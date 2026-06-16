@@ -1,0 +1,31 @@
+{
+  "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
+  "id": "agent-first-ui",
+  "name": "Agent-First UI",
+  "version": "0.1.0",
+  "domain": "agentfirstkit.com",
+  "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
+  "synopsis": "A UI protocol that lets a tool describe its interface as data instead of code — so a trusted host you own renders the screens and actions, and nothing the tool sends can run on your machine.",
+  "intent": [
+    "Define a JSON-compatible AFUI protocol that carries no JavaScript, CSS, HTML, WASM, build scripts, callbacks, shell commands, or remote component URLs, so showing a human an operation surface stays data-only",
+    "Separate producer, host, and composer roles: producers emit snapshots and patches, trusted hosts render and gate user intent, and composition tools combine ordinary snapshots by namespacing ids/actions/state without adding a new wire type",
+    "Provide language-neutral protocol assets plus a lightweight Rust SDK under rust/ for wire types, validation, binding, patching, action input assembly, replay/reporting, and producer/handler tests; reference compose/web/TUI/terminal host packages live as sibling spores"
+  ],
+  "license": "MIT",
+  "mutations": [
+    "Initial release of the Agent-First UI protocol: producers describe current state and the actions available on it as plain data, and a user-owned trusted host renderer draws the interface and reports user intent back — no producer-supplied UI code runs",
+    "Provide the canonical, serde-serializable Rust type definitions for the protocol (state surfaces, actions, intents) so any producer or host renderer interoperates against one shared schema"
+  ],
+  "bonds": [],
+  "tree": {
+    "algorithm": "blob_tree_blake3_nfc",
+    "exclude_names": [
+      ".git",
+      ".cmn",
+      "target"
+    ],
+    "follow_rules": [
+      ".gitignore"
+    ]
+  }
+}

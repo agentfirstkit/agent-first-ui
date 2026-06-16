@@ -1,0 +1,373 @@
+{
+  "afui": "0.1",
+  "type": "ui_snapshot",
+  "document": {
+    "screens": [
+      {
+        "id": "terminal_ops",
+        "title": "Deploy Ops",
+        "views": [
+          {
+            "id": "terminal_header",
+            "kind": "stats",
+            "description": "Top status line for a TUI.",
+            "items": [
+              {
+                "label": "Env",
+                "value_bind": "state:selected_environment.name"
+              },
+              {
+                "label": "Healthy",
+                "value_bind": "state:health.healthy_count"
+              },
+              {
+                "label": "Degraded",
+                "value_bind": "state:health.degraded_count"
+              },
+              {
+                "label": "Queue",
+                "value_bind": "state:health.queue_count"
+              }
+            ]
+          },
+          {
+            "id": "environment_tree",
+            "kind": "tree",
+            "description": "Left pane environment/service tree. Selection is read-only; actions should work with the selected environment.",
+            "source_bind": "state:environments",
+            "selected_node_bind": "state:selected_environment.id",
+            "environment_id_bind": "record:id",
+            "actions": [
+              "select_environment"
+            ]
+          },
+          {
+            "id": "deployments",
+            "kind": "table",
+            "description": "Middle pane deployment queue.",
+            "source_bind": "state:deployments",
+            "selected_row_bind": "state:selected_deployment_id",
+            "deployment_id_bind": "record:id",
+            "columns": [
+              {
+                "key": "id",
+                "label": "Deploy"
+              },
+              {
+                "key": "service",
+                "label": "Service"
+              },
+              {
+                "key": "version",
+                "label": "Version"
+              },
+              {
+                "key": "status",
+                "label": "Status"
+              },
+              {
+                "key": "duration_s",
+                "label": "Age"
+              }
+            ],
+            "row_actions": [
+              "inspect_deployment",
+              "rollback_deploy"
+            ]
+          },
+          {
+            "id": "selected_deployment",
+            "kind": "detail",
+            "description": "Right pane inspector for the selected deployment.",
+            "source_bind": "state:selected_deployment",
+            "deployment_id_bind": "record:id",
+            "fields": [
+              {
+                "key": "id",
+                "label": "Deploy"
+              },
+              {
+                "key": "service",
+                "label": "Service"
+              },
+              {
+                "key": "version",
+                "label": "Version"
+              },
+              {
+                "key": "operator",
+                "label": "Operator"
+              },
+              {
+                "key": "risk_note",
+                "label": "Risk"
+              }
+            ],
+            "actions": [
+              "inspect_deployment",
+              "rollback_deploy",
+              "promote_canary"
+            ]
+          },
+          {
+            "id": "pipeline_progress",
+            "kind": "progress",
+            "description": "Current pipeline progress rendered as a terminal progress bar.",
+            "label_bind": "state:pipeline.label",
+            "current_bind": "state:pipeline.current_step",
+            "max_bind": "state:pipeline.total_steps"
+          },
+          {
+            "id": "build_log",
+            "kind": "log",
+            "description": "Bottom pane log tail. This is a bounded stream, not complete history.",
+            "source_bind": "state:log_tail",
+            "level_key": "level",
+            "message_key": "message",
+            "time_key": "timestamp_epoch_ms"
+          },
+          {
+            "id": "command_line",
+            "kind": "input",
+            "description": "Command prompt. The host parses commands; AFUI only emits structured intent.",
+            "value_bind": "state:command.buffer",
+            "placeholder": ":restart api or /filter error",
+            "submit_action": "submit_command",
+            "command_bind": "input:."
+          },
+          {
+            "id": "key_help",
+            "kind": "keymap",
+            "description": "Advisory TUI shortcut strip. v0 does not make key bindings programmatic; the host may expose these as hints while actions remain semantic.",
+            "source_bind": "state:keymap",
+            "actions": [
+              "refresh",
+              "restart_service",
+              "rollback_deploy",
+              "quit_console"
+            ]
+          },
+          {
+            "id": "footer_actions",
+            "kind": "action_bar",
+            "description": "Footer action bar. If an action needs a selected id and the triggering view has no binding, the host collects or derives it from focus/selection.",
+            "actions": [
+              "refresh",
+              "restart_service",
+              "promote_canary",
+              "rollback_deploy",
+              "quit_console"
+            ]
+          }
+        ]
+      }
+    ],
+    "actions": [
+      {
+        "id": "select_environment",
+        "label": "Select",
+        "risk": "read_only",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "environment_id"
+          ],
+          "properties": {
+            "environment_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "inspect_deployment",
+        "label": "Inspect",
+        "risk": "read_only",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "deployment_id"
+          ],
+          "properties": {
+            "deployment_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "refresh",
+        "label": "Refresh",
+        "risk": "read_only"
+      },
+      {
+        "id": "submit_command",
+        "label": "Run Command",
+        "risk": "external_effect",
+        "description": "Submits a command to the deploy controller; host should parse and preview side effects.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "command"
+          ],
+          "properties": {
+            "command": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "restart_service",
+        "label": "Restart",
+        "risk": "external_effect",
+        "description": "Restarts the selected service in the selected environment."
+      },
+      {
+        "id": "promote_canary",
+        "label": "Promote",
+        "risk": "external_effect",
+        "description": "Promotes the selected canary to stable if checks pass."
+      },
+      {
+        "id": "rollback_deploy",
+        "label": "Rollback",
+        "risk": "destructive",
+        "undoable": false,
+        "description": "Rolls back the selected deployment and may drop in-flight sessions.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "deployment_id"
+          ],
+          "properties": {
+            "deployment_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "quit_console",
+        "label": "Quit",
+        "risk": "local_mutation"
+      }
+    ],
+    "surface": {
+      "id": "tui_deploy_console",
+      "title": "TUI Deploy Console",
+      "description": "Terminal-style operation surface for deployments. The host may use panes, borders, a command line, a key help strip, and colored logs, but AFUI only carries semantic views and actions."
+    }
+  },
+  "state": {
+    "selected_environment": {
+      "id": "prod-us",
+      "name": "prod-us"
+    },
+    "selected_deployment_id": "dep_771",
+    "health": {
+      "healthy_count": 28,
+      "degraded_count": 2,
+      "queue_count": 5
+    },
+    "environments": [
+      {
+        "id": "prod-us",
+        "name": "prod-us",
+        "children": [
+          {
+            "id": "api",
+            "name": "api"
+          },
+          {
+            "id": "worker",
+            "name": "worker"
+          }
+        ]
+      },
+      {
+        "id": "staging",
+        "name": "staging",
+        "children": [
+          {
+            "id": "api-stg",
+            "name": "api"
+          }
+        ]
+      }
+    ],
+    "deployments": [
+      {
+        "id": "dep_771",
+        "service": "api",
+        "version": "2026.05.16-rc3",
+        "status": "canary",
+        "duration_s": 420
+      },
+      {
+        "id": "dep_770",
+        "service": "worker",
+        "version": "2026.05.16-rc1",
+        "status": "running",
+        "duration_s": 1180
+      },
+      {
+        "id": "dep_769",
+        "service": "web",
+        "version": "2026.05.15",
+        "status": "stable",
+        "duration_s": 86400
+      }
+    ],
+    "selected_deployment": {
+      "id": "dep_771",
+      "service": "api",
+      "version": "2026.05.16-rc3",
+      "operator": "ops-bot",
+      "risk_note": "Canary has 2 elevated latency checks but no errors."
+    },
+    "pipeline": {
+      "label": "api canary rollout",
+      "current_step": 3,
+      "total_steps": 5
+    },
+    "command": {
+      "buffer": ""
+    },
+    "keymap": [
+      {
+        "key": "r",
+        "label": "refresh"
+      },
+      {
+        "key": "R",
+        "label": "restart selected service"
+      },
+      {
+        "key": "b",
+        "label": "rollback selected deploy"
+      },
+      {
+        "key": "q",
+        "label": "quit"
+      }
+    ],
+    "log_tail": [
+      {
+        "timestamp_epoch_ms": 1778891000000,
+        "level": "info",
+        "message": "dep_771 health check 3/5 passed"
+      },
+      {
+        "timestamp_epoch_ms": 1778891060000,
+        "level": "warn",
+        "message": "api p95 latency above baseline by 18%"
+      },
+      {
+        "timestamp_epoch_ms": 1778891120000,
+        "level": "info",
+        "message": "waiting for canary cohort expansion"
+      }
+    ]
+  }
+}

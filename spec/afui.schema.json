@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:afui:0.1:schema",
+  "title": "Agent-First UI v0.1 wire schema",
+  "description": "Validates the AFUI envelope and the programmatic-control layer only. AFUI is data-only: documents describe operation surfaces and never carry JavaScript, CSS, HTML fragments, WASM, package manifests, build scripts, shell commands, or remote component code. Two primitives: the document is an identity graph (every node has a document-unique id), and there is one scoped binding marker (_bind whose value is <scope>:<path>). State and document deltas both use JSON Patch. It is strict where deviation breaks or breaches and permissive where host presentation is in charge: `kind` is an open string, view fields are open, and `description` is never constrained beyond being text.",
+  "$ref": "#/$defs/Message",
+  "$defs": {
+    "Message": {
+      "type": "object",
+      "required": ["afui", "type"],
+      "properties": {
+        "afui": { "const": "0.1" },
+        "type": {
+          "enum": ["ui_snapshot", "state_patch", "document_patch", "theme_patch", "user_action"]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "ui_snapshot" } } },
+          "then": {
+            "required": ["document", "state"],
+            "properties": {
+              "document": { "$ref": "#/$defs/Document" },
+              "state": { "type": "object" },
+              "theme": { "$ref": "#/$defs/Theme" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "state_patch" } } },
+          "then": {
+            "required": ["patch"],
+            "properties": { "patch": { "$ref": "#/$defs/Patch" } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "document_patch" } } },
+          "then": {
+            "required": ["patch"],
+            "properties": {
+              "patch": { "$ref": "#/$defs/Patch" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "theme_patch" } } },
+          "then": {
+            "required": ["patch"],
+            "properties": { "patch": { "$ref": "#/$defs/Patch" } }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "user_action" } } },
+          "then": {
+            "required": ["action_id"],
+            "properties": {
+              "action_id": { "$ref": "#/$defs/Id" },
+              "input": true
+            }
+          }
+        }
+      ]
+    },
+
+    "Id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:-]+$",
+      "not": { "const": "-" },
+      "description": "Stable, case-sensitive, document-unique ASCII id. Not a secret, not `-`, stable across patches when it refers to the same thing."
+    },
+
+    "ScopedBind": {
+      "type": "string",
+      "pattern": "^(state:|record:|input:)?[^:]+$",
+      "description": "Binding value `<scope>:<path>`; scope in {state,record,input}; omitted scope means state; path contains no ':'."
+    },
+
+    "Risk": {
+      "enum": ["read_only", "local_mutation", "external_effect", "destructive"],
+      "description": "Programmatic safety fact. Required on every Action; the runtime gate is derived from it. Absent or unrecognized is treated as `destructive`."
+    },
+
+    "MarkedFields": {
+      "$comment": "Shared marker discipline applied to any node that may carry view-like fields.",
+      "patternProperties": {
+        "_bind$": { "$ref": "#/$defs/ScopedBind" },
+        "_uri$": { "type": "string" },
+        "(^action$|_action$)": { "$ref": "#/$defs/Id" },
+        "(^actions$|_actions$)": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Id" }
+        }
+      }
+    },
+
+    "NoCodeTransportFields": {
+      "$comment": "Ordinary AFUI is data-only. These obvious code/package/component transport fields are invalid in documents. This is not a security scanner; the normative rule is in spec/agent-first-ui.md.",
+      "not": {
+        "anyOf": [
+          { "required": ["html"] },
+          { "required": ["css"] },
+          { "required": ["javascript"] },
+          { "required": ["script"] },
+          { "required": ["script_uri"] },
+          { "required": ["component_uri"] },
+          { "required": ["plugin_uri"] },
+          { "required": ["wasm_uri"] },
+          { "required": ["package_json"] },
+          { "required": ["build_script"] },
+          { "required": ["shell_script"] },
+          { "required": ["shell_command"] },
+          { "required": ["npm_package"] },
+          { "required": ["dependency_graph"] }
+        ]
+      }
+    },
+
+    "Document": {
+      "type": "object",
+      "required": ["surface", "screens"],
+      "properties": {
+        "surface": { "$ref": "#/$defs/Surface" },
+        "screens": { "type": "array", "items": { "$ref": "#/$defs/Screen" } },
+        "actions": { "type": "array", "items": { "$ref": "#/$defs/Action" } }
+      },
+      "patternProperties": {
+        "_bind$": { "$ref": "#/$defs/ScopedBind" },
+        "_uri$": { "type": "string" }
+      },
+      "allOf": [
+        { "$ref": "#/$defs/NoCodeTransportFields" },
+        { "not": { "required": ["app"] } }
+      ],
+      "additionalProperties": true
+    },
+
+    "Surface": {
+      "type": "object",
+      "required": ["id", "title"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "version": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+
+    "Screen": {
+      "type": "object",
+      "required": ["id", "views"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "views": { "type": "array", "items": { "$ref": "#/$defs/View" } }
+      },
+      "patternProperties": {
+        "_bind$": { "$ref": "#/$defs/ScopedBind" },
+        "_uri$": { "type": "string" }
+      },
+      "allOf": [{ "$ref": "#/$defs/NoCodeTransportFields" }],
+      "additionalProperties": true
+    },
+
+    "View": {
+      "type": "object",
+      "required": ["id", "kind"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Semantic word, NOT an enum. Open by principle; the schema intentionally does not constrain it."
+        },
+        "description": { "type": "string" },
+        "header": { "$ref": "#/$defs/View" },
+        "footer": { "$ref": "#/$defs/View" },
+        "empty_view": { "$ref": "#/$defs/View" },
+        "default": { "$ref": "#/$defs/View" },
+        "cases": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/View" }
+        }
+      },
+      "patternProperties": {
+        "_bind$": { "$ref": "#/$defs/ScopedBind" },
+        "_uri$": { "type": "string" },
+        "(^action$|_action$)": { "$ref": "#/$defs/Id" },
+        "(^actions$|_actions$)": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Id" }
+        }
+      },
+      "allOf": [{ "$ref": "#/$defs/NoCodeTransportFields" }],
+      "additionalProperties": true
+    },
+
+    "Action": {
+      "type": "object",
+      "required": ["id", "label", "risk"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "label": { "type": "string" },
+        "description": { "type": "string" },
+        "risk": { "$ref": "#/$defs/Risk" },
+        "undoable": { "type": "boolean" },
+        "input_schema": {
+          "type": "object",
+          "description": "JSON Schema-compatible shape; full constraints deferred; only type:object is asserted."
+        }
+      },
+      "not": {
+        "required": ["requires_confirmation"],
+        "$comment": "Regression guard. Gating is runtime host behavior derived from `risk`, never a document field."
+      },
+      "allOf": [{ "$ref": "#/$defs/NoCodeTransportFields" }],
+      "additionalProperties": true
+    },
+
+    "Patch": {
+      "type": "array",
+      "description": "JSON Patch (RFC 6902) over state or document, depending on the envelope type. AFUI does not redefine it.",
+      "items": { "$ref": "#/$defs/PatchOp" }
+    },
+
+    "PatchOp": {
+      "type": "object",
+      "required": ["op", "path"],
+      "properties": {
+        "op": { "enum": ["add", "remove", "replace", "move", "copy", "test"] },
+        "path": { "type": "string", "pattern": "^(/[^/]*)*$" },
+        "from": { "type": "string", "pattern": "^(/[^/]*)*$" },
+        "value": true
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "op": { "enum": ["add", "replace", "test"] } } },
+          "then": { "required": ["value"] }
+        },
+        {
+          "if": { "properties": { "op": { "enum": ["move", "copy"] } } },
+          "then": { "required": ["from"] }
+        }
+      ],
+      "additionalProperties": true
+    },
+
+    "Theme": {
+      "type": "object",
+      "description": "Advisory style token map. Keys use AFDATA-style suffixes (_color, _px, _ms). Advisory: a host renderer may ignore all tokens and fall back to its own defaults. Never programmatic: theme tokens cannot trigger or waive a safety gate. An agent may generate or patch a theme without safety or correctness risk. Unknown tokens are inert and MUST be ignored without error.",
+      "properties": {
+        "color_primary":            { "type": "string", "description": "Accent / brand color (CSS color string)" },
+        "color_surface":            { "type": "string", "description": "Host surface background" },
+        "color_surface_raised":     { "type": "string", "description": "Card / panel background" },
+        "color_on_surface":         { "type": "string", "description": "Default text color" },
+        "color_border":             { "type": "string", "description": "Dividers and outlines" },
+        "color_risk_read_only":     { "type": "string", "description": "Visual for read_only actions" },
+        "color_risk_local":         { "type": "string", "description": "Visual for local_mutation actions" },
+        "color_risk_external":      { "type": "string", "description": "Visual for external_effect actions" },
+        "color_risk_destructive":   { "type": "string", "description": "Visual for destructive actions" },
+        "space_base_px":            { "type": "integer", "description": "Base spacing unit in pixels" },
+        "space_panel_gap_px":       { "type": "integer", "description": "Gap between panels / sections" },
+        "space_sidebar_width_px":   { "type": "integer", "description": "Sidebar or navigation panel width" },
+        "radius_base_px":           { "type": "integer", "description": "Base border radius for cards and panels" },
+        "radius_button_px":         { "type": "integer", "description": "Border radius for buttons and controls" },
+        "font_family":              { "type": "string",  "description": "Font stack string" },
+        "font_size_base_px":        { "type": "integer", "description": "Base font size in pixels" }
+      },
+      "additionalProperties": { "oneOf": [{ "type": "string" }, { "type": "number" }] }
+    }
+  }
+}

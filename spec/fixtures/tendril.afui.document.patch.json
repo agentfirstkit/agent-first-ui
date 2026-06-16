@@ -1,0 +1,58 @@
+[
+  {
+    "op": "test",
+    "path": "/screens/0/id",
+    "value": "main"
+  },
+  {
+    "op": "test",
+    "path": "/screens/0/views/2/id",
+    "value": "active_content"
+  },
+  {
+    "op": "add",
+    "path": "/screens/0/views/3",
+    "value": {
+      "id": "safety_banner",
+      "kind": "text",
+      "description": "Shown until the spore is tasted on this machine.",
+      "text": "This spore has not been safety-tasted on this machine."
+    }
+  },
+  {
+    "op": "test",
+    "path": "/screens/0/views/2/cases/spore/id",
+    "value": "spore_detail"
+  },
+  {
+    "op": "replace",
+    "path": "/screens/0/views/2/cases/spore",
+    "value": {
+      "id": "spore_detail",
+      "kind": "detail",
+      "source_bind": "state:spore.active",
+      "fields": [
+        {
+          "key": "name",
+          "label": "Name"
+        },
+        {
+          "key": "phase",
+          "label": "Phase"
+        }
+      ],
+      "actions": [
+        "run_safety_taste"
+      ]
+    }
+  },
+  {
+    "op": "test",
+    "path": "/screens/0/views/3/id",
+    "value": "safety_banner"
+  },
+  {
+    "op": "remove",
+    "path": "/screens/0/views/3"
+  }
+]

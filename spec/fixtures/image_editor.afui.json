@@ -1,0 +1,310 @@
+{
+  "afui": "0.1",
+  "type": "ui_snapshot",
+  "document": {
+    "screens": [
+      {
+        "id": "edit",
+        "title": "Edit",
+        "views": [
+          {
+            "id": "canvas",
+            "kind": "canvas",
+            "description": "The composited image being edited. AFUI references the surface; the host owns the pixels and the drawing input. Honor the document's pixel dimensions.",
+            "surface_bind": "state:image"
+          },
+          {
+            "id": "toolbar",
+            "kind": "action_bar",
+            "description": "Tool selection. Picking a tool only changes editor state; nothing about the image changes until the user draws.",
+            "actions": [
+              "select_brush",
+              "select_eraser",
+              "select_move"
+            ]
+          },
+          {
+            "id": "brush_size",
+            "kind": "input",
+            "description": "Active brush diameter in pixels. Applies to the next stroke, not retroactively.",
+            "value_bind": "state:tools.brush.size_px",
+            "placeholder": "Brush size (px)",
+            "submit_action": "set_brush_size",
+            "size_px_bind": "input:."
+          },
+          {
+            "id": "layers",
+            "kind": "tree",
+            "description": "Layer stack, top layer first. Selecting a layer is safe; deleting one risks user pixels even though history can recover it.",
+            "source_bind": "state:layers",
+            "selected_node_bind": "state:selected_layer_id",
+            "layer_id_bind": "record:id",
+            "actions": [
+              "select_layer",
+              "toggle_layer_visible",
+              "delete_layer"
+            ]
+          },
+          {
+            "id": "layer_detail",
+            "kind": "detail",
+            "description": "Properties of the selected layer. Opacity and blend mode are non-destructive and live-previewed.",
+            "source_bind": "state:selected_layer",
+            "fields": [
+              {
+                "key": "name",
+                "label": "Name"
+              },
+              {
+                "key": "opacity_percent",
+                "label": "Opacity"
+              },
+              {
+                "key": "blend_mode",
+                "label": "Blend"
+              },
+              {
+                "key": "visible",
+                "label": "Visible"
+              }
+            ],
+            "actions": [
+              "apply_filter"
+            ]
+          },
+          {
+            "id": "history",
+            "kind": "list",
+            "description": "Edit history. The undo horizon: operations older than the oldest entry cannot be undone.",
+            "source_bind": "state:history",
+            "empty_view": {
+              "id": "history_empty",
+              "kind": "text",
+              "text": "No edits yet."
+            }
+          },
+          {
+            "id": "document_bar",
+            "kind": "action_bar",
+            "description": "Document-level operations. These are the consequential ones; the host must not flatten their risk into the toolbar's look.",
+            "actions": [
+              "export_image",
+              "flatten_image",
+              "revert_to_saved"
+            ]
+          }
+        ]
+      }
+    ],
+    "actions": [
+      {
+        "id": "select_brush",
+        "label": "Brush",
+        "risk": "local_mutation",
+        "description": "Makes the brush the active tool."
+      },
+      {
+        "id": "select_eraser",
+        "label": "Eraser",
+        "risk": "local_mutation",
+        "description": "Makes the eraser the active tool. Erased pixels are recoverable through history until the undo horizon."
+      },
+      {
+        "id": "select_move",
+        "label": "Move",
+        "risk": "local_mutation",
+        "description": "Makes the move tool active."
+      },
+      {
+        "id": "set_brush_size",
+        "label": "Set Brush Size",
+        "risk": "local_mutation",
+        "description": "Sets the active brush diameter for subsequent strokes.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "size_px"
+          ],
+          "properties": {
+            "size_px": {
+              "type": "number"
+            }
+          }
+        }
+      },
+      {
+        "id": "select_layer",
+        "label": "Select Layer",
+        "risk": "read_only",
+        "description": "Focuses a layer. Selection changes nothing in the image.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "layer_id"
+          ],
+          "properties": {
+            "layer_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "toggle_layer_visible",
+        "label": "Toggle Visibility",
+        "risk": "local_mutation",
+        "undoable": true,
+        "description": "Shows or hides the selected layer. Non-destructive: the pixels are retained."
+      },
+      {
+        "id": "apply_filter",
+        "label": "Apply Filter",
+        "risk": "local_mutation",
+        "undoable": true,
+        "description": "Bakes a filter into the selected layer's pixels. Recoverable via history until the undo horizon. `filter`/`amount_percent` are not on the layer record, so the host collects them.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "filter"
+          ],
+          "properties": {
+            "filter": {
+              "type": "string"
+            },
+            "amount_percent": {
+              "type": "number"
+            }
+          }
+        }
+      },
+      {
+        "id": "delete_layer",
+        "label": "Delete Layer",
+        "risk": "destructive",
+        "undoable": true,
+        "description": "Removes the selected layer. Marked destructive because it risks user pixels even though history can restore it within the undo horizon. `undoable` and `risk` are independent facts; the gate is the host's call."
+      },
+      {
+        "id": "flatten_image",
+        "label": "Flatten Image",
+        "risk": "destructive",
+        "undoable": false,
+        "description": "Merges every layer into one and discards the layer structure permanently. Not recoverable through history."
+      },
+      {
+        "id": "export_image",
+        "label": "Export",
+        "risk": "external_effect",
+        "description": "Writes a rendered copy to a file outside the editor. Does not alter the working document. `path`/`format` are collected by the host.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "path",
+            "format"
+          ],
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "format": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "revert_to_saved",
+        "label": "Revert to Saved",
+        "risk": "destructive",
+        "undoable": false,
+        "description": "Discards every change since the last save and reloads the file from disk. All unsaved edits are lost."
+      }
+    ],
+    "surface": {
+      "id": "raster_editor",
+      "title": "Raster Editor",
+      "description": "A layered image editor. Proves AFUI carries a spatial editing surface, a layer tree, and irreversible document operations under one two-layer model."
+    }
+  },
+  "theme": {
+    "color_primary": "#a78bfa",
+    "color_surface": "#1a1a2e",
+    "color_surface_raised": "#16213e",
+    "color_on_surface": "#e2e8f0",
+    "color_border": "#2d3748",
+    "color_risk_read_only": "#60a5fa",
+    "color_risk_local": "#34d399",
+    "color_risk_external": "#fbbf24",
+    "color_risk_destructive": "#f87171",
+    "space_base_px": 8,
+    "space_panel_gap_px": 12,
+    "space_sidebar_width_px": 256,
+    "radius_base_px": 6,
+    "radius_button_px": 4,
+    "font_family": "system-ui, -apple-system, sans-serif",
+    "font_size_base_px": 13
+  },
+  "state": {
+    "image": {
+      "source_uri": "file://project/poster.psd#composite",
+      "mime": "image/x-photoshop",
+      "width_px": 3000,
+      "height_px": 4500
+    },
+    "tools": {
+      "active": "brush",
+      "brush": {
+        "size_px": 24
+      }
+    },
+    "layers": [
+      {
+        "id": "layer_text",
+        "name": "Headline",
+        "visible": true,
+        "opacity_percent": 100,
+        "blend_mode": "normal"
+      },
+      {
+        "id": "layer_photo",
+        "name": "Photo",
+        "visible": true,
+        "opacity_percent": 85,
+        "blend_mode": "multiply"
+      },
+      {
+        "id": "layer_bg",
+        "name": "Background",
+        "visible": true,
+        "opacity_percent": 100,
+        "blend_mode": "normal"
+      }
+    ],
+    "selected_layer_id": "layer_photo",
+    "selected_layer": {
+      "name": "Photo",
+      "opacity_percent": 85,
+      "blend_mode": "multiply",
+      "visible": true
+    },
+    "history": [
+      {
+        "id": "h1",
+        "label": "Open poster.psd"
+      },
+      {
+        "id": "h2",
+        "label": "Brush stroke on Photo"
+      },
+      {
+        "id": "h3",
+        "label": "Opacity 100 -> 85 on Photo"
+      }
+    ],
+    "document": {
+      "path": "~/projects/poster.psd",
+      "dirty": true,
+      "saved_at_epoch_ms": 1778800000000
+    }
+  }
+}

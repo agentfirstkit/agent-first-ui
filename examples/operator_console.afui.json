@@ -1,0 +1,595 @@
+{
+  "afui": "0.1",
+  "type": "ui_snapshot",
+  "document": {
+    "screens": [
+      {
+        "id": "admin_dashboard",
+        "title": "Commerce Admin",
+        "description": "A dense operator dashboard. Many visual elements should be present, but the programmatic layer remains only identity, bindings, action references, risk, and patches.",
+        "views": [
+          {
+            "id": "sidebar_nav",
+            "kind": "tree",
+            "description": "Left operator navigation. Host renderers may choose a sidebar, menu, or terminal tree; selecting a node is safe navigation.",
+            "source_bind": "state:navigation.items",
+            "selected_node_bind": "state:navigation.active_id",
+            "nav_id_bind": "record:id",
+            "actions": [
+              "open_nav_item"
+            ]
+          },
+          {
+            "id": "top_search",
+            "kind": "input",
+            "description": "Top navbar search box for orders, customers, and products.",
+            "value_bind": "state:search.query",
+            "placeholder": "Search orders, customers, products...",
+            "submit_action": "search_admin",
+            "query_bind": "input:."
+          },
+          {
+            "id": "admin_summary",
+            "kind": "stats",
+            "description": "KPI summary: revenue, orders, conversion, latency, failed jobs, and fraud review queue.",
+            "items": [
+              {
+                "label": "Revenue",
+                "value_bind": "state:summary.revenue_usd_cents"
+              },
+              {
+                "label": "Orders",
+                "value_bind": "state:summary.orders_count"
+              },
+              {
+                "label": "Conversion",
+                "value_bind": "state:summary.conversion_percent"
+              },
+              {
+                "label": "P95 API",
+                "value_bind": "state:summary.p95_api_ms"
+              },
+              {
+                "label": "Failed Jobs",
+                "value_bind": "state:summary.failed_jobs_count"
+              },
+              {
+                "label": "Fraud Queue",
+                "value_bind": "state:summary.fraud_review_count"
+              }
+            ]
+          },
+          {
+            "id": "sales_chart",
+            "kind": "chart",
+            "description": "Revenue chart data. This is an open semantic kind; a host can use bars, an SVG chart, or fallback text.",
+            "chart_type": "bar",
+            "source_bind": "state:analytics.daily_revenue",
+            "x_key": "day",
+            "y_key": "revenue_usd_cents"
+          },
+          {
+            "id": "campaign_progress",
+            "kind": "progress",
+            "description": "Monthly campaign target progress. The host chooses whether this is a bar, text, or native progress control.",
+            "label_bind": "state:campaign.name",
+            "current_bind": "state:campaign.current_usd_cents",
+            "max_bind": "state:campaign.target_usd_cents"
+          },
+          {
+            "id": "orders_table",
+            "kind": "table",
+            "description": "Main orders data table. Per-row actions use record-scoped bindings for the order and user ids.",
+            "source_bind": "state:orders",
+            "selected_row_bind": "state:selected_order_id",
+            "order_id_bind": "record:id",
+            "user_id_bind": "record:user_id",
+            "columns": [
+              {
+                "key": "id",
+                "label": "Order"
+              },
+              {
+                "key": "user_id",
+                "label": "Customer"
+              },
+              {
+                "key": "total_usd_cents",
+                "label": "Total"
+              },
+              {
+                "key": "status",
+                "label": "Status"
+              },
+              {
+                "key": "risk_score_percent",
+                "label": "Risk"
+              },
+              {
+                "key": "created_at_epoch_ms",
+                "label": "Created"
+              }
+            ],
+            "row_actions": [
+              "open_order",
+              "capture_payment",
+              "refund_order",
+              "ban_user"
+            ]
+          },
+          {
+            "id": "selected_order_detail",
+            "kind": "detail",
+            "description": "Selected order inspector. The risk reason and shipping state should be visible before any money-moving action.",
+            "source_bind": "state:selected_order",
+            "order_id_bind": "record:id",
+            "user_id_bind": "record:user_id",
+            "fields": [
+              {
+                "key": "id",
+                "label": "Order"
+              },
+              {
+                "key": "status",
+                "label": "Status"
+              },
+              {
+                "key": "payment_state",
+                "label": "Payment"
+              },
+              {
+                "key": "shipping_state",
+                "label": "Shipping"
+              },
+              {
+                "key": "risk_reason",
+                "label": "Risk Reason"
+              },
+              {
+                "key": "support_note",
+                "label": "Support Note"
+              }
+            ],
+            "actions": [
+              "open_order",
+              "capture_payment",
+              "refund_order",
+              "ban_user"
+            ]
+          },
+          {
+            "id": "agent_recommendations",
+            "kind": "list",
+            "description": "Simulated agent recommendations generated from the dashboard data. These are advisory until the human triggers actions.",
+            "source_bind": "state:agent.recommendations",
+            "empty_view": {
+              "id": "agent_recommendations_empty",
+              "kind": "text",
+              "text": "No agent recommendations."
+            },
+            "footer": {
+              "id": "agent_prompt",
+              "kind": "input",
+              "placeholder": "Ask the admin agent to inspect a cohort...",
+              "submit_action": "ask_agent",
+              "prompt_bind": "input:."
+            }
+          },
+          {
+            "id": "active_panel_switch",
+            "kind": "switch",
+            "description": "A tab-like panel switch controlled by state. Demonstrates that the host can choose tabs/cards without AFUI defining a layout engine.",
+            "source_bind": "state:active_panel",
+            "cases": {
+              "security": {
+                "id": "security_panel",
+                "kind": "detail",
+                "source_bind": "state:security",
+                "fields": [
+                  {
+                    "key": "mfa_enforced",
+                    "label": "MFA"
+                  },
+                  {
+                    "key": "webhook_uri",
+                    "label": "Webhook"
+                  },
+                  {
+                    "key": "stripe_api_key_secret",
+                    "label": "Stripe Key"
+                  }
+                ],
+                "actions": [
+                  "rotate_signing_secret"
+                ]
+              },
+              "fulfillment": {
+                "id": "fulfillment_panel",
+                "kind": "stats",
+                "items": [
+                  {
+                    "label": "Pick Queue",
+                    "value_bind": "state:fulfillment.pick_queue_count"
+                  },
+                  {
+                    "label": "Late",
+                    "value_bind": "state:fulfillment.late_shipments_count"
+                  }
+                ]
+              }
+            },
+            "default": {
+              "id": "overview_panel",
+              "kind": "text",
+              "text": "Overview selected."
+            }
+          },
+          {
+            "id": "system_log",
+            "kind": "log",
+            "description": "Bounded event tail for jobs, payments, and agent notes.",
+            "source_bind": "state:recent_events",
+            "level_key": "level",
+            "message_key": "message",
+            "time_key": "timestamp_epoch_ms"
+          },
+          {
+            "id": "admin_actions",
+            "kind": "action_bar",
+            "description": "Global operator controls. Risks must remain visually distinct in every host appearance.",
+            "actions": [
+              "refresh_dashboard",
+              "export_orders",
+              "bulk_email_customers",
+              "rotate_signing_secret"
+            ]
+          }
+        ]
+      }
+    ],
+    "actions": [
+      {
+        "id": "open_nav_item",
+        "label": "Open",
+        "risk": "read_only",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "nav_id"
+          ],
+          "properties": {
+            "nav_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "search_admin",
+        "label": "Search",
+        "risk": "read_only",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "query"
+          ],
+          "properties": {
+            "query": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "open_order",
+        "label": "Open",
+        "risk": "read_only",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "order_id"
+          ],
+          "properties": {
+            "order_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "capture_payment",
+        "label": "Capture",
+        "risk": "external_effect",
+        "description": "Captures an authorized payment and triggers downstream fulfillment.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "order_id"
+          ],
+          "properties": {
+            "order_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "refund_order",
+        "label": "Refund",
+        "risk": "destructive",
+        "undoable": false,
+        "description": "Refunds the full order amount to the original payment method. The host should collect a reason before emitting the event.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "order_id",
+            "reason"
+          ],
+          "properties": {
+            "order_id": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "ban_user",
+        "label": "Ban User",
+        "risk": "destructive",
+        "undoable": true,
+        "description": "Disables a customer account. Undo may restore access, but the action still risks user harm.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "user_id"
+          ],
+          "properties": {
+            "user_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "ask_agent",
+        "label": "Ask Agent",
+        "risk": "external_effect",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "prompt"
+          ],
+          "properties": {
+            "prompt": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "refresh_dashboard",
+        "label": "Refresh",
+        "risk": "read_only"
+      },
+      {
+        "id": "export_orders",
+        "label": "Export CSV",
+        "risk": "external_effect",
+        "description": "Exports potentially sensitive customer order data."
+      },
+      {
+        "id": "bulk_email_customers",
+        "label": "Email Cohort",
+        "risk": "external_effect",
+        "description": "Sends email to the currently filtered cohort; host should summarize recipients."
+      },
+      {
+        "id": "rotate_signing_secret",
+        "label": "Rotate Secret",
+        "risk": "destructive",
+        "undoable": false,
+        "description": "Invalidates the current webhook signing secret immediately."
+      }
+    ],
+    "surface": {
+      "id": "operator_console",
+      "title": "Operator Console Surface",
+      "description": "A simulated commerce operation surface produced from workflow data. AFUI carries state bindings, actions, risks, and descriptions; the trusted host chooses the visual appearance."
+    }
+  },
+  "state": {
+    "navigation": {
+      "active_id": "orders",
+      "items": [
+        {
+          "id": "overview",
+          "name": "Overview",
+          "children": []
+        },
+        {
+          "id": "orders",
+          "name": "Orders",
+          "children": [
+            {
+              "id": "fraud",
+              "name": "Fraud Review"
+            },
+            {
+              "id": "returns",
+              "name": "Returns"
+            }
+          ]
+        },
+        {
+          "id": "catalog",
+          "name": "Catalog",
+          "children": [
+            {
+              "id": "products",
+              "name": "Products"
+            },
+            {
+              "id": "inventory",
+              "name": "Inventory"
+            }
+          ]
+        },
+        {
+          "id": "settings",
+          "name": "Settings",
+          "children": [
+            {
+              "id": "security",
+              "name": "Security"
+            },
+            {
+              "id": "webhooks",
+              "name": "Webhooks"
+            }
+          ]
+        }
+      ]
+    },
+    "search": {
+      "query": ""
+    },
+    "summary": {
+      "revenue_usd_cents": 12893450,
+      "orders_count": 1248,
+      "conversion_percent": 4.8,
+      "p95_api_ms": 312,
+      "failed_jobs_count": 7,
+      "fraud_review_count": 18
+    },
+    "analytics": {
+      "daily_revenue": [
+        {
+          "day": "Mon",
+          "revenue_usd_cents": 1450000
+        },
+        {
+          "day": "Tue",
+          "revenue_usd_cents": 1725000
+        },
+        {
+          "day": "Wed",
+          "revenue_usd_cents": 1512000
+        },
+        {
+          "day": "Thu",
+          "revenue_usd_cents": 2018000
+        },
+        {
+          "day": "Fri",
+          "revenue_usd_cents": 2255000
+        },
+        {
+          "day": "Sat",
+          "revenue_usd_cents": 1899000
+        },
+        {
+          "day": "Sun",
+          "revenue_usd_cents": 2034000
+        }
+      ]
+    },
+    "campaign": {
+      "name": "May launch campaign",
+      "current_usd_cents": 7420000,
+      "target_usd_cents": 10000000
+    },
+    "orders": [
+      {
+        "id": "ord_9001",
+        "user_id": "usr_201",
+        "total_usd_cents": 12999,
+        "status": "authorized",
+        "risk_score_percent": 82,
+        "created_at_epoch_ms": 1778881200000
+      },
+      {
+        "id": "ord_9002",
+        "user_id": "usr_044",
+        "total_usd_cents": 3999,
+        "status": "paid",
+        "risk_score_percent": 12,
+        "created_at_epoch_ms": 1778882400000
+      },
+      {
+        "id": "ord_9003",
+        "user_id": "usr_771",
+        "total_usd_cents": 24950,
+        "status": "pending_review",
+        "risk_score_percent": 93,
+        "created_at_epoch_ms": 1778883600000
+      },
+      {
+        "id": "ord_9004",
+        "user_id": "usr_118",
+        "total_usd_cents": 799,
+        "status": "refunded",
+        "risk_score_percent": 4,
+        "created_at_epoch_ms": 1778885400000
+      }
+    ],
+    "selected_order_id": "ord_9003",
+    "selected_order": {
+      "id": "ord_9003",
+      "user_id": "usr_771",
+      "status": "pending_review",
+      "payment_state": "authorized",
+      "shipping_state": "held",
+      "risk_reason": "High-value order from new account with proxy IP",
+      "support_note": "Customer asked to expedite shipping."
+    },
+    "agent": {
+      "recommendations": [
+        {
+          "severity": "high",
+          "title": "Review ord_9003 before capture",
+          "body": "Risk score is above the manual threshold and shipping is currently held."
+        },
+        {
+          "severity": "medium",
+          "title": "Investigate failed webhooks",
+          "body": "Seven webhook delivery jobs failed after retries in the last hour."
+        },
+        {
+          "severity": "low",
+          "title": "Campaign near target",
+          "body": "Revenue progress is 74.2%; agent suggests testing a small discount cohort."
+        }
+      ]
+    },
+    "active_panel": "security",
+    "security": {
+      "mfa_enforced": true,
+      "webhook_uri": "https://admin.example.test/webhooks/stripe",
+      "stripe_api_key_secret": "sk_live_redacted_in_renderer"
+    },
+    "fulfillment": {
+      "pick_queue_count": 42,
+      "late_shipments_count": 3
+    },
+    "recent_events": [
+      {
+        "timestamp_epoch_ms": 1778886000000,
+        "level": "warn",
+        "message": "Payment webhook delivery failed for ord_9001"
+      },
+      {
+        "timestamp_epoch_ms": 1778886060000,
+        "level": "info",
+        "message": "Agent generated 3 recommendations"
+      },
+      {
+        "timestamp_epoch_ms": 1778886120000,
+        "level": "error",
+        "message": "Inventory sync job failed after 3 retries"
+      }
+    ]
+  }
+}

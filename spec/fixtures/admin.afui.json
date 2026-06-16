@@ -1,0 +1,282 @@
+{
+  "afui": "0.1",
+  "type": "ui_snapshot",
+  "document": {
+    "screens": [
+      {
+        "id": "orders",
+        "title": "Orders",
+        "views": [
+          {
+            "id": "summary",
+            "kind": "stats",
+            "items": [
+              {
+                "label": "Pending",
+                "value_bind": "state:summary.pending_count"
+              },
+              {
+                "label": "Failed Jobs",
+                "value_bind": "state:summary.failed_jobs_count"
+              },
+              {
+                "label": "P95 Latency",
+                "value_bind": "state:summary.p95_latency_ms"
+              },
+              {
+                "label": "Error Rate",
+                "value_bind": "state:summary.error_rate_percent"
+              }
+            ]
+          },
+          {
+            "id": "orders_table",
+            "kind": "table",
+            "source_bind": "state:orders",
+            "selected_row_bind": "state:selected_order_id",
+            "order_id_bind": "record:id",
+            "columns": [
+              {
+                "key": "id",
+                "label": "Order"
+              },
+              {
+                "key": "user_id",
+                "label": "User"
+              },
+              {
+                "key": "total_usd_cents",
+                "label": "Total"
+              },
+              {
+                "key": "risk_score_percent",
+                "label": "Risk"
+              },
+              {
+                "key": "status",
+                "label": "Status"
+              },
+              {
+                "key": "created_at_epoch_ms",
+                "label": "Created"
+              }
+            ],
+            "row_actions": [
+              "open_order",
+              "approve_order",
+              "refund_order"
+            ]
+          },
+          {
+            "id": "selected_order",
+            "kind": "detail",
+            "description": "The order the operator is currently reviewing. Surface the risk reason and audit summary prominently before any approve/refund.",
+            "source_bind": "state:selected_order",
+            "order_id_bind": "record:id",
+            "fields": [
+              {
+                "key": "id",
+                "label": "Order"
+              },
+              {
+                "key": "status",
+                "label": "Status"
+              },
+              {
+                "key": "risk_reason",
+                "label": "Risk Reason"
+              },
+              {
+                "key": "audit_summary",
+                "label": "Audit"
+              }
+            ],
+            "actions": [
+              "open_audit_log",
+              "approve_order",
+              "refund_order"
+            ]
+          },
+          {
+            "id": "integrations",
+            "kind": "detail",
+            "description": "Live payment integration. The API key is a secret and must be masked by default; the webhook target is a host-resolved uri and must pass host trust policy before any test call.",
+            "source_bind": "state:integrations",
+            "fields": [
+              {
+                "key": "provider",
+                "label": "Provider"
+              },
+              {
+                "key": "stripe_api_key_secret",
+                "label": "API Key"
+              },
+              {
+                "key": "webhook_uri",
+                "label": "Webhook"
+              },
+              {
+                "key": "last_rotated_at_epoch_ms",
+                "label": "Rotated"
+              }
+            ],
+            "actions": [
+              "rotate_signing_secret"
+            ]
+          },
+          {
+            "id": "job_log",
+            "kind": "log",
+            "source_bind": "state:recent_events",
+            "level_key": "level",
+            "message_key": "message",
+            "time_key": "timestamp_epoch_ms"
+          }
+        ]
+      }
+    ],
+    "actions": [
+      {
+        "id": "open_order",
+        "label": "Open",
+        "risk": "read_only",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "order_id"
+          ],
+          "properties": {
+            "order_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "open_audit_log",
+        "label": "Audit Log",
+        "risk": "read_only"
+      },
+      {
+        "id": "approve_order",
+        "label": "Approve",
+        "risk": "external_effect",
+        "description": "Approves a flagged order and releases it for fulfilment. Triggers remote work; tell the operator the order will ship and the flag will clear.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "order_id"
+          ],
+          "properties": {
+            "order_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "refund_order",
+        "label": "Refund",
+        "risk": "destructive",
+        "description": "Refunds the full order amount to the customer's original payment method. This moves money irreversibly and cannot be undone. `reason` is not on the row, so the host collects it before emitting the event.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "order_id",
+            "reason"
+          ],
+          "properties": {
+            "order_id": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "rotate_signing_secret",
+        "label": "Rotate Signing Secret",
+        "risk": "destructive",
+        "description": "Generates a new signing secret and invalidates the old one immediately. In-flight webhooks signed with the old secret will fail.",
+        "undoable": false
+      },
+      {
+        "id": "retry_job",
+        "label": "Retry Job",
+        "risk": "local_mutation",
+        "description": "Re-enqueues a failed background job for another attempt.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "job_id"
+          ],
+          "properties": {
+            "job_id": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ],
+    "surface": {
+      "id": "order_admin",
+      "title": "Order Admin",
+      "description": "Human operator dashboard for orders, payments, jobs, and audit events."
+    }
+  },
+  "state": {
+    "summary": {
+      "pending_count": 12,
+      "failed_jobs_count": 3,
+      "p95_latency_ms": 840,
+      "error_rate_percent": 2.4
+    },
+    "orders": [
+      {
+        "id": "ord_123",
+        "user_id": "user_456",
+        "total_usd_cents": 1299,
+        "risk_score_percent": 82,
+        "risk_reason": "New account with mismatched billing region",
+        "status": "pending_review",
+        "created_at_epoch_ms": 1778819200000
+      },
+      {
+        "id": "ord_124",
+        "user_id": "user_789",
+        "total_usd_cents": 4999,
+        "risk_score_percent": 18,
+        "risk_reason": "Low risk repeat customer",
+        "status": "paid",
+        "created_at_epoch_ms": 1778819500000
+      }
+    ],
+    "selected_order_id": "ord_123",
+    "selected_order": {
+      "id": "ord_123",
+      "status": "pending_review",
+      "risk_reason": "New account with mismatched billing region",
+      "audit_summary": "No prior refunds. Manual approval required."
+    },
+    "integrations": {
+      "provider": "stripe",
+      "stripe_api_key_secret": "sk_live_example_redacted",
+      "webhook_uri": "https://hooks.order-admin.internal/stripe",
+      "last_rotated_at_epoch_ms": 1778000000000
+    },
+    "recent_events": [
+      {
+        "timestamp_epoch_ms": 1778819600000,
+        "level": "warn",
+        "message": "Job job_77 failed after 3 retries"
+      },
+      {
+        "timestamp_epoch_ms": 1778819660000,
+        "level": "info",
+        "message": "Order ord_124 payment captured"
+      }
+    ]
+  }
+}

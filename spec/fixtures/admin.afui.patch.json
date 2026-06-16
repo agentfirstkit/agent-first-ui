@@ -1,0 +1,30 @@
+[
+  {
+    "op": "test",
+    "path": "/orders/0/status",
+    "value": "pending_review"
+  },
+  {
+    "op": "replace",
+    "path": "/orders/0/status",
+    "value": "refunded"
+  },
+  {
+    "op": "add",
+    "path": "/recent_events/-",
+    "value": {
+      "timestamp_epoch_ms": 1778819700000,
+      "level": "info",
+      "message": "Order ord_123 refunded by operator"
+    }
+  },
+  {
+    "op": "remove",
+    "path": "/summary/failed_jobs_count"
+  },
+  {
+    "op": "move",
+    "from": "/selected_order_id",
+    "path": "/last_selected_order_id"
+  }
+]

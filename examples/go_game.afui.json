@@ -1,0 +1,3177 @@
+{
+  "afui": "0.1",
+  "type": "ui_snapshot",
+  "document": {
+    "screens": [
+      {
+        "id": "go_match",
+        "title": "Go Match",
+        "views": [
+          {
+            "id": "match_summary",
+            "kind": "stats",
+            "description": "Game status and clocks.",
+            "items": [
+              {
+                "label": "Turn",
+                "value_bind": "state:game.current_player"
+              },
+              {
+                "label": "Move",
+                "value_bind": "state:game.move_number"
+              },
+              {
+                "label": "Black Captures",
+                "value_bind": "state:game.black_captures_count"
+              },
+              {
+                "label": "White Captures",
+                "value_bind": "state:game.white_captures_count"
+              },
+              {
+                "label": "Komi",
+                "value_bind": "state:game.komi"
+              },
+              {
+                "label": "Byoyomi",
+                "value_bind": "state:game.byoyomi_s"
+              }
+            ]
+          },
+          {
+            "id": "board",
+            "kind": "go_board",
+            "description": "Render a 19x19 Go board with star points, stones, last move marker, legal move shading, and optional engine heat. Clicking an empty legal intersection triggers play_move with point from record:point.",
+            "source_bind": "state:board.points",
+            "board_size_bind": "state:board.size",
+            "last_move_bind": "state:board.last_move",
+            "ko_point_bind": "state:board.ko_point",
+            "x_key": "x",
+            "y_key": "y",
+            "point_key": "point",
+            "stone_key": "stone",
+            "legal_key": "legal",
+            "heat_key": "heat_percent",
+            "point_bind": "record:point",
+            "play_action": "play_move"
+          },
+          {
+            "id": "engine_eval",
+            "kind": "detail",
+            "description": "Engine opinion after the last move. The host may show it as a side panel.",
+            "source_bind": "state:engine",
+            "fields": [
+              {
+                "key": "best_move",
+                "label": "Best Move"
+              },
+              {
+                "key": "principal_variation",
+                "label": "PV"
+              },
+              {
+                "key": "black_winrate_percent",
+                "label": "Black Winrate"
+              },
+              {
+                "key": "visits_count",
+                "label": "Visits"
+              },
+              {
+                "key": "comment",
+                "label": "Comment"
+              }
+            ],
+            "actions": [
+              "request_hint"
+            ]
+          },
+          {
+            "id": "winrate",
+            "kind": "progress",
+            "description": "Engine black winrate as a progress bar.",
+            "label": "Black winrate",
+            "current_bind": "state:engine.black_winrate_percent",
+            "max": 100
+          },
+          {
+            "id": "move_history",
+            "kind": "table",
+            "description": "Move list. Selecting a row reviews history without changing the game.",
+            "source_bind": "state:moves",
+            "move_id_bind": "record:id",
+            "columns": [
+              {
+                "key": "number",
+                "label": "#"
+              },
+              {
+                "key": "color",
+                "label": "Color"
+              },
+              {
+                "key": "point",
+                "label": "Move"
+              },
+              {
+                "key": "comment",
+                "label": "Comment"
+              }
+            ],
+            "row_actions": [
+              "review_move"
+            ]
+          },
+          {
+            "id": "game_actions",
+            "kind": "action_bar",
+            "description": "Game-level actions. Resign is destructive for a rated match; pass changes game state.",
+            "actions": [
+              "pass_turn",
+              "request_hint",
+              "undo_move",
+              "resign_game",
+              "new_game"
+            ]
+          },
+          {
+            "id": "coach_log",
+            "kind": "log",
+            "description": "Bounded engine and coach messages.",
+            "source_bind": "state:coach_messages",
+            "level_key": "level",
+            "message_key": "message",
+            "time_key": "timestamp_epoch_ms"
+          }
+        ]
+      }
+    ],
+    "actions": [
+      {
+        "id": "play_move",
+        "label": "Play",
+        "risk": "external_effect",
+        "description": "Submits a move to the computer opponent or server-authoritative match loop.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "point"
+          ],
+          "properties": {
+            "point": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "pass_turn",
+        "label": "Pass",
+        "risk": "external_effect",
+        "description": "Passes the current turn."
+      },
+      {
+        "id": "request_hint",
+        "label": "Hint",
+        "risk": "external_effect",
+        "description": "Asks the engine for a hint; may spend compute budget."
+      },
+      {
+        "id": "undo_move",
+        "label": "Undo",
+        "risk": "local_mutation",
+        "undoable": true,
+        "description": "Requests an undo in local analysis mode."
+      },
+      {
+        "id": "resign_game",
+        "label": "Resign",
+        "risk": "destructive",
+        "undoable": false,
+        "description": "Ends the game as a loss. In rated mode this is irreversible."
+      },
+      {
+        "id": "new_game",
+        "label": "New Game",
+        "risk": "destructive",
+        "undoable": false,
+        "description": "Starts over and discards the current local game."
+      },
+      {
+        "id": "review_move",
+        "label": "Review",
+        "risk": "read_only",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "move_id"
+          ],
+          "properties": {
+            "move_id": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ],
+    "surface": {
+      "id": "go_human_vs_engine",
+      "title": "Human vs Computer Go",
+      "description": "Graphical Go operation surface for a human playing against a computer engine. The board is an open semantic kind rendered by a preinstalled host capability or by safe fallback; the action and point binding remain deterministic."
+    }
+  },
+  "state": {
+    "game": {
+      "current_player": "black",
+      "move_number": 13,
+      "black_captures_count": 1,
+      "white_captures_count": 0,
+      "komi": 6.5,
+      "byoyomi_s": 28
+    },
+    "board": {
+      "size": 19,
+      "last_move": "J10",
+      "ko_point": null,
+      "points": [
+        {
+          "point": "A19",
+          "x": 1,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "B19",
+          "x": 2,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "C19",
+          "x": 3,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "D19",
+          "x": 4,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "E19",
+          "x": 5,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "F19",
+          "x": 6,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "G19",
+          "x": 7,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "H19",
+          "x": 8,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "J19",
+          "x": 9,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "K19",
+          "x": 10,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "L19",
+          "x": 11,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "M19",
+          "x": 12,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "N19",
+          "x": 13,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "O19",
+          "x": 14,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "P19",
+          "x": 15,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "Q19",
+          "x": 16,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "R19",
+          "x": 17,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "S19",
+          "x": 18,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "T19",
+          "x": 19,
+          "y": 19,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "A18",
+          "x": 1,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "B18",
+          "x": 2,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "C18",
+          "x": 3,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "D18",
+          "x": 4,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "E18",
+          "x": 5,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "F18",
+          "x": 6,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "G18",
+          "x": 7,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "H18",
+          "x": 8,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "J18",
+          "x": 9,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "K18",
+          "x": 10,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "L18",
+          "x": 11,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "M18",
+          "x": 12,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "N18",
+          "x": 13,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "O18",
+          "x": 14,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "P18",
+          "x": 15,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "Q18",
+          "x": 16,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "R18",
+          "x": 17,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "S18",
+          "x": 18,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "T18",
+          "x": 19,
+          "y": 18,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "A17",
+          "x": 1,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "B17",
+          "x": 2,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "C17",
+          "x": 3,
+          "y": 17,
+          "stone": "black",
+          "legal": false,
+          "heat_percent": 0
+        },
+        {
+          "point": "D17",
+          "x": 4,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "E17",
+          "x": 5,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "F17",
+          "x": 6,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "G17",
+          "x": 7,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "H17",
+          "x": 8,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "J17",
+          "x": 9,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "K17",
+          "x": 10,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "L17",
+          "x": 11,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "M17",
+          "x": 12,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "N17",
+          "x": 13,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "O17",
+          "x": 14,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "P17",
+          "x": 15,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "Q17",
+          "x": 16,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "R17",
+          "x": 17,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "S17",
+          "x": 18,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "T17",
+          "x": 19,
+          "y": 17,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "A16",
+          "x": 1,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "B16",
+          "x": 2,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "C16",
+          "x": 3,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "D16",
+          "x": 4,
+          "y": 16,
+          "stone": "white",
+          "legal": false,
+          "heat_percent": 4
+        },
+        {
+          "point": "E16",
+          "x": 5,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "F16",
+          "x": 6,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "G16",
+          "x": 7,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "H16",
+          "x": 8,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "J16",
+          "x": 9,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "K16",
+          "x": 10,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "L16",
+          "x": 11,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "M16",
+          "x": 12,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "N16",
+          "x": 13,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "O16",
+          "x": 14,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "P16",
+          "x": 15,
+          "y": 16,
+          "stone": "white",
+          "legal": false,
+          "heat_percent": 12
+        },
+        {
+          "point": "Q16",
+          "x": 16,
+          "y": 16,
+          "stone": "black",
+          "legal": false,
+          "heat_percent": 4
+        },
+        {
+          "point": "R16",
+          "x": 17,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "S16",
+          "x": 18,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "T16",
+          "x": 19,
+          "y": 16,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "A15",
+          "x": 1,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "B15",
+          "x": 2,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "C15",
+          "x": 3,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "D15",
+          "x": 4,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "E15",
+          "x": 5,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "F15",
+          "x": 6,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "G15",
+          "x": 7,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "H15",
+          "x": 8,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "J15",
+          "x": 9,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "K15",
+          "x": 10,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "L15",
+          "x": 11,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "M15",
+          "x": 12,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "N15",
+          "x": 13,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "O15",
+          "x": 14,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "P15",
+          "x": 15,
+          "y": 15,
+          "stone": "black",
+          "legal": false,
+          "heat_percent": 20
+        },
+        {
+          "point": "Q15",
+          "x": 16,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "R15",
+          "x": 17,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "S15",
+          "x": 18,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "T15",
+          "x": 19,
+          "y": 15,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "A14",
+          "x": 1,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "B14",
+          "x": 2,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "C14",
+          "x": 3,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "D14",
+          "x": 4,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "E14",
+          "x": 5,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "F14",
+          "x": 6,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "G14",
+          "x": 7,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "H14",
+          "x": 8,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "J14",
+          "x": 9,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "K14",
+          "x": 10,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "L14",
+          "x": 11,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "M14",
+          "x": 12,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "N14",
+          "x": 13,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "O14",
+          "x": 14,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "P14",
+          "x": 15,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "Q14",
+          "x": 16,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "R14",
+          "x": 17,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "S14",
+          "x": 18,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "T14",
+          "x": 19,
+          "y": 14,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "A13",
+          "x": 1,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "B13",
+          "x": 2,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "C13",
+          "x": 3,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "D13",
+          "x": 4,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "E13",
+          "x": 5,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "F13",
+          "x": 6,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "G13",
+          "x": 7,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "H13",
+          "x": 8,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "J13",
+          "x": 9,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "K13",
+          "x": 10,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 76
+        },
+        {
+          "point": "L13",
+          "x": 11,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "M13",
+          "x": 12,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "N13",
+          "x": 13,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "O13",
+          "x": 14,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "P13",
+          "x": 15,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "Q13",
+          "x": 16,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "R13",
+          "x": 17,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "S13",
+          "x": 18,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "T13",
+          "x": 19,
+          "y": 13,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "A12",
+          "x": 1,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "B12",
+          "x": 2,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "C12",
+          "x": 3,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "D12",
+          "x": 4,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "E12",
+          "x": 5,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "F12",
+          "x": 6,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "G12",
+          "x": 7,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "H12",
+          "x": 8,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "J12",
+          "x": 9,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 76
+        },
+        {
+          "point": "K12",
+          "x": 10,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 84
+        },
+        {
+          "point": "L12",
+          "x": 11,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 76
+        },
+        {
+          "point": "M12",
+          "x": 12,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "N12",
+          "x": 13,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "O12",
+          "x": 14,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "P12",
+          "x": 15,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "Q12",
+          "x": 16,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "R12",
+          "x": 17,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "S12",
+          "x": 18,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "T12",
+          "x": 19,
+          "y": 12,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "A11",
+          "x": 1,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "B11",
+          "x": 2,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "C11",
+          "x": 3,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "D11",
+          "x": 4,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "E11",
+          "x": 5,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "F11",
+          "x": 6,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "G11",
+          "x": 7,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "H11",
+          "x": 8,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 76
+        },
+        {
+          "point": "J11",
+          "x": 9,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 84
+        },
+        {
+          "point": "K11",
+          "x": 10,
+          "y": 11,
+          "stone": "white",
+          "legal": false,
+          "heat_percent": 92
+        },
+        {
+          "point": "L11",
+          "x": 11,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 84
+        },
+        {
+          "point": "M11",
+          "x": 12,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 76
+        },
+        {
+          "point": "N11",
+          "x": 13,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "O11",
+          "x": 14,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "P11",
+          "x": 15,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "Q11",
+          "x": 16,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "R11",
+          "x": 17,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "S11",
+          "x": 18,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "T11",
+          "x": 19,
+          "y": 11,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "A10",
+          "x": 1,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "B10",
+          "x": 2,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "C10",
+          "x": 3,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "D10",
+          "x": 4,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "E10",
+          "x": 5,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "F10",
+          "x": 6,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "G10",
+          "x": 7,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 76
+        },
+        {
+          "point": "H10",
+          "x": 8,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 84
+        },
+        {
+          "point": "J10",
+          "x": 9,
+          "y": 10,
+          "stone": "white",
+          "legal": false,
+          "heat_percent": 92
+        },
+        {
+          "point": "K10",
+          "x": 10,
+          "y": 10,
+          "stone": "black",
+          "legal": false,
+          "heat_percent": 100
+        },
+        {
+          "point": "L10",
+          "x": 11,
+          "y": 10,
+          "stone": "black",
+          "legal": false,
+          "heat_percent": 92
+        },
+        {
+          "point": "M10",
+          "x": 12,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 84
+        },
+        {
+          "point": "N10",
+          "x": 13,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 76
+        },
+        {
+          "point": "O10",
+          "x": 14,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "P10",
+          "x": 15,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "Q10",
+          "x": 16,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "R10",
+          "x": 17,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "S10",
+          "x": 18,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "T10",
+          "x": 19,
+          "y": 10,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "A9",
+          "x": 1,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "B9",
+          "x": 2,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "C9",
+          "x": 3,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "D9",
+          "x": 4,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "E9",
+          "x": 5,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "F9",
+          "x": 6,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "G9",
+          "x": 7,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "H9",
+          "x": 8,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 76
+        },
+        {
+          "point": "J9",
+          "x": 9,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 84
+        },
+        {
+          "point": "K9",
+          "x": 10,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 92
+        },
+        {
+          "point": "L9",
+          "x": 11,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 84
+        },
+        {
+          "point": "M9",
+          "x": 12,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 76
+        },
+        {
+          "point": "N9",
+          "x": 13,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "O9",
+          "x": 14,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "P9",
+          "x": 15,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "Q9",
+          "x": 16,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "R9",
+          "x": 17,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "S9",
+          "x": 18,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "T9",
+          "x": 19,
+          "y": 9,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "A8",
+          "x": 1,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "B8",
+          "x": 2,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "C8",
+          "x": 3,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "D8",
+          "x": 4,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "E8",
+          "x": 5,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "F8",
+          "x": 6,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "G8",
+          "x": 7,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "H8",
+          "x": 8,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "J8",
+          "x": 9,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 76
+        },
+        {
+          "point": "K8",
+          "x": 10,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 84
+        },
+        {
+          "point": "L8",
+          "x": 11,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 76
+        },
+        {
+          "point": "M8",
+          "x": 12,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "N8",
+          "x": 13,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "O8",
+          "x": 14,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "P8",
+          "x": 15,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "Q8",
+          "x": 16,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "R8",
+          "x": 17,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "S8",
+          "x": 18,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "T8",
+          "x": 19,
+          "y": 8,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "A7",
+          "x": 1,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "B7",
+          "x": 2,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "C7",
+          "x": 3,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "D7",
+          "x": 4,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "E7",
+          "x": 5,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "F7",
+          "x": 6,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "G7",
+          "x": 7,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "H7",
+          "x": 8,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "J7",
+          "x": 9,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "K7",
+          "x": 10,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 76
+        },
+        {
+          "point": "L7",
+          "x": 11,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "M7",
+          "x": 12,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "N7",
+          "x": 13,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "O7",
+          "x": 14,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "P7",
+          "x": 15,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "Q7",
+          "x": 16,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "R7",
+          "x": 17,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "S7",
+          "x": 18,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "T7",
+          "x": 19,
+          "y": 7,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "A6",
+          "x": 1,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "B6",
+          "x": 2,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "C6",
+          "x": 3,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "D6",
+          "x": 4,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "E6",
+          "x": 5,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "F6",
+          "x": 6,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "G6",
+          "x": 7,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "H6",
+          "x": 8,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "J6",
+          "x": 9,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "K6",
+          "x": 10,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 68
+        },
+        {
+          "point": "L6",
+          "x": 11,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "M6",
+          "x": 12,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "N6",
+          "x": 13,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "O6",
+          "x": 14,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "P6",
+          "x": 15,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "Q6",
+          "x": 16,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "R6",
+          "x": 17,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "S6",
+          "x": 18,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "T6",
+          "x": 19,
+          "y": 6,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "A5",
+          "x": 1,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "B5",
+          "x": 2,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "C5",
+          "x": 3,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "D5",
+          "x": 4,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "E5",
+          "x": 5,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "F5",
+          "x": 6,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "G5",
+          "x": 7,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "H5",
+          "x": 8,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "J5",
+          "x": 9,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "K5",
+          "x": 10,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 60
+        },
+        {
+          "point": "L5",
+          "x": 11,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "M5",
+          "x": 12,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "N5",
+          "x": 13,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "O5",
+          "x": 14,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "P5",
+          "x": 15,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "Q5",
+          "x": 16,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "R5",
+          "x": 17,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "S5",
+          "x": 18,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "T5",
+          "x": 19,
+          "y": 5,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "A4",
+          "x": 1,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "B4",
+          "x": 2,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "C4",
+          "x": 3,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "D4",
+          "x": 4,
+          "y": 4,
+          "stone": "black",
+          "legal": false,
+          "heat_percent": 4
+        },
+        {
+          "point": "E4",
+          "x": 5,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "F4",
+          "x": 6,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "G4",
+          "x": 7,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "H4",
+          "x": 8,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "J4",
+          "x": 9,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "K4",
+          "x": 10,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 52
+        },
+        {
+          "point": "L4",
+          "x": 11,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "M4",
+          "x": 12,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "N4",
+          "x": 13,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "O4",
+          "x": 14,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "P4",
+          "x": 15,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "Q4",
+          "x": 16,
+          "y": 4,
+          "stone": "white",
+          "legal": false,
+          "heat_percent": 4
+        },
+        {
+          "point": "R4",
+          "x": 17,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "S4",
+          "x": 18,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "T4",
+          "x": 19,
+          "y": 4,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "A3",
+          "x": 1,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "B3",
+          "x": 2,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "C3",
+          "x": 3,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "D3",
+          "x": 4,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "E3",
+          "x": 5,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "F3",
+          "x": 6,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "G3",
+          "x": 7,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "H3",
+          "x": 8,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "J3",
+          "x": 9,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "K3",
+          "x": 10,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 44
+        },
+        {
+          "point": "L3",
+          "x": 11,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "M3",
+          "x": 12,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "N3",
+          "x": 13,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "O3",
+          "x": 14,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "P3",
+          "x": 15,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "Q3",
+          "x": 16,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "R3",
+          "x": 17,
+          "y": 3,
+          "stone": "white",
+          "legal": false,
+          "heat_percent": 0
+        },
+        {
+          "point": "S3",
+          "x": 18,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "T3",
+          "x": 19,
+          "y": 3,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "A2",
+          "x": 1,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "B2",
+          "x": 2,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "C2",
+          "x": 3,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "D2",
+          "x": 4,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "E2",
+          "x": 5,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "F2",
+          "x": 6,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "G2",
+          "x": 7,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "H2",
+          "x": 8,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "J2",
+          "x": 9,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "K2",
+          "x": 10,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 36
+        },
+        {
+          "point": "L2",
+          "x": 11,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "M2",
+          "x": 12,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "N2",
+          "x": 13,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "O2",
+          "x": 14,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "P2",
+          "x": 15,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "Q2",
+          "x": 16,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "R2",
+          "x": 17,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "S2",
+          "x": 18,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "T2",
+          "x": 19,
+          "y": 2,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "A1",
+          "x": 1,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "B1",
+          "x": 2,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "C1",
+          "x": 3,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "D1",
+          "x": 4,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "E1",
+          "x": 5,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "F1",
+          "x": 6,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "G1",
+          "x": 7,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "H1",
+          "x": 8,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "J1",
+          "x": 9,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "K1",
+          "x": 10,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 28
+        },
+        {
+          "point": "L1",
+          "x": 11,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 20
+        },
+        {
+          "point": "M1",
+          "x": 12,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 12
+        },
+        {
+          "point": "N1",
+          "x": 13,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 4
+        },
+        {
+          "point": "O1",
+          "x": 14,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "P1",
+          "x": 15,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "Q1",
+          "x": 16,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "R1",
+          "x": 17,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "S1",
+          "x": 18,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        },
+        {
+          "point": "T1",
+          "x": 19,
+          "y": 1,
+          "stone": null,
+          "legal": true,
+          "heat_percent": 0
+        }
+      ]
+    },
+    "engine": {
+      "best_move": "Q10",
+      "principal_variation": "Q10 C10 R6 D14",
+      "black_winrate_percent": 54.7,
+      "visits_count": 120384,
+      "comment": "Black is slightly ahead if the center influence is converted."
+    },
+    "moves": [
+      {
+        "id": "m1",
+        "number": 1,
+        "color": "black",
+        "point": "D4",
+        "comment": "Corner enclosure start"
+      },
+      {
+        "id": "m2",
+        "number": 2,
+        "color": "white",
+        "point": "Q16",
+        "comment": "Opposite corner"
+      },
+      {
+        "id": "m12",
+        "number": 12,
+        "color": "white",
+        "point": "J11",
+        "comment": "Cuts center influence"
+      },
+      {
+        "id": "m13",
+        "number": 13,
+        "color": "black",
+        "point": "J10",
+        "comment": "Last move"
+      }
+    ],
+    "coach_messages": [
+      {
+        "timestamp_epoch_ms": 1778890000000,
+        "level": "info",
+        "message": "Engine suggests expanding on the right side."
+      },
+      {
+        "timestamp_epoch_ms": 1778890060000,
+        "level": "warn",
+        "message": "Do not answer locally at J11 unless reading supports the cut."
+      }
+    ]
+  }
+}

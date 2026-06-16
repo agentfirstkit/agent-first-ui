@@ -1,0 +1,238 @@
+{
+  "afui": "0.1",
+  "type": "ui_snapshot",
+  "document": {
+    "screens": [
+      {
+        "id": "combat",
+        "title": "Combat",
+        "description": "The live encounter surface. Vitals and cast progress must stay glanceable; the host is free to overlay them on the viewport however the platform allows.",
+        "views": [
+          {
+            "id": "viewport",
+            "kind": "canvas",
+            "description": "The 3D scene the engine is rendering. AFUI does not transport pixels; it references the surface and lets the host composite the HUD over it.",
+            "surface_bind": "state:scene"
+          },
+          {
+            "id": "vitals",
+            "kind": "stats",
+            "description": "Health and resource for the controlled character. Low health is the single most safety-relevant signal; make it unmistakable.",
+            "items": [
+              {
+                "label": "HP",
+                "value_bind": "state:player.hp_current"
+              },
+              {
+                "label": "Mana",
+                "value_bind": "state:player.mana_current"
+              },
+              {
+                "label": "GCD",
+                "value_bind": "state:player.gcd_ms"
+              }
+            ]
+          },
+          {
+            "id": "cast",
+            "kind": "progress",
+            "description": "Current spell cast. Interrupting movement cancels it; surface the spell name so the player knows what they are losing.",
+            "current_bind": "state:cast.current_ms",
+            "max_bind": "state:cast.total_ms",
+            "label_bind": "state:cast.spell"
+          },
+          {
+            "id": "encounter_state",
+            "kind": "switch",
+            "description": "Top-level encounter phase. Each phase reframes the whole HUD; the host picks the discriminated child.",
+            "source_bind": "state:encounter.phase",
+            "cases": {
+              "trash": {
+                "id": "trash_banner",
+                "kind": "text",
+                "text_bind": "state:encounter.hint"
+              },
+              "boss": {
+                "id": "boss_frame",
+                "kind": "stats",
+                "items": [
+                  {
+                    "label": "Boss",
+                    "value_bind": "state:encounter.boss_name"
+                  },
+                  {
+                    "label": "Enrage in",
+                    "value_bind": "state:encounter.enrage_in_s"
+                  }
+                ]
+              },
+              "wipe": {
+                "id": "wipe_actions",
+                "kind": "action_bar",
+                "actions": [
+                  "release_spirit",
+                  "abandon_run"
+                ]
+              },
+              "victory": {
+                "id": "loot_actions",
+                "kind": "action_bar",
+                "actions": [
+                  "open_loot",
+                  "abandon_run"
+                ]
+              }
+            },
+            "default": {
+              "id": "idle_banner",
+              "kind": "text",
+              "text": "Awaiting encounter."
+            }
+          },
+          {
+            "id": "combat_log",
+            "kind": "log",
+            "description": "Windowed combat events. This is a bounded tail, never the full fight history; older lines are dropped, not paged.",
+            "source_bind": "state:recent_events",
+            "level_key": "level",
+            "message_key": "message",
+            "time_key": "timestamp_epoch_ms"
+          },
+          {
+            "id": "abilities",
+            "kind": "action_bar",
+            "description": "Primary combat affordances. The host may bind these to keys, buttons, or a gamepad; risk must survive whichever it picks.",
+            "actions": [
+              "basic_attack",
+              "use_potion",
+              "rez_ally",
+              "flee",
+              "abandon_run"
+            ],
+            "target_id_bind": "state:target.id",
+            "ally_id_bind": "state:focus_ally_id"
+          }
+        ]
+      }
+    ],
+    "actions": [
+      {
+        "id": "basic_attack",
+        "label": "Attack",
+        "risk": "external_effect",
+        "description": "Sends an attack to the authoritative server. The outcome is resolved remotely; the client only requests it.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "target_id"
+          ],
+          "properties": {
+            "target_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "use_potion",
+        "label": "Use Potion",
+        "risk": "local_mutation",
+        "undoable": false,
+        "description": "Consumes a potion from inventory and applies its effect. Low stakes but not reversible once drunk."
+      },
+      {
+        "id": "rez_ally",
+        "label": "Resurrect",
+        "risk": "external_effect",
+        "description": "Asks the server to resurrect a downed ally. Costs reagents and may fail if the ally has already released.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "ally_id"
+          ],
+          "properties": {
+            "ally_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "release_spirit",
+        "label": "Release Spirit",
+        "risk": "external_effect",
+        "description": "Releases to the graveyard. Ends any chance of an in-combat resurrection for this death."
+      },
+      {
+        "id": "open_loot",
+        "label": "Open Loot",
+        "risk": "read_only",
+        "description": "Inspects the encounter reward table. Looking does not commit anything."
+      },
+      {
+        "id": "flee",
+        "label": "Flee",
+        "risk": "local_mutation",
+        "description": "Disengages and runs. Drops combat state but keeps the run alive."
+      },
+      {
+        "id": "abandon_run",
+        "label": "Abandon Run",
+        "risk": "destructive",
+        "description": "Forfeits the entire raid run: the lockout is consumed and all uncollected loot is lost. This cannot be undone."
+      }
+    ],
+    "surface": {
+      "id": "raid_hud",
+      "title": "Raid HUD",
+      "description": "In-game heads-up display for a server-authoritative raid encounter. Proves AFUI carries spatial, temporal, and windowed-stream UI, not only forms and tables."
+    }
+  },
+  "state": {
+    "scene": {
+      "source_uri": "engine://viewport/main",
+      "mime": "application/x-game-surface",
+      "width_px": 2560,
+      "height_px": 1440
+    },
+    "player": {
+      "hp_current": 18450,
+      "hp_max": 31200,
+      "mana_current": 7600,
+      "mana_max": 12000,
+      "gcd_ms": 1500
+    },
+    "cast": {
+      "spell": "Greater Heal",
+      "current_ms": 1200,
+      "total_ms": 2500
+    },
+    "encounter": {
+      "phase": "boss",
+      "boss_name": "Maw of the Tide",
+      "enrage_in_s": 84,
+      "hint": "Stack behind the pillar before the slam."
+    },
+    "target": {
+      "id": "npc_maw"
+    },
+    "focus_ally_id": "ally_tanky",
+    "recent_events": [
+      {
+        "timestamp_epoch_ms": 1778820000000,
+        "level": "info",
+        "message": "You cast Greater Heal on Tanky."
+      },
+      {
+        "timestamp_epoch_ms": 1778820001500,
+        "level": "warn",
+        "message": "Maw of the Tide begins to cast Tidal Slam."
+      },
+      {
+        "timestamp_epoch_ms": 1778820003000,
+        "level": "error",
+        "message": "Healer2 was struck for 22,140 and died."
+      }
+    ]
+  }
+}

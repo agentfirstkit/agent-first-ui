@@ -1,0 +1,365 @@
+{
+  "afui": "0.1",
+  "type": "ui_snapshot",
+  "document": {
+    "screens": [
+      {
+        "id": "main",
+        "title": "Tendril",
+        "views": [
+          {
+            "id": "tab_bar",
+            "kind": "tabs",
+            "source_bind": "state:tabs",
+            "active_bind": "state:active_tab_id",
+            "label_key": "title",
+            "kind_key": "kind",
+            "new_action": "new_home_tab",
+            "activate_action": "activate_tab",
+            "close_action": "close_tab",
+            "tab_id_bind": "record:id"
+          },
+          {
+            "id": "address_bar",
+            "kind": "input",
+            "value_bind": "state:address.value",
+            "placeholder": "Enter address, domain, or search...",
+            "submit_action": "submit_address",
+            "text_bind": "input:."
+          },
+          {
+            "id": "active_content",
+            "kind": "switch",
+            "source_bind": "state:active_tab_kind",
+            "cases": {
+              "home": {
+                "id": "home_panel",
+                "kind": "list",
+                "source_bind": "state:home.messages",
+                "empty_view": {
+                  "id": "landing",
+                  "kind": "action_bar",
+                  "actions": [
+                    "focus_search",
+                    "open_settings"
+                  ]
+                },
+                "footer": {
+                  "id": "refine_input",
+                  "kind": "input",
+                  "placeholder": "Refine search, ask a question...",
+                  "submit_action": "refine_search",
+                  "text_bind": "input:."
+                }
+              },
+              "spore": {
+                "id": "spore_detail",
+                "kind": "detail",
+                "description": "A spore the user is considering bonding. Make the safety-taste state obvious: running a taste reaches the network, skipping it accepts unvetted code.",
+                "source_bind": "state:spore.active",
+                "fields": [
+                  {
+                    "key": "name",
+                    "label": "Name"
+                  },
+                  {
+                    "key": "domain",
+                    "label": "Domain"
+                  },
+                  {
+                    "key": "uri",
+                    "label": "URI"
+                  },
+                  {
+                    "key": "license",
+                    "label": "License"
+                  },
+                  {
+                    "key": "phase",
+                    "label": "Phase"
+                  },
+                  {
+                    "key": "cached",
+                    "label": "Cached"
+                  }
+                ],
+                "actions": [
+                  "open_spore",
+                  "skip_safety_taste",
+                  "run_safety_taste",
+                  "open_service",
+                  "open_in_editor"
+                ]
+              },
+              "settings": {
+                "id": "settings_panel",
+                "kind": "tree",
+                "description": "Editable config and prompt files. Resetting a virtual file discards local edits irreversibly; communicate that before the user commits.",
+                "source_bind": "state:settings.files",
+                "selected_node_bind": "state:settings.selected_file_path",
+                "path_bind": "record:id",
+                "actions": [
+                  "select_file",
+                  "save_file",
+                  "reset_virtual_file",
+                  "toggle_auto_bond"
+                ]
+              },
+              "service": {
+                "id": "service_chat",
+                "kind": "list",
+                "source_bind": "state:service.messages",
+                "header": {
+                  "id": "service_summary",
+                  "kind": "stats",
+                  "items": [
+                    {
+                      "label": "Service",
+                      "value_bind": "state:service.name"
+                    },
+                    {
+                      "label": "Credits",
+                      "value_bind": "state:service.credits"
+                    }
+                  ]
+                },
+                "footer": {
+                  "id": "service_message_input",
+                  "kind": "input",
+                  "placeholder": "Type a message...",
+                  "submit_action": "send_service_message",
+                  "text_bind": "input:."
+                }
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "actions": [
+      {
+        "id": "new_home_tab",
+        "label": "New Tab",
+        "risk": "local_mutation"
+      },
+      {
+        "id": "activate_tab",
+        "label": "Activate Tab",
+        "risk": "read_only",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "tab_id"
+          ],
+          "properties": {
+            "tab_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "close_tab",
+        "label": "Close Tab",
+        "risk": "local_mutation",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "tab_id"
+          ],
+          "properties": {
+            "tab_id": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "focus_search",
+        "label": "Search",
+        "risk": "read_only"
+      },
+      {
+        "id": "open_settings",
+        "label": "Settings",
+        "risk": "read_only"
+      },
+      {
+        "id": "submit_address",
+        "label": "Open or Search",
+        "risk": "external_effect",
+        "description": "Resolves the text as an address or a search and navigates.",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "text"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "refine_search",
+        "label": "Refine Search",
+        "risk": "external_effect",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "text"
+          ],
+          "properties": {
+            "text": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "open_spore",
+        "label": "Open",
+        "risk": "external_effect",
+        "description": "Fetches the spore over the network so it can be inspected and tasted."
+      },
+      {
+        "id": "skip_safety_taste",
+        "label": "Skip Taste",
+        "risk": "local_mutation",
+        "description": "Proceeds without running the safety taste. The user is accepting code that has not been vetted on this machine."
+      },
+      {
+        "id": "run_safety_taste",
+        "label": "Run Safety Taste",
+        "risk": "external_effect",
+        "description": "Runs the safety taste in a sandbox; reaches the network and may take a while."
+      },
+      {
+        "id": "open_service",
+        "label": "Open Service",
+        "risk": "local_mutation"
+      },
+      {
+        "id": "open_in_editor",
+        "label": "Open in Editor",
+        "risk": "external_effect",
+        "description": "Hands the spore's files to the host's external editor."
+      },
+      {
+        "id": "select_file",
+        "label": "Select File",
+        "risk": "read_only",
+        "input_schema": {
+          "type": "object",
+          "required": [
+            "path"
+          ],
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      {
+        "id": "save_file",
+        "label": "Save",
+        "risk": "local_mutation"
+      },
+      {
+        "id": "reset_virtual_file",
+        "label": "Reset to Default",
+        "risk": "destructive",
+        "description": "Discards all local edits to this file and restores the built-in default. This cannot be undone."
+      },
+      {
+        "id": "toggle_auto_bond",
+        "label": "Auto Bond",
+        "risk": "local_mutation"
+      },
+      {
+        "id": "send_service_message",
+        "label": "Send",
+        "risk": "external_effect"
+      },
+      {
+        "id": "purchase_credits",
+        "label": "Buy Credits",
+        "risk": "external_effect",
+        "description": "Opens the credit purchase flow. No charge happens until the payment is confirmed."
+      },
+      {
+        "id": "confirm_payment",
+        "label": "Confirm Payment",
+        "risk": "destructive",
+        "description": "Charges the selected payment method now. This pays real money irreversibly."
+      }
+    ],
+    "surface": {
+      "id": "tendril",
+      "title": "Tendril",
+      "description": "CMN browser for finding, opening, tasting, and using spores."
+    }
+  },
+  "state": {
+    "tabs": [
+      {
+        "id": "home-0",
+        "kind": "home",
+        "title": "Home",
+        "closable": false
+      }
+    ],
+    "active_tab_id": "home-0",
+    "active_tab_kind": "home",
+    "address": {
+      "value": "",
+      "composing": false
+    },
+    "home": {
+      "is_loading": false,
+      "messages": [],
+      "search_results": []
+    },
+    "spore": {
+      "active": {
+        "uri": "",
+        "name": "",
+        "domain": "",
+        "license": "",
+        "phase": "none",
+        "cached": false,
+        "downloaded_bytes": 0,
+        "total_bytes": null,
+        "file_tree": []
+      }
+    },
+    "settings": {
+      "root_path": "~/.config/tendril",
+      "auto_bond": true,
+      "selected_file_path": null,
+      "files": [
+        {
+          "id": "config.toml",
+          "name": "config.toml",
+          "is_dir": false,
+          "source": "virtual"
+        },
+        {
+          "id": "prompts/main/system.md",
+          "name": "system.md",
+          "is_dir": false,
+          "source": "virtual"
+        }
+      ]
+    },
+    "service": {
+      "name": "",
+      "domain": "",
+      "credits": null,
+      "messages": [],
+      "pending_payment": null
+    }
+  }
+}
