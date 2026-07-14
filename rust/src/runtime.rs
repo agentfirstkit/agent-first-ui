@@ -1,66 +1,77 @@
-use serde_json::Value;
+use crate::error::AgentFirstUiError;
+use crate::operation::{Operation, apply_operations, parse_pointer};
+use crate::types::{AgentFirstUiMessage, MessagePayload, Space};
+use crate::validation::{is_valid_owner_key, validate_space};
 
-use crate::error::AfuiError;
-use crate::patch::apply_patch;
-use crate::types::{AfuiMessage, AfuiPayload, Document, Snapshot, State, Theme};
-use crate::validation::validate_document;
-
-pub fn apply_afui_message(
-    current: Option<&Snapshot>,
-    message: &AfuiMessage,
-) -> Result<Snapshot, AfuiError> {
+/// Advance a space by one message.
+///
+/// - A **snapshot** replaces the space and resets the emit-log position; it is
+///   checked for well-formedness first.
+/// - An **emit** applies its JSON Patch operations to the current space, after
+///   verifying the author writes only its own section, and advances the position.
+/// - A **request** is an intent routed to an owner, not a space change, so it is
+///   not applied here.
+pub fn apply_message(
+    current_space: Option<&Space>,
+    message: &AgentFirstUiMessage,
+) -> Result<(Space, u64), AgentFirstUiError> {
     message.ensure_version()?;
 
     match &message.payload {
-        AfuiPayload::UiSnapshot {
-            document,
-            state,
-            theme,
+        MessagePayload::Snapshot { space, sequence } => {
+            validate_space(space)?;
+            Ok((space.clone(), *sequence))
+        }
+        MessagePayload::Emit {
+            author,
+            sequence,
+            operations,
         } => {
-            validate_document(document)?;
-            Ok(Snapshot {
-                document: document.clone(),
-                state: state.clone(),
-                theme: theme.clone(),
-            })
+            let current = current_space.ok_or(AgentFirstUiError::MissingSpace)?;
+            ensure_emit_write_scope(author, operations)?;
+            let next = apply_operations(current.as_value(), operations)?;
+            let next_space = Space::try_from_value(next)?;
+            validate_space(&next_space)?;
+            Ok((next_space, *sequence))
         }
-        AfuiPayload::StatePatch { patch } => {
-            let current = current.ok_or(AfuiError::MissingSnapshot)?;
-            let next_state = apply_patch(current.state.as_value(), patch)?;
-            Ok(Snapshot {
-                document: current.document.clone(),
-                state: State::try_from_value(next_state)?,
-                theme: current.theme.clone(),
-            })
+        MessagePayload::Request { .. } => Err(AgentFirstUiError::UnsupportedMessageType {
+            message_type: "request".to_string(),
+        }),
+    }
+}
+
+/// An owner is the sole writer of its own section. Every operation in an emit
+/// must target a path under the author's section; a move also removes from its
+/// `from` path, so that must be owned too. (A copy only reads from `from`, so it
+/// may read another section.)
+///
+/// Exposed so owner/transport code that scopes emits per audience (see
+/// `projection`) enforces the same write-scope before delivering an emit.
+pub fn ensure_emit_write_scope(
+    author: &str,
+    operations: &[Operation],
+) -> Result<(), AgentFirstUiError> {
+    if !is_valid_owner_key(author) {
+        return Err(AgentFirstUiError::InvalidIdentifier {
+            identifier: author.to_string(),
+        });
+    }
+    for operation in operations {
+        ensure_owned(author, operation.path())?;
+        if let Operation::Move { from, .. } = operation {
+            ensure_owned(author, from)?;
         }
-        AfuiPayload::DocumentPatch { patch } => {
-            let current = current.ok_or(AfuiError::MissingSnapshot)?;
-            let document_value = serde_json::to_value(&current.document)?;
-            let next_document_value = apply_patch(&document_value, patch)?;
-            let next_document: Document = serde_json::from_value(next_document_value)?;
-            validate_document(&next_document)?;
-            Ok(Snapshot {
-                document: next_document,
-                state: current.state.clone(),
-                theme: current.theme.clone(),
-            })
-        }
-        AfuiPayload::ThemePatch { patch } => {
-            let current = current.ok_or(AfuiError::MissingSnapshot)?;
-            let theme_value = current
-                .theme
-                .as_ref()
-                .map(|theme| theme.as_value().clone())
-                .unwrap_or_else(|| Value::Object(Default::default()));
-            let next_theme = apply_patch(&theme_value, patch)?;
-            Ok(Snapshot {
-                document: current.document.clone(),
-                state: current.state.clone(),
-                theme: Some(Theme::try_from_value(next_theme)?),
-            })
-        }
-        AfuiPayload::UserAction(_) => Err(AfuiError::UnsupportedMessageType {
-            message_type: "user_action".to_string(),
+    }
+    Ok(())
+}
+
+fn ensure_owned(author: &str, pointer: &str) -> Result<(), AgentFirstUiError> {
+    let tokens = parse_pointer(pointer)?;
+    match tokens.first() {
+        Some(section) if section == author => Ok(()),
+        _ => Err(AgentFirstUiError::CrossSectionEmit {
+            author: author.to_string(),
+            path: pointer.to_string(),
         }),
     }
 }

@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::AfuiError;
-use crate::host::HostStore;
-use crate::runtime::apply_afui_message;
-use crate::types::{Action, AfuiMessage, AfuiPayload, Snapshot, View, AFUI_VERSION};
-use crate::validation::validate_document;
+use crate::error::AgentFirstUiError;
+use crate::profile::{ProfileValidationReport, ValidationProfile, validate_space_profile};
+use crate::store::SpaceStore;
+use crate::types::{AgentFirstUiMessage, MessagePayload, PROTOCOL_VERSION, Space};
+use crate::validation::validate_space;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationReport {
@@ -15,80 +15,112 @@ pub struct ValidationReport {
     pub issues: Vec<String>,
 }
 
+/// A summary report of a space's structure and validation state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AfuiReport {
-    pub afui_version: String,
-    pub surface_id: String,
-    pub surface_title: String,
-    pub screen_count: usize,
-    pub view_count: usize,
-    pub action_count: usize,
-    pub has_theme: bool,
-    pub view_kinds: BTreeMap<String, usize>,
-    pub action_risks: BTreeMap<String, usize>,
+pub struct SpaceReport {
+    pub protocol_version: String,
+    pub owner_count: usize,
+    pub capability_count: usize,
+    pub unit_count: usize,
+    pub unit_kinds: BTreeMap<String, usize>,
+    pub capability_risks: BTreeMap<String, usize>,
     pub validation: ValidationReport,
+    pub profile_validation: ProfileValidationReport,
 }
 
-pub fn inspect_snapshot(snapshot: &Snapshot) -> AfuiReport {
-    let validation = validation_report(snapshot);
-    let mut view_kinds = BTreeMap::new();
-    for screen in &snapshot.document.screens {
-        for view in &screen.views {
-            collect_view_kind(view, &mut view_kinds);
+/// Inspect a space and produce a report.
+pub fn inspect_space(space: &Space) -> SpaceReport {
+    let validation = match validate_space(space) {
+        Ok(()) => ValidationReport {
+            valid: true,
+            issues: Vec::new(),
+        },
+        Err(AgentFirstUiError::WellFormedness { issues }) => ValidationReport {
+            valid: false,
+            issues,
+        },
+        Err(e) => ValidationReport {
+            valid: false,
+            issues: vec![e.to_string()],
+        },
+    };
+    let profile_validation = validate_space_profile(space, ValidationProfile::ReferenceHost);
+
+    let mut owner_count = 0;
+    let mut capability_count = 0;
+    let mut unit_count = 0;
+    let mut unit_kinds: BTreeMap<String, usize> = BTreeMap::new();
+    let mut capability_risks: BTreeMap<String, usize> = BTreeMap::new();
+
+    if let Some(obj) = space.as_value().as_object() {
+        for section in obj.values() {
+            owner_count += 1;
+            if let Some(caps) = section.get("capabilities").and_then(|v| v.as_array()) {
+                capability_count += caps.len();
+                for cap in caps {
+                    let risk = cap
+                        .get("risk")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("destructive");
+                    *capability_risks.entry(risk.to_string()).or_insert(0) += 1;
+                }
+            }
+            if let Some(units) = section.get("units").and_then(|v| v.as_array()) {
+                for unit in units {
+                    unit_count += 1;
+                    if let Some(kind) = unit.get("kind").and_then(|k| k.as_str()) {
+                        *unit_kinds.entry(kind.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
         }
     }
 
-    let mut action_risks = BTreeMap::new();
-    for action in &snapshot.document.actions {
-        collect_action_risk(action, &mut action_risks);
-    }
-
-    AfuiReport {
-        afui_version: AFUI_VERSION.to_string(),
-        surface_id: snapshot.document.surface.id.clone(),
-        surface_title: snapshot.document.surface.title.clone(),
-        screen_count: snapshot.document.screens.len(),
-        view_count: view_kinds.values().sum(),
-        action_count: snapshot.document.actions.len(),
-        has_theme: snapshot.theme.is_some(),
-        view_kinds,
-        action_risks,
+    SpaceReport {
+        protocol_version: PROTOCOL_VERSION.to_string(),
+        owner_count,
+        capability_count,
+        unit_count,
+        unit_kinds,
+        capability_risks,
         validation,
+        profile_validation,
     }
 }
 
+/// A record of a failed replay step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayFailure {
     pub line: usize,
     pub message: String,
 }
 
+/// A summary of replaying a stream of messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayReport {
     pub message_count: usize,
     pub applied_count: usize,
     pub snapshot_count: usize,
-    pub state_patch_count: usize,
-    pub document_patch_count: usize,
-    pub theme_patch_count: usize,
-    pub user_action_count: usize,
+    pub emit_count: usize,
+    pub request_count: usize,
     pub failure_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<ReplayFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub final_report: Option<AfuiReport>,
+    pub final_report: Option<SpaceReport>,
 }
 
+/// Replay a JSONL stream of messages. Each non-blank line must be an
+/// `AgentFirstUiMessage`. Snapshots and emits advance the store; requests are
+/// recorded without changing space state.
 pub fn replay_jsonl(input: &str) -> ReplayReport {
-    let mut store = HostStore::new();
+    let mut store = SpaceStore::new();
     let mut report = ReplayReport {
         message_count: 0,
         applied_count: 0,
         snapshot_count: 0,
-        state_patch_count: 0,
-        document_patch_count: 0,
-        theme_patch_count: 0,
-        user_action_count: 0,
+        emit_count: 0,
+        request_count: 0,
         failure_count: 0,
         failures: Vec::new(),
         final_report: None,
@@ -101,77 +133,54 @@ pub fn replay_jsonl(input: &str) -> ReplayReport {
             continue;
         }
         report.message_count += 1;
-        let message: AfuiMessage = match serde_json::from_str(trimmed) {
-            Ok(message) => message,
-            Err(error) => {
-                push_failure(&mut report, line_number, error);
+
+        let message: AgentFirstUiMessage = match serde_json::from_str(trimmed) {
+            Ok(msg) => msg,
+            Err(e) => {
+                push_failure(&mut report, line_number, e);
                 continue;
             }
         };
 
         match &message.payload {
-            AfuiPayload::UiSnapshot { .. } => report.snapshot_count += 1,
-            AfuiPayload::StatePatch { .. } => report.state_patch_count += 1,
-            AfuiPayload::DocumentPatch { .. } => report.document_patch_count += 1,
-            AfuiPayload::ThemePatch { .. } => report.theme_patch_count += 1,
-            AfuiPayload::UserAction(_) => report.user_action_count += 1,
+            MessagePayload::Snapshot { .. } => report.snapshot_count += 1,
+            MessagePayload::Emit { .. } => report.emit_count += 1,
+            MessagePayload::Request { .. } => report.request_count += 1,
         }
 
-        let applied = match &message.payload {
-            AfuiPayload::UserAction(_) => store.emit_user_action(message).map(|_| ()),
-            _ => apply_host_message(&mut store, &message),
+        let result = match &message.payload {
+            MessagePayload::Request { .. } => store.record_request(message).map(|_| ()),
+            _ => store.apply(&message).map(|_| ()),
         };
-        if let Err(error) = applied {
-            push_failure(&mut report, line_number, error);
-        } else {
-            report.applied_count += 1;
+
+        match result {
+            Ok(()) => report.applied_count += 1,
+            Err(e) => push_failure(&mut report, line_number, e),
         }
     }
 
     report.failure_count = report.failures.len();
-    report.final_report = store.snapshot().map(inspect_snapshot);
+    report.final_report = store.space().map(inspect_space);
     report
 }
 
-pub fn replay_messages(messages: &[AfuiMessage]) -> Result<Option<Snapshot>, AfuiError> {
-    let mut snapshot = None;
+/// Replay a slice of messages, returning the final space state (or None if no
+/// snapshot was seen).
+pub fn replay_messages(
+    messages: &[AgentFirstUiMessage],
+) -> Result<Option<Space>, AgentFirstUiError> {
+    let mut store = SpaceStore::new();
     for message in messages {
-        if matches!(&message.payload, AfuiPayload::UserAction(_)) {
-            continue;
+        match &message.payload {
+            MessagePayload::Request { .. } => {
+                store.record_request(message.clone())?;
+            }
+            _ => {
+                store.apply(message)?;
+            }
         }
-        snapshot = Some(apply_afui_message(snapshot.as_ref(), message)?);
     }
-    Ok(snapshot)
-}
-
-fn validation_report(snapshot: &Snapshot) -> ValidationReport {
-    match validate_document(&snapshot.document) {
-        Ok(()) => ValidationReport {
-            valid: true,
-            issues: Vec::new(),
-        },
-        Err(AfuiError::WellFormedness { issues }) => ValidationReport {
-            valid: false,
-            issues,
-        },
-        Err(error) => ValidationReport {
-            valid: false,
-            issues: vec![error.to_string()],
-        },
-    }
-}
-
-fn collect_view_kind(view: &View, view_kinds: &mut BTreeMap<String, usize>) {
-    *view_kinds.entry(view.kind.clone()).or_insert(0) += 1;
-    for child in view.child_views() {
-        collect_view_kind(child, view_kinds);
-    }
-}
-
-fn collect_action_risk(action: &Action, action_risks: &mut BTreeMap<String, usize>) {
-    *action_risks
-        .entry(action.risk.as_str().to_string())
-        .or_insert(0) += 1;
+    Ok(store.space().cloned())
 }
 
 fn push_failure(report: &mut ReplayReport, line: usize, error: impl ToString) {
@@ -179,8 +188,4 @@ fn push_failure(report: &mut ReplayReport, line: usize, error: impl ToString) {
         line,
         message: error.to_string(),
     });
-}
-
-fn apply_host_message(store: &mut HostStore, message: &AfuiMessage) -> Result<(), AfuiError> {
-    store.apply_message(message).map(|_| ())
 }

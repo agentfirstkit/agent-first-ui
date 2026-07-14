@@ -1,14 +1,20 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::error::AfuiError;
+use crate::error::AgentFirstUiError;
 
+/// The scopes a binding may read from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BindingScope {
-    State,
+    /// The shared space tree.
+    Space,
+    /// The current row of a list or table.
     Record,
+    /// The request input being assembled.
     Input,
+    /// The current actor/viewer's own section.
+    Actor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,32 +24,33 @@ pub struct Binding {
 }
 
 impl Binding {
-    pub fn parse(value: &str) -> Result<Self, AfuiError> {
+    pub fn parse(value: &str) -> Result<Self, AgentFirstUiError> {
         let (scope, path) = if let Some((prefix, path)) = value.split_once(':') {
             let scope = match prefix {
-                "state" => BindingScope::State,
+                "space" => BindingScope::Space,
                 "record" => BindingScope::Record,
                 "input" => BindingScope::Input,
+                "actor" => BindingScope::Actor,
                 other => {
-                    return Err(AfuiError::InvalidBinding {
+                    return Err(AgentFirstUiError::InvalidBinding {
                         binding: value.to_string(),
                         reason: format!("unknown scope `{other}`"),
-                    })
+                    });
                 }
             };
             (scope, path)
         } else {
-            (BindingScope::State, value)
+            (BindingScope::Space, value)
         };
 
         if path.is_empty() {
-            return Err(AfuiError::InvalidBinding {
+            return Err(AgentFirstUiError::InvalidBinding {
                 binding: value.to_string(),
                 reason: "path must not be empty".to_string(),
             });
         }
         if path.contains(':') {
-            return Err(AfuiError::InvalidBinding {
+            return Err(AgentFirstUiError::InvalidBinding {
                 binding: value.to_string(),
                 reason: "path must not contain ':'".to_string(),
             });
@@ -57,7 +64,7 @@ impl Binding {
 }
 
 impl std::str::FromStr for Binding {
-    type Err = AfuiError;
+    type Err = AgentFirstUiError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::parse(s)
@@ -66,17 +73,19 @@ impl std::str::FromStr for Binding {
 
 #[derive(Debug, Clone, Copy)]
 pub struct BindingContext<'a> {
-    pub state: &'a Value,
+    pub space: &'a Value,
     pub record: Option<&'a Value>,
     pub input: Option<&'a Value>,
+    pub actor: Option<&'a Value>,
 }
 
 impl<'a> BindingContext<'a> {
-    pub fn new(state: &'a Value) -> Self {
+    pub fn new(space: &'a Value) -> Self {
         Self {
-            state,
+            space,
             record: None,
             input: None,
+            actor: None,
         }
     }
 
@@ -89,25 +98,27 @@ impl<'a> BindingContext<'a> {
         self.input = input;
         self
     }
+
+    pub fn with_actor(mut self, actor: Option<&'a Value>) -> Self {
+        self.actor = actor;
+        self
+    }
 }
 
 pub fn resolve_binding<'a>(
-    ctx: &'a BindingContext<'a>,
+    context: &'a BindingContext<'a>,
     binding_value: &str,
-) -> Result<Option<&'a Value>, AfuiError> {
+) -> Result<Option<&'a Value>, AgentFirstUiError> {
     let binding = Binding::parse(binding_value)?;
     let root = match binding.scope {
-        BindingScope::State => Some(ctx.state),
-        BindingScope::Record => ctx.record,
-        BindingScope::Input => ctx.input,
+        BindingScope::Space => Some(context.space),
+        BindingScope::Record => context.record,
+        BindingScope::Input => context.input,
+        BindingScope::Actor => context.actor,
     };
     let Some(root) = root else {
         return Ok(None);
     };
-
-    if binding.scope == BindingScope::Input && binding.path == "value" && !root.is_object() {
-        return Ok(Some(root));
-    }
 
     Ok(get_dot_path(root, &binding.path))
 }

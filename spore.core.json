@@ -2,19 +2,26 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-ui",
   "name": "Agent-First UI",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
-  "synopsis": "A UI protocol that lets a tool describe its interface as data instead of code — so a trusted host you own renders the screens and actions, and nothing the tool sends can run on your machine.",
+  "synopsis": "A protocol that lets a tool publish **what is true** and **what can be done** as plain **data**, into a shared live **space** — so any viewer you trust, human or agent, renders the interface, and nothing the tool publishes can run on your machine. **One tool, any viewer:** the same space drives a web workbench, a terminal interface, a native app, a voice assistant, or an agent operating it directly.",
   "intent": [
-    "Define a JSON-compatible AFUI protocol that carries no JavaScript, CSS, HTML, WASM, build scripts, callbacks, shell commands, or remote component URLs, so showing a human an operation surface stays data-only",
-    "Separate producer, host, and composer roles: producers emit snapshots and patches, trusted hosts render and gate user intent, and composition tools combine ordinary snapshots by namespacing ids/actions/state without adding a new wire type",
-    "Provide language-neutral protocol assets plus a lightweight Rust SDK under rust/ for wire types, validation, binding, patching, action input assembly, replay/reporting, and producer/handler tests"
+    "Define a JSON-compatible protocol that carries no JavaScript, CSS, HTML, WebAssembly, build scripts, callbacks, shell commands, or remote component URLs, so showing a human an operation surface stays data-only",
+    "Make the space multi-participant from the start: a shared tree split into owner sections, changed only by an owner emitting to its own section or by a risk-gated request to another owner, and the protocol itself never computes",
+    "Provide language-neutral protocol assets plus a lightweight Rust library under rust/ for the space types, validation, binding resolution, JSON Patch helpers, request assembly, and replay"
   ],
   "license": "MIT",
   "mutations": [
-    "Initial release of the Agent-First UI protocol: producers describe current state and the actions available on it as plain data, and a user-owned trusted host renderer draws the interface and reports user intent back — no producer-supplied UI code runs",
-    "Provide the canonical, serde-serializable Rust type definitions for the protocol (state surfaces, actions, intents) so any producer or host renderer interoperates against one shared schema"
+    "Redesign the protocol around a shared live space with per-participant projections: each participant sees their own projection scoped by audience/read-scope (the dual of ownership) instead of one global broadcast tree, and capabilities project per-participant",
+    "Rework owner identity to self-generated opaque ids with join-time duplicate rejection, make a section's key its owner id, and replace display_name with an advisory name fact while deferring authenticity and signing to a higher layer",
+    "Add whisper projections scoped to a single viewer and viewer interaction intents with input bindings, and drop the undoable concept",
+    "Introduce a separate advisory view-hint profile layer with its own spec and JSON schema (salience, layout grouping, surface genre profile) that hosts may use or ignore and that is never the wire format or load-bearing",
+    "Restructure the Rust SDK: merge hosts into a single host crate, move composition into the SDK, and add request, profile, projection, and unit-profile helpers",
+    "Narrow validation to protocol structure and make composed section names separator-safe",
+    "Split and rewrite the specification into a normative protocol.md plus a separate view-hint.md, each with its own JSON schema, and refresh conformance fixtures around a worked operator console",
+    "Migrate the SDK to build documents on Agent-First Data builders",
+    "Add an afui-customize skill for authoring view-hint profiles"
   ],
   "bonds": [],
   "tree": {

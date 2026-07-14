@@ -1,30 +1,38 @@
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
-use crate::error::AfuiError;
-use crate::patch::{Patch, PatchOperation};
+use crate::error::AgentFirstUiError;
+use crate::operation::{Operation, Operations};
 
-pub const AFUI_VERSION: &str = "0.1";
+/// The protocol version carried in every message envelope.
+pub const PROTOCOL_VERSION: &str = "0.2";
 
+/// A stable identifier for a capability, unit, or layout. These ids are unique
+/// only within the owner section that declares them.
 pub type Id = String;
+
+/// A section key: the leading-level key under which an owner's facts live, for
+/// example `owner_A7K9mN4pQ2`.
+pub type OwnerKey = String;
+
 pub type JsonMap = Map<String, Value>;
 
+/// The shared tree of facts, split into sections keyed by owner. Always a JSON
+/// object whose top-level entries are owner sections.
 #[derive(Debug, Clone, PartialEq)]
-pub struct State(Value);
+pub struct Space(Value);
 
-impl State {
+impl Space {
     pub fn empty() -> Self {
         Self(Value::Object(JsonMap::new()))
     }
 
-    pub fn try_from_value(value: Value) -> Result<Self, AfuiError> {
+    pub fn try_from_value(value: Value) -> Result<Self, AgentFirstUiError> {
         if value.is_object() {
             Ok(Self(value))
         } else {
-            Err(AfuiError::InvalidState {
-                message: "state must be a JSON object".to_string(),
+            Err(AgentFirstUiError::InvalidSpace {
+                message: "space must be a JSON object".to_string(),
             })
         }
     }
@@ -40,102 +48,42 @@ impl State {
     pub fn into_value(self) -> Value {
         self.0
     }
-}
 
-impl Default for State {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
-impl From<JsonMap> for State {
-    fn from(value: JsonMap) -> Self {
-        Self(Value::Object(value))
-    }
-}
-
-impl TryFrom<Value> for State {
-    type Error = AfuiError;
-
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
-        Self::try_from_value(value)
-    }
-}
-
-impl Serialize for State {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        self.0.serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for State {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = Value::deserialize(deserializer)?;
-        Self::try_from_value(value).map_err(serde::de::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Theme(Value);
-
-impl Theme {
-    pub fn empty() -> Self {
-        Self(Value::Object(JsonMap::new()))
+    /// The section owned by `owner`, if present.
+    pub fn section(&self, owner: &str) -> Option<&Value> {
+        self.0.get(owner)
     }
 
-    pub fn try_from_value(value: Value) -> Result<Self, AfuiError> {
-        let Some(tokens) = value.as_object() else {
-            return Err(AfuiError::InvalidTheme {
-                message: "theme must be a JSON object".to_string(),
-            });
-        };
-        let invalid = tokens
-            .iter()
-            .find(|(_, value)| !(value.is_string() || value.is_number()));
-        if let Some((key, _)) = invalid {
-            return Err(AfuiError::InvalidTheme {
-                message: format!("theme token `{key}` must be a string or number"),
-            });
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_value(&self) -> &Value {
-        &self.0
-    }
-
-    pub fn into_value(self) -> Value {
+    /// The owner keys (section names) currently in the space.
+    pub fn owner_keys(&self) -> Vec<String> {
         self.0
+            .as_object()
+            .map(|map| map.keys().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
-impl Default for Theme {
+impl Default for Space {
     fn default() -> Self {
         Self::empty()
     }
 }
 
-impl From<JsonMap> for Theme {
+impl From<JsonMap> for Space {
     fn from(value: JsonMap) -> Self {
         Self(Value::Object(value))
     }
 }
 
-impl TryFrom<Value> for Theme {
-    type Error = AfuiError;
+impl TryFrom<Value> for Space {
+    type Error = AgentFirstUiError;
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
         Self::try_from_value(value)
     }
 }
 
-impl Serialize for Theme {
+impl Serialize for Space {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -144,7 +92,7 @@ impl Serialize for Theme {
     }
 }
 
-impl<'de> Deserialize<'de> for Theme {
+impl<'de> Deserialize<'de> for Space {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -154,325 +102,97 @@ impl<'de> Deserialize<'de> for Theme {
     }
 }
 
+/// One wire message. The envelope carries the protocol version and a flattened,
+/// `type`-tagged payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AfuiMessage {
-    pub afui: String,
+pub struct AgentFirstUiMessage {
+    pub agent_first_ui: String,
     #[serde(flatten)]
-    pub payload: AfuiPayload,
+    pub payload: MessagePayload,
 }
 
-impl AfuiMessage {
-    pub fn ui_snapshot(document: Document, state: State) -> Self {
+impl AgentFirstUiMessage {
+    /// A snapshot of one participant's delivered projection at an emit-log position.
+    pub fn snapshot(space: Space, sequence: u64) -> Self {
         Self {
-            afui: AFUI_VERSION.to_string(),
-            payload: AfuiPayload::UiSnapshot {
-                document,
-                state,
-                theme: None,
+            agent_first_ui: PROTOCOL_VERSION.to_string(),
+            payload: MessagePayload::Snapshot { space, sequence },
+        }
+    }
+
+    /// An owner's applied change to its own section.
+    pub fn emit(author: impl Into<OwnerKey>, sequence: u64, operations: Operations) -> Self {
+        Self {
+            agent_first_ui: PROTOCOL_VERSION.to_string(),
+            payload: MessagePayload::Emit {
+                author: author.into(),
+                sequence,
+                operations,
             },
         }
     }
 
-    pub fn ui_snapshot_with_theme(document: Document, state: State, theme: Theme) -> Self {
+    /// A participant asking another owner to invoke a capability.
+    pub fn request(
+        author: impl Into<OwnerKey>,
+        owner: impl Into<OwnerKey>,
+        capability: impl Into<Id>,
+        input: Option<Value>,
+    ) -> Self {
         Self {
-            afui: AFUI_VERSION.to_string(),
-            payload: AfuiPayload::UiSnapshot {
-                document,
-                state,
-                theme: Some(theme),
-            },
-        }
-    }
-
-    pub fn state_patch(patch: Patch) -> Self {
-        Self {
-            afui: AFUI_VERSION.to_string(),
-            payload: AfuiPayload::StatePatch { patch },
-        }
-    }
-
-    pub fn document_patch(patch: Patch) -> Self {
-        Self {
-            afui: AFUI_VERSION.to_string(),
-            payload: AfuiPayload::DocumentPatch { patch },
-        }
-    }
-
-    pub fn theme_patch(patch: Patch) -> Self {
-        Self {
-            afui: AFUI_VERSION.to_string(),
-            payload: AfuiPayload::ThemePatch { patch },
-        }
-    }
-
-    pub fn user_action(action_id: impl Into<Id>, input: Option<Value>) -> Self {
-        Self {
-            afui: AFUI_VERSION.to_string(),
-            payload: AfuiPayload::UserAction(UserAction {
-                action_id: action_id.into(),
+            agent_first_ui: PROTOCOL_VERSION.to_string(),
+            payload: MessagePayload::Request {
+                author: author.into(),
+                owner: owner.into(),
+                capability: capability.into(),
                 input,
-            }),
+            },
         }
     }
 
-    pub fn ensure_version(&self) -> Result<(), AfuiError> {
-        if self.afui == AFUI_VERSION {
+    pub fn ensure_version(&self) -> Result<(), AgentFirstUiError> {
+        if self.agent_first_ui == PROTOCOL_VERSION {
             Ok(())
         } else {
-            Err(AfuiError::UnsupportedVersion {
-                found: self.afui.clone(),
+            Err(AgentFirstUiError::UnsupportedVersion {
+                found: self.agent_first_ui.clone(),
             })
         }
     }
-
-    pub fn as_snapshot(&self) -> Result<Snapshot, AfuiError> {
-        self.ensure_version()?;
-        match &self.payload {
-            AfuiPayload::UiSnapshot {
-                document,
-                state,
-                theme,
-            } => Ok(Snapshot {
-                document: document.clone(),
-                state: state.clone(),
-                theme: theme.clone(),
-            }),
-            other => Err(AfuiError::UnsupportedMessageType {
-                message_type: other.message_type().to_string(),
-            }),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum AfuiPayload {
-    #[serde(rename = "ui_snapshot")]
-    UiSnapshot {
-        document: Document,
-        state: State,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        theme: Option<Theme>,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessagePayload {
+    Snapshot {
+        space: Space,
+        sequence: u64,
     },
-    #[serde(rename = "state_patch")]
-    StatePatch { patch: Vec<PatchOperation> },
-    #[serde(rename = "document_patch")]
-    DocumentPatch { patch: Vec<PatchOperation> },
-    #[serde(rename = "theme_patch")]
-    ThemePatch { patch: Vec<PatchOperation> },
-    #[serde(rename = "user_action")]
-    UserAction(UserAction),
+    Emit {
+        author: OwnerKey,
+        sequence: u64,
+        operations: Vec<Operation>,
+    },
+    Request {
+        author: OwnerKey,
+        owner: OwnerKey,
+        capability: Id,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<Value>,
+    },
 }
 
-impl AfuiPayload {
+impl MessagePayload {
     pub fn message_type(&self) -> &'static str {
         match self {
-            Self::UiSnapshot { .. } => "ui_snapshot",
-            Self::StatePatch { .. } => "state_patch",
-            Self::DocumentPatch { .. } => "document_patch",
-            Self::ThemePatch { .. } => "theme_patch",
-            Self::UserAction(_) => "user_action",
+            Self::Snapshot { .. } => "snapshot",
+            Self::Emit { .. } => "emit",
+            Self::Request { .. } => "request",
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Snapshot {
-    pub document: Document,
-    pub state: State,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub theme: Option<Theme>,
-}
-
-impl Snapshot {
-    pub fn new(document: Document, state: State) -> Self {
-        Self {
-            document,
-            state,
-            theme: None,
-        }
-    }
-
-    pub fn with_theme(document: Document, state: State, theme: Theme) -> Self {
-        Self {
-            document,
-            state,
-            theme: Some(theme),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UserAction {
-    pub action_id: Id,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input: Option<Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Document {
-    pub surface: Surface,
-    pub screens: Vec<Screen>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub actions: Vec<Action>,
-    #[serde(flatten, default)]
-    pub extra: JsonMap,
-}
-
-impl Document {
-    pub fn new(surface: Surface, screens: Vec<Screen>) -> Self {
-        Self {
-            surface,
-            screens,
-            actions: Vec::new(),
-            extra: JsonMap::new(),
-        }
-    }
-
-    pub fn with_actions(mut self, actions: Vec<Action>) -> Self {
-        self.actions = actions;
-        self
-    }
-
-    pub fn find_action(&self, id: &str) -> Option<&Action> {
-        self.actions.iter().find(|action| action.id == id)
-    }
-
-    pub fn find_view(&self, id: &str) -> Option<&View> {
-        self.screens
-            .iter()
-            .flat_map(|screen| screen.views.iter())
-            .find_map(|view| find_view_recursive(view, id))
-    }
-}
-
-fn find_view_recursive<'a>(view: &'a View, id: &str) -> Option<&'a View> {
-    if view.id == id {
-        return Some(view);
-    }
-    for child in view.child_views() {
-        if let Some(found) = find_view_recursive(child, id) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Surface {
-    pub id: Id,
-    pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    #[serde(flatten, default)]
-    pub extra: JsonMap,
-}
-
-impl Surface {
-    pub fn new(id: impl Into<Id>, title: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            title: title.into(),
-            description: None,
-            version: None,
-            extra: JsonMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Screen {
-    pub id: Id,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub views: Vec<View>,
-    #[serde(flatten, default)]
-    pub extra: JsonMap,
-}
-
-impl Screen {
-    pub fn new(id: impl Into<Id>, views: Vec<View>) -> Self {
-        Self {
-            id: id.into(),
-            title: None,
-            description: None,
-            views,
-            extra: JsonMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct View {
-    pub id: Id,
-    pub kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub header: Option<Box<View>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub footer: Option<Box<View>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub empty_view: Option<Box<View>>,
-    #[serde(rename = "default", default, skip_serializing_if = "Option::is_none")]
-    pub default_view: Option<Box<View>>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub cases: BTreeMap<String, View>,
-    #[serde(flatten, default)]
-    pub extra: JsonMap,
-}
-
-impl View {
-    pub fn new(id: impl Into<Id>, kind: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            kind: kind.into(),
-            description: None,
-            header: None,
-            footer: None,
-            empty_view: None,
-            default_view: None,
-            cases: BTreeMap::new(),
-            extra: JsonMap::new(),
-        }
-    }
-
-    pub fn field(&self, key: &str) -> Option<&Value> {
-        self.extra.get(key)
-    }
-
-    pub fn field_as_str(&self, key: &str) -> Option<&str> {
-        self.field(key).and_then(Value::as_str)
-    }
-
-    pub fn set_field(mut self, key: impl Into<String>, value: Value) -> Self {
-        self.extra.insert(key.into(), value);
-        self
-    }
-
-    pub fn child_views(&self) -> Vec<&View> {
-        let mut children = Vec::new();
-        if let Some(view) = self.header.as_deref() {
-            children.push(view);
-        }
-        if let Some(view) = self.footer.as_deref() {
-            children.push(view);
-        }
-        if let Some(view) = self.empty_view.as_deref() {
-            children.push(view);
-        }
-        if let Some(view) = self.default_view.as_deref() {
-            children.push(view);
-        }
-        children.extend(self.cases.values());
-        children
-    }
-}
-
+/// The single safety label on a capability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Risk {
@@ -494,8 +214,8 @@ impl Risk {
 }
 
 impl Default for Risk {
-    /// Fail-safe default: an action that declares no risk is treated as the
-    /// most dangerous category until the producer proves otherwise.
+    /// Fail-safe default: a capability that declares no risk is treated as the
+    /// most dangerous category until the owner proves otherwise.
     fn default() -> Self {
         Self::Destructive
     }
@@ -507,11 +227,9 @@ impl std::fmt::Display for Risk {
     }
 }
 
-/// Deserialize a producer-supplied `risk`, treating any unrecognized value as
-/// `destructive`. Producers are untrusted: an unknown risk word (for example
-/// from a newer producer) must fail safe rather than abort the whole document.
-/// This matches `spec/afui.schema.json` and the skill, which both state that an
-/// absent or unrecognized risk is treated as `destructive`.
+/// Deserialize an owner-supplied `risk`, treating any unrecognized value as
+/// `destructive`. Owners are untrusted: an unknown risk word must fail safe
+/// rather than abort the whole space.
 fn deserialize_risk<'de, D>(deserializer: D) -> Result<Risk, D::Error>
 where
     D: Deserializer<'de>,
@@ -525,8 +243,9 @@ where
     })
 }
 
+/// An owner-declared affordance: what a participant may request from this owner.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Action {
+pub struct Capability {
     pub id: Id,
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -534,25 +253,202 @@ pub struct Action {
     #[serde(default, deserialize_with = "deserialize_risk")]
     pub risk: Risk,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub undoable: Option<bool>,
+    pub applicable_binding: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<Value>,
     #[serde(flatten, default)]
     pub extra: JsonMap,
 }
 
-impl Action {
+impl Capability {
     pub fn new(id: impl Into<Id>, label: impl Into<String>, risk: Risk) -> Self {
         Self {
             id: id.into(),
             label: label.into(),
             description: None,
             risk,
-            undoable: None,
+            applicable_binding: None,
             input_schema: None,
             extra: JsonMap::new(),
         }
     }
+}
+
+/// How much a unit, field, item, or layout region matters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Salience {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prominence: Option<Prominence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<SalienceState>,
+}
+
+impl Salience {
+    pub fn new() -> Self {
+        Self {
+            prominence: None,
+            state: None,
+        }
+    }
+
+    pub fn prominence(mut self, value: Prominence) -> Self {
+        self.prominence = Some(value);
+        self
+    }
+
+    pub fn state(mut self, value: SalienceState) -> Self {
+        self.state = Some(value);
+        self
+    }
+}
+
+impl Default for Salience {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Prominence {
+    Primary,
+    Normal,
+    Subtle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SalienceState {
+    Neutral,
+    Info,
+    Success,
+    Warning,
+    Danger,
+}
+
+/// A unit: an owner's advisory recommendation of a coherent slice of facts to
+/// present, with an open semantic `kind`. Units are a flat pool and compose only
+/// by id reference through layouts and `select` cases.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Unit {
+    pub id: Id,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activate_capability: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_capability: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salience: Option<Salience>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<Id>,
+    #[serde(flatten, default)]
+    pub extra: JsonMap,
+}
+
+impl Unit {
+    pub fn new(id: impl Into<Id>, kind: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            kind: kind.into(),
+            description: None,
+            activate_capability: None,
+            primary_capability: None,
+            salience: None,
+            fallback: None,
+            extra: JsonMap::new(),
+        }
+    }
+
+    pub fn field(&self, key: &str) -> Option<&Value> {
+        self.extra.get(key)
+    }
+
+    pub fn field_as_str(&self, key: &str) -> Option<&str> {
+        self.field(key).and_then(Value::as_str)
+    }
+
+    pub fn set_field(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(key.into(), value);
+        self
+    }
+
+    pub fn child_units(&self) -> Vec<&Unit> {
+        Vec::new()
+    }
+
+    /// Capability ids this unit references, read from typed capability fields
+    /// plus marker fields (`capability` / `*_capability` and
+    /// `capabilities` / `*_capabilities`).
+    pub fn capability_ids(&self) -> Vec<Id> {
+        let mut ids = Vec::new();
+        if let Some(id) = &self.activate_capability {
+            ids.push(id.clone());
+        }
+        if let Some(id) = &self.primary_capability {
+            ids.push(id.clone());
+        }
+        collect_capability_ids_from_value(&Value::Object(self.extra.clone()), &mut ids);
+        ids
+    }
+}
+
+fn collect_capability_ids_from_value(value: &Value, ids: &mut Vec<Id>) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if key == "capability" || key.ends_with("_capability") {
+                    if let Some(id) = value.as_str() {
+                        ids.push(id.to_string());
+                    }
+                } else if (key == "capabilities" || key.ends_with("_capabilities"))
+                    && let Some(items) = value.as_array()
+                {
+                    ids.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
+                }
+                collect_capability_ids_from_value(value, ids);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_capability_ids_from_value(item, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One named layout region in an owner's recommended layout pool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Layout {
+    pub id: Id,
+    pub members: Vec<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub overlay: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salience: Option<Salience>,
+    #[serde(flatten, default)]
+    pub extra: JsonMap,
+}
+
+impl Layout {
+    pub fn new(id: impl Into<Id>, members: Vec<Id>) -> Self {
+        Self {
+            id: id.into(),
+            members,
+            description: None,
+            overlay: false,
+            salience: None,
+            extra: JsonMap::new(),
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[cfg(test)]
@@ -561,7 +457,7 @@ mod tests {
     use serde_json::json;
 
     fn risk_of(value: Value) -> Result<Risk, serde_json::Error> {
-        Ok(serde_json::from_value::<Action>(value)?.risk)
+        Ok(serde_json::from_value::<Capability>(value)?.risk)
     }
 
     #[test]
@@ -604,6 +500,25 @@ mod tests {
             risk_of(json!({ "id": "a", "label": "A", "risk": 7 }))?,
             Risk::Destructive
         );
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_uses_space_key() -> Result<(), serde_json::Error> {
+        let message = AgentFirstUiMessage::snapshot(Space::empty(), 0);
+        let value = serde_json::to_value(message)?;
+        assert!(value.get("space").is_some());
+        assert!(value.get("room").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn request_carries_target_owner() -> Result<(), serde_json::Error> {
+        let message = AgentFirstUiMessage::request("owner_operator", "owner_afmail", "open", None);
+        let value = serde_json::to_value(message)?;
+        assert_eq!(value.get("author"), Some(&json!("owner_operator")));
+        assert_eq!(value.get("owner"), Some(&json!("owner_afmail")));
+        assert_eq!(value.get("capability"), Some(&json!("open")));
         Ok(())
     }
 }

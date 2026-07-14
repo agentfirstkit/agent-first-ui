@@ -1,0 +1,959 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-first-ui:0.2:view-hint-schema",
+  "title": "Agent-First UI 0.2 View Hint Profile schema",
+  "description": "OPTIONAL profile validation for a space that opts into the View Hint Profile (spec/view-hint.md). It is stricter than the envelope schema for advisory hints only: unit `kind` is constrained to the canonical set, canonical field shapes are checked, and retired legacy hint names are rejected (`input`, `record_list`, `action_bar`, `stats`, `detail`, `tabs`, `switch`; `reference_label`; `*_bind`; `action`/`actions`; old groups/unit_ids layout fields). Domain facts remain unconstrained data. A space is a conforming PROTOCOL space without passing this; this only asserts the recommended display contract. Validate a snapshot message against it.",
+  "$ref": "#/$defs/Snapshot",
+  "$defs": {
+    "Snapshot": {
+      "type": "object",
+      "required": [
+        "agent_first_ui",
+        "type",
+        "space"
+      ],
+      "properties": {
+        "agent_first_ui": {
+          "const": "0.2"
+        },
+        "type": {
+          "const": "snapshot"
+        },
+        "space": {
+          "$ref": "#/$defs/Space"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "room"
+            ]
+          },
+          {
+            "required": [
+              "proof"
+            ]
+          },
+          {
+            "required": [
+              "signature"
+            ]
+          },
+          {
+            "required": [
+              "public_key"
+            ]
+          },
+          {
+            "required": [
+              "owner_key"
+            ]
+          }
+        ]
+      },
+      "additionalProperties": true
+    },
+    "Space": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Section"
+      },
+      "propertyNames": {
+        "$ref": "#/$defs/OwnerKey"
+      }
+    },
+    "Section": {
+      "type": "object",
+      "description": "One owner's section. Domain facts are unconstrained, but the advisory hint members must follow the profile, and retired legacy names are rejected.",
+      "properties": {
+        "units": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Unit"
+          }
+        },
+        "layouts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Layout"
+          }
+        },
+        "surface": {
+          "$ref": "#/$defs/Surface"
+        },
+        "root_layout": {
+          "$ref": "#/$defs/Id"
+        }
+      },
+      "additionalProperties": true
+    },
+    "NoLegacyNames": {
+      "$comment": "Names this profile retired. input -> form, record_list -> list, action_bar -> capabilities, stats/detail -> facts, tabs/switch -> select, reference_label -> reference envelope label/viewer-derived label, *_bind -> *_binding, action/actions -> capability/capabilities.",
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "action"
+            ]
+          },
+          {
+            "required": [
+              "actions"
+            ]
+          },
+          {
+            "required": [
+              "dockview"
+            ]
+          },
+          {
+            "required": [
+              "layout"
+            ]
+          },
+          {
+            "required": [
+              "groups"
+            ]
+          },
+          {
+            "required": [
+              "unit_ids"
+            ]
+          },
+          {
+            "required": [
+              "size"
+            ]
+          },
+          {
+            "required": [
+              "priority"
+            ]
+          },
+          {
+            "required": [
+              "default_open"
+            ]
+          },
+          {
+            "required": [
+              "header"
+            ]
+          },
+          {
+            "required": [
+              "footer"
+            ]
+          },
+          {
+            "required": [
+              "empty_unit"
+            ]
+          },
+          {
+            "required": [
+              "reference_label"
+            ]
+          }
+        ]
+      },
+      "propertyNames": {
+        "not": {
+          "pattern": "_bind$"
+        }
+      }
+    },
+    "Unit": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "kind": {
+          "enum": [
+            "facts",
+            "table",
+            "list",
+            "text",
+            "media",
+            "log",
+            "terminal",
+            "select",
+            "form",
+            "capabilities"
+          ],
+          "description": "Canonical View Hint Profile kinds. Non-canonical extensions such as chart/progress/tree should publish a canonical fallback outside strict profile validation."
+        },
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "summary": {
+          "$ref": "#/$defs/Summary"
+        },
+        "salience": {
+          "$ref": "#/$defs/Salience"
+        },
+        "source_binding": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "selector_binding": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "text": {
+          "type": "string"
+        },
+        "text_binding": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "body_format": {
+          "enum": [
+            "markdown"
+          ]
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "fields": {
+          "type": "array"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Item"
+          }
+        },
+        "reference_binding": {
+          "$ref": "#/$defs/ScopedBinding",
+          "description": "Resolves to a stable inert, self-describing string id for the current row or record. The viewer combines owner, unit.id, reference_kind (or unit.kind fallback), that id, and an optional derived label into a transferable ReferenceEnvelope for a viewer-owned context sink."
+        },
+        "reference_kind": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Domain kind placed in a synthesized ReferenceEnvelope (for example message, draft, case, or build). It is not the canonical unit kind; when omitted the viewer may fall back to unit.kind."
+        },
+        "row_capabilities": {
+          "type": "array",
+          "description": "Capabilities available in the current record context. Agent/viewer policy may discover them; an ordinary viewer does not turn them into row buttons by default.",
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "activate_capability": {
+          "$ref": "#/$defs/Id",
+          "description": "Non-button primary intent for activating the unit or current row."
+        },
+        "primary_capability": {
+          "$ref": "#/$defs/Id",
+          "description": "Ranks a capability within an action context that is already surfaced; it does not surface a button by itself."
+        },
+        "capabilities": {
+          "type": "array",
+          "description": "Referenced capabilities. On kind=capabilities this is an explicit human action surface; on other kinds it is discoverable context and not automatic buttons.",
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "submit_capability": {
+          "$ref": "#/$defs/Id",
+          "description": "Visible submit action of a canonical form. Invalid on other canonical kinds."
+        },
+        "default_presentation": {
+          "enum": [
+            "glance",
+            "compact",
+            "full"
+          ],
+          "description": "Owner recommendation for the initial viewer-owned presentation state. All three states remain reachable and viewer/user/pack policy may override this value."
+        },
+        "input_bindings": {
+          "type": "object",
+          "description": "Request input wiring. Keys are capability input field names; values are scoped bindings resolved when preparing a request from this unit.",
+          "propertyNames": {
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/ScopedBinding"
+          }
+        },
+        "media_type": {
+          "enum": [
+            "image",
+            "video",
+            "audio"
+          ]
+        },
+        "alt": {
+          "type": "string"
+        },
+        "alt_binding": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "level_key": {
+          "type": "string"
+        },
+        "time_key": {
+          "type": "string"
+        },
+        "message_key": {
+          "type": "string"
+        },
+        "session_id_binding": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "title_binding": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "status_binding": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "state_binding": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "cases": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "default": {
+          "$ref": "#/$defs/Id"
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "fallback": {
+          "$ref": "#/$defs/Id"
+        },
+        "interactions": {
+          "$ref": "#/$defs/Interactions"
+        }
+      },
+      "patternProperties": {
+        "_binding$": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "(^capability$|_capability$)": {
+          "$ref": "#/$defs/Id"
+        },
+        "(^capabilities$|_capabilities$)": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "$ref": "#/$defs/NoLegacyNames"
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "form"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "fields",
+              "submit_capability"
+            ],
+            "properties": {
+              "fields": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "$ref": "#/$defs/FormField"
+                }
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "submit_capability"
+              ]
+            },
+            "properties": {
+              "fields": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Column"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "capabilities"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "capabilities"
+            ],
+            "properties": {
+              "capabilities": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": true
+    },
+    "Surface": {
+      "type": "object",
+      "description": "Advisory owner-section shell hint. It can guide a host's first render but cannot grant capability, authority, code, or styling.",
+      "properties": {
+        "genre": {
+          "enum": [
+            "triage",
+            "collection_admin",
+            "monitor",
+            "reader",
+            "conversation",
+            "board",
+            "console"
+          ],
+          "description": "Advisory shell genre. Unknown values are invalid for this strict profile; viewers may still ignore known values."
+        }
+      },
+      "additionalProperties": true
+    },
+    "Interactions": {
+      "type": "object",
+      "description": "Canonical viewer interaction intents. A conforming viewer may translate these into actor-owned emits or owner requests.",
+      "propertyNames": {
+        "enum": [
+          "activate",
+          "select",
+          "submit"
+        ]
+      },
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/InteractionEffect"
+        }
+      }
+    },
+    "InteractionEffect": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SetActorStateEffect"
+        },
+        {
+          "$ref": "#/$defs/RequestEffect"
+        }
+      ]
+    },
+    "ActorStatePath": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*$"
+    },
+    "SetActorStateEffect": {
+      "type": "object",
+      "required": [
+        "type",
+        "path"
+      ],
+      "properties": {
+        "type": {
+          "const": "set_actor_state"
+        },
+        "path": {
+          "$ref": "#/$defs/ActorStatePath"
+        },
+        "value_binding": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "value": true
+      },
+      "oneOf": [
+        {
+          "required": [
+            "value_binding"
+          ],
+          "not": {
+            "required": [
+              "value"
+            ]
+          }
+        },
+        {
+          "required": [
+            "value"
+          ],
+          "not": {
+            "required": [
+              "value_binding"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "RequestEffect": {
+      "type": "object",
+      "required": [
+        "type",
+        "capability"
+      ],
+      "properties": {
+        "type": {
+          "const": "request"
+        },
+        "capability": {
+          "$ref": "#/$defs/Id"
+        },
+        "input_bindings": {
+          "type": "object",
+          "propertyNames": {
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/ScopedBinding"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "AtomicValuePredicate": {
+      "type": "object",
+      "description": "One literal, display-only comparison against the current field value.",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "lt": {
+          "type": "number"
+        },
+        "gt": {
+          "type": "number"
+        },
+        "eq": true,
+        "contains": true,
+        "empty": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ValuePredicate": {
+      "description": "A field is visible when this predicate passes. An array is an AND of predicates.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/AtomicValuePredicate"
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/AtomicValuePredicate"
+          }
+        }
+      ]
+    },
+    "Column": {
+      "type": "object",
+      "required": [
+        "key"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "label": {
+          "type": "string"
+        },
+        "salience": {
+          "$ref": "#/$defs/Salience"
+        },
+        "state_binding": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "visible_when": {
+          "$ref": "#/$defs/ValuePredicate"
+        }
+      },
+      "additionalProperties": true
+    },
+    "FormField": {
+      "type": "object",
+      "description": "One named value collected by a canonical form. value_binding seeds the editor; the current value lives at input:<name> and is submitted as directly provided request input.",
+      "required": [
+        "name",
+        "label",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "enum": [
+            "string",
+            "boolean",
+            "number",
+            "array"
+          ]
+        },
+        "format": {
+          "enum": [
+            "text",
+            "textarea",
+            "markdown",
+            "email",
+            "enum",
+            "email_list",
+            "tags"
+          ]
+        },
+        "value_binding": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FormFieldOption"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "format": {
+                "const": "enum"
+              }
+            },
+            "required": [
+              "format"
+            ]
+          },
+          "then": {
+            "properties": {
+              "type": {
+                "const": "string"
+              },
+              "options": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "options"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "options"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "string"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "format": {
+                "enum": [
+                  "text",
+                  "textarea",
+                  "markdown",
+                  "email",
+                  "enum"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "array"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "format": {
+                "enum": [
+                  "email_list",
+                  "tags"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "enum": [
+                  "boolean",
+                  "number"
+                ]
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "format"
+              ]
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "FormFieldOption": {
+      "type": "object",
+      "required": [
+        "value",
+        "label"
+      ],
+      "properties": {
+        "value": {
+          "type": "string",
+          "minLength": 1
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "ReferenceEnvelope": {
+      "type": "object",
+      "description": "Recommended inert transferable context-sink output synthesized by the viewer from a reference-bearing unit and the scalar resolved by reference_binding. It is not a repeated source-record shape. owner and unit identify provenance, kind and id identify the domain reference, and label is optional display text. It is not executable and does not imply navigation.",
+      "required": [
+        "owner",
+        "unit",
+        "kind",
+        "id"
+      ],
+      "properties": {
+        "owner": {
+          "$ref": "#/$defs/OwnerKey"
+        },
+        "unit": {
+          "$ref": "#/$defs/Id"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Domain kind, not a canonical unit kind."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable self-describing string id resolved from reference_binding; numeric ids are intentionally not used across JSON/language boundaries."
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "Item": {
+      "type": "object",
+      "required": [
+        "value_binding"
+      ],
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "value_binding": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "salience": {
+          "$ref": "#/$defs/Salience"
+        },
+        "state_binding": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "visible_when": {
+          "$ref": "#/$defs/ValuePredicate"
+        }
+      },
+      "additionalProperties": true
+    },
+    "Summary": {
+      "type": "object",
+      "properties": {
+        "count_binding": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "attention_binding": {
+          "$ref": "#/$defs/ScopedBinding"
+        },
+        "fields": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Item"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "Layout": {
+      "type": "object",
+      "required": [
+        "id",
+        "members"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Id"
+        },
+        "description": {
+          "type": "string"
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Id"
+          }
+        },
+        "overlay": {
+          "type": "boolean"
+        },
+        "salience": {
+          "$ref": "#/$defs/Salience"
+        },
+        "relation": {
+          "enum": [
+            "sequence",
+            "workspace",
+            "master_detail",
+            "overview_detail",
+            "comparison",
+            "flow",
+            "supporting"
+          ],
+          "description": "Cross-media relationship among this layout region's members. It guides composition without specifying position, dimensions, or implementation widgets."
+        },
+        "role": {
+          "enum": [
+            "primary",
+            "navigation",
+            "detail",
+            "inspector",
+            "actions",
+            "status",
+            "history",
+            "input",
+            "summary",
+            "supporting"
+          ],
+          "description": "Cross-media semantic role of this layout region. It guides landmarking and emphasis without naming a widget or screen position."
+        }
+      },
+      "allOf": [
+        {
+          "$ref": "#/$defs/NoLegacyNames"
+        }
+      ],
+      "additionalProperties": true
+    },
+    "Salience": {
+      "type": "object",
+      "properties": {
+        "prominence": {
+          "enum": [
+            "primary",
+            "normal",
+            "subtle"
+          ]
+        },
+        "state": {
+          "enum": [
+            "neutral",
+            "info",
+            "success",
+            "warning",
+            "danger"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ScopedBinding": {
+      "type": "string",
+      "pattern": "^(space:|record:|input:|actor:)?[^:]+$"
+    },
+    "Id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "not": {
+        "const": "-"
+      }
+    },
+    "OwnerKey": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    }
+  }
+}
