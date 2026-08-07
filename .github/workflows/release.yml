@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+
+      # `--features serve` is not optional here, and it is the one thing about
+      # this build that differs from `cargo build --release`.
+      #
+      # `serve` is off by default because five Provider spores consume this
+      # crate as a library and none of them proxies anything. A released binary
+      # is the other case: `afui session serve` is the reason the binary exists
+      # on a phone-accessible machine, and a build without the feature answers
+      # that verb with `feature_unavailable`. The library default stays light;
+      # the shipped executable is built with the feature on. scripts/
+      # release-smoke.sh below asserts it rather than trusting this line.
+      - name: Build
+        run: cargo build --release --features serve --bin afui --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          ARCHIVE_KIND: ${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "invalid release tag: $TAG" >&2
+            exit 1
+          fi
+          BIN_DIR="target/${TARGET}/release"
+          if [ "$ARCHIVE_KIND" = "zip" ]; then
+            ARCHIVE="afui-${TAG}-${TARGET}.zip"
+            cd "$BIN_DIR" && 7z a "../../../$ARCHIVE" afui.exe && cd -
+          else
+            ARCHIVE="afui-${TAG}-${TARGET}.tar.gz"
+            tar -czf "$ARCHIVE" -C "$BIN_DIR" afui
+          fi
+          # A cached `target/` can hold a binary from an earlier run, so assert
+          # the archived one is this tag's rather than merely that it runs.
+          "$BIN_DIR/afui" --version | grep -q "\"version\":\"${TAG#v}\""
+          ./scripts/release-smoke.sh "$BIN_DIR"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256" 2>/dev/null || shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        shell: bash
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes "Release $TAG"
+          gh release upload "$TAG" "$ARCHIVE" "${ARCHIVE}.sha256" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

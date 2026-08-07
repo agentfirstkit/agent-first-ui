@@ -1,0 +1,132 @@
+[package]
+name = "agent-first-ui"
+version = "0.3.0"
+edition = "2024"
+description = "Let your AI agent hand you a real interface when a step needs a person — a window opens, you decide, and the agent gets a typed answer back."
+license = "MIT"
+repository = "https://github.com/agentfirstkit/agent-first-ui"
+readme = "README.md"
+include = [
+    "src/bin/**",
+    "src/**",
+    "skills/**",
+    "scripts/**",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "clippy.toml",
+]
+
+# Three tiers, because a Provider that hosts no UI session still has a frontend
+# to keep honest.
+#
+# The featureless build is the markup guard plus frontend discovery, the trust
+# gate and the per-file overlay: reading files off disk and refusing some of
+# them. It costs serde, blake3, walkdir and dirs, and no server at all. afmail
+# is why that tier exists — its Review UI is a `review`-feature build, but the
+# template loader that has to refuse a smuggled `<script>` is not, and clippy
+# gates it under `--no-default-features`. Without this tier the only way to
+# share the guard was to drag axum and tokio into a build that has neither.
+[features]
+default = ["session"]
+# Everything that hands a UI to a person: the session, its host, its credential,
+# its security policy, the cross-process registry, the browser window, and the
+# `assets/` route a frontend's static files are served from. This is what a
+# Provider needs, and what the `afui` binary is built from.
+session = [
+    "dep:agent-first-data",
+    "dep:axum",
+    "dep:getrandom",
+    "dep:hex",
+    "dep:libc",
+    "dep:subtle",
+    "dep:tempfile",
+    "dep:tokio",
+    "dep:tower",
+    "tokio/macros",
+    "tokio/net",
+    "tokio/process",
+    "tokio/rt-multi-thread",
+    "tokio/sync",
+    "tokio/time",
+]
+# The third delivery: a page that serves this machine's live sessions to a
+# browser somewhere else, and the streaming reverse proxy underneath it.
+#
+# Off by default because five Provider spores consume this crate as a library
+# and none of them proxies anything: they open a window or hand out one URL.
+# Only `afui session serve` needs this, so only a build of the binary that
+# wants that verb pays for it. It serves sessions, so it implies `session`.
+serve = ["session", "dep:hyper", "dep:hyper-util", "tokio/io-util", "tokio/signal"]
+
+# Cargo discovers src/bin/afui.rs without being told. The release pipeline does
+# not: it reads this table to learn what a release ships, deriving the archive
+# name, the Homebrew formula, and the Scoop manifest from bin.0.name, and it
+# skips the packaging step entirely when the table is absent. Naming the target
+# here is what makes the CLI installable rather than merely buildable.
+#
+# `required-features` is what lets `--no-default-features` mean the guard tier
+# rather than a compile error: the CLI lists sessions and opens windows, so a
+# build without them has no binary to produce.
+[[bin]]
+name = "afui"
+path = "src/bin/afui.rs"
+required-features = ["session"]
+
+[dependencies]
+# The CLI's argument parsing, event stream and skill installer. Only the binary
+# uses it, and the binary is a `session` build.
+agent-first-data = { version = "0.32.0", default-features = false, features = ["cli", "skill-admin"], optional = true }
+# A `provider_id` and a `ui_kind` are path segments in a frontend directory
+# before they are anything else, so the grammar is checked in the guard tier.
+agent-first-slug = { version = "0.6.2", default-features = false }
+axum = { version = "0.8", optional = true }
+blake3 = "1"
+dirs = "6"
+getrandom = { version = "0.4", optional = true }
+hex = { version = "0.4", optional = true }
+# The reverse proxy speaks HTTP itself rather than through a pooling client:
+# one connection per proxied request is what keeps a Server-Sent Events stream
+# from sharing a connection with anything else, and `Incoming` hands the body
+# back frame by frame instead of collecting it.
+hyper = { version = "1", features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = { version = "2", optional = true }
+tempfile = { version = "3", optional = true }
+# Applied directly so the credential is stripped before the Provider router
+# routes, which `Router::layer` (post-routing) cannot do.
+tower = { version = "0.5", optional = true }
+tokio = { version = "1", optional = true }
+walkdir = "2"
+
+# One question std cannot ask: does the process that announced this session
+# still exist? A session AFUI serves answers it with its own socket, but a
+# session that only names an upstream is announced by one process and served by
+# another, so `kill(pid, 0)` is what stops a crashed announcer leaving a listing
+# behind. The registry is a `session` affordance, so this arrives with it.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+# `SinkExt`/`StreamExt` on a WebSocket stream. Nothing in the library polls one.
+futures-util = { version = "0.3", default-features = false }
+# The lifetime tests drive a real request against a served session; the library
+# itself never reads or writes a socket directly.
+tokio = { version = "1", features = ["io-util"] }
+# Proving the proxy streams needs a body that is deliberately not finished yet,
+# which is a channel behind an Axum response.
+tokio-stream = "0.1"
+# A real WebSocket on both sides of the proxy. The proxy relays an upgraded
+# connection without understanding it, so what has to be proven is that a real
+# implementation still works through it — masking, framing and close included.
+# Asserting a `101` would have tested none of that.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+print_stdout = "deny"
+print_stderr = "deny"

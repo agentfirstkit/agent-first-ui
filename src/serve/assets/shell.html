@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Agent-First UI sessions</title>
+  <link rel="stylesheet" href="shell.css">
+  <script defer src="shell.js"></script>
+</head>
+<body>
+  <header class="bar">
+    <h1>Sessions on this machine</h1>
+    <p class="state"><span id="count">0</span> open · <span id="state">connecting</span></p>
+  </header>
+
+  <main class="deck">
+    <section class="pane terminal-pane" aria-label="Terminal">
+      <div class="pane-head"><h2>Terminal</h2></div>
+      <div id="terminal-slot" class="slot"></div>
+      <p id="terminal-empty" class="empty">No terminal is running. Start one with <code>afterminal ui</code>.</p>
+    </section>
+
+    <section class="pane list-pane" aria-label="Interfaces">
+      <div class="pane-head"><h2>Waiting for you</h2></div>
+      <div id="ui-slot" class="stack"></div>
+      <p id="ui-empty" class="empty">Nothing else is open.</p>
+    </section>
+  </main>
+
+  <template id="card">
+    <article class="card">
+      <header class="card-head">
+        <div class="who">
+          <strong class="provider"></strong>
+          <span class="kind"></span>
+          <span class="subject"></span>
+        </div>
+        <div class="acts">
+          <button type="button" data-act="fold">Fold</button>
+          <button type="button" data-act="drop">Remove</button>
+        </div>
+      </header>
+      <div class="frame"></div>
+    </article>
+  </template>
+</body>
+</html>
