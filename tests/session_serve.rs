@@ -100,7 +100,7 @@ async fn provider_session(router: Router) -> ActiveUiSession<()> {
 #[allow(clippy::expect_used)]
 async fn provider_session_with(router: Router, policy: UiSecurityPolicy) -> ActiveUiSession<()> {
     registry_root();
-    UiSession::<()>::new("afpsql", "table_inspect")
+    UiSession::<()>::new("inspector", "table_inspect")
         .expect("session")
         .with_subject("public.orders")
         .with_security_policy(policy)
@@ -796,7 +796,7 @@ async fn a_preflight_is_answered_here_rather_than_asked_of_a_provider() {
 
 // ── A session's cookies are its own ─────────────────────────────────
 
-/// A Provider that hands a credential over the way afhttp's takeover does:
+/// A Provider that hands a credential over the way a proxied third-party panel does:
 /// once in a query, and in a cookie on every request after it.
 ///
 /// Both sessions in the test below use the same cookie *name*, because a
@@ -926,7 +926,7 @@ in_both_shapes! {
 
 /// A UI served by something that is not AFUI, behind a credential of its own.
 ///
-/// Shaped like afhttp's takeover panel: the credential arrives as a query
+/// Shaped like a proxied third-party panel: the credential arrives as a query
 /// parameter, a request without it is refused, and the address a person is
 /// given carries it. Nothing here is minted by or known to AFUI.
 #[allow(clippy::expect_used)]
@@ -966,7 +966,7 @@ in_both_shapes! {
             let _ignored = axum::serve(listener, app).await;
         });
         let panel_url = format!("http://{upstream_addr}/takeover/panel?handoff_secret=deadbeef");
-        let announced = UiUpstream::new("afhttp", "takeover", &panel_url)
+        let announced = UiUpstream::new("remote", "takeover", &panel_url)
             .expect("upstream")
             .with_subject("captcha wall")
             .announce()
@@ -977,7 +977,7 @@ in_both_shapes! {
         let card = shell.listed(&session_id).await.expect("listed");
         // The page is handed exactly the fields a served session gives it, and no
         // way of telling the two apart.
-        assert_eq!(card["provider_id"], "afhttp");
+        assert_eq!(card["provider_id"], "remote");
         assert_eq!(card["ui_kind"], "takeover");
         assert_eq!(card["subject"], "captcha wall");
         assert!(card.get("access_url_secret").is_none());
@@ -1010,7 +1010,7 @@ in_both_shapes! {
         // above came from reproducing the credential rather than from the panel
         // being open.
         let unannounced = UiUpstream::new(
-            "afhttp",
+            "remote",
             "takeover",
             format!("http://{upstream_addr}/takeover/panel"),
         )
@@ -1085,7 +1085,7 @@ fn websocket_echo() -> Router {
 }
 
 in_both_shapes! {
-    /// §2.5 step 3 needs this: afhttp's takeover panel is RFB over WebSocket, and
+    /// §2.5 step 3 needs this: a remote-framebuffer panel is RFB over WebSocket, and
     /// an upgrade the proxy refuses to perform cannot be framed at all.
     async fn frames_cross_the_proxy_in_both_directions_once_the_connection_is_upgraded(
         shape: Shape,
@@ -1162,7 +1162,7 @@ async fn a_window_still_opens_when_nothing_is_being_served() {
     .expect("write stub");
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-    let session = UiSession::<()>::new("afmail", "case_review").expect("session");
+    let session = UiSession::<()>::new("reviewer", "case_review").expect("session");
     let outcome = session
         .window(
             Router::new().route("/", get(|| async { "review" })),

@@ -1,6 +1,6 @@
 [package]
 name = "agent-first-ui"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Let your AI agent hand you a real interface when a step needs a person — a window opens, you decide, and the agent gets a typed answer back."
 license = "MIT"
@@ -22,10 +22,10 @@ include = [
 #
 # The featureless build is the markup guard plus frontend discovery, the trust
 # gate and the per-file overlay: reading files off disk and refusing some of
-# them. It costs serde, blake3, walkdir and dirs, and no server at all. afmail
-# is why that tier exists — its Review UI is a `review`-feature build, but the
-# template loader that has to refuse a smuggled `<script>` is not, and clippy
-# gates it under `--no-default-features`. Without this tier the only way to
+# them. It costs serde, blake3, walkdir and dirs, and no server at all. That tier
+# exists for the build that has a frontend but no port: a Provider whose human
+# UI is itself an optional feature still has to refuse a smuggled `<script>` in
+# the build where that UI is compiled out. Without this tier the only way to
 # share the guard was to drag axum and tokio into a build that has neither.
 [features]
 default = ["session"]
@@ -53,8 +53,8 @@ session = [
 # The third delivery: a page that serves this machine's live sessions to a
 # browser somewhere else, and the streaming reverse proxy underneath it.
 #
-# Off by default because five Provider spores consume this crate as a library
-# and none of them proxies anything: they open a window or hand out one URL.
+# Off by default because a Provider consuming this crate as a library does not
+# proxy anything: it opens a window or hands out one URL.
 # Only `afui session serve` needs this, so only a build of the binary that
 # wants that verb pays for it. It serves sessions, so it implies `session`.
 serve = ["session", "dep:hyper", "dep:hyper-util", "tokio/io-util", "tokio/signal"]

@@ -64,21 +64,21 @@ async fn three_sessions_share_one_port_and_stay_isolated() {
 
     let review = host
         .attach(
-            UiSession::<&str>::new("afmail", "case_review").unwrap(),
+            UiSession::<&str>::new("reviewer", "case_review").unwrap(),
             labelled_router("review"),
             UiExpiry::Never,
         )
         .unwrap();
     let terminal = host
         .attach(
-            UiSession::<&str>::new("afterminal", "terminal").unwrap(),
+            UiSession::<&str>::new("console", "terminal").unwrap(),
             labelled_router("terminal"),
             UiExpiry::Never,
         )
         .unwrap();
     let panel = host
         .attach(
-            UiSession::<&str>::new("afpsql", "table_inspect").unwrap(),
+            UiSession::<&str>::new("inspector", "table_inspect").unwrap(),
             labelled_router("panel"),
             UiExpiry::Never,
         )
@@ -139,14 +139,14 @@ async fn results_route_back_to_the_call_that_is_waiting_for_them() {
 
     let first = host
         .attach(
-            UiSession::<&str>::new("afmail", "case_review").unwrap(),
+            UiSession::<&str>::new("reviewer", "case_review").unwrap(),
             Router::new(),
             UiExpiry::Never,
         )
         .unwrap();
     let second = host
         .attach(
-            UiSession::<&str>::new("afpay", "plan_confirm").unwrap(),
+            UiSession::<&str>::new("ledger", "plan_confirm").unwrap(),
             Router::new(),
             UiExpiry::Never,
         )
@@ -174,14 +174,14 @@ async fn ending_one_session_leaves_its_neighbours_serving() {
     let host = UiHost::bind_local().await.unwrap();
     let leaving = host
         .attach(
-            UiSession::<()>::new("afmail", "case_review").unwrap(),
+            UiSession::<()>::new("reviewer", "case_review").unwrap(),
             labelled_router("leaving"),
             UiExpiry::Never,
         )
         .unwrap();
     let staying = host
         .attach(
-            UiSession::<()>::new("afterminal", "terminal").unwrap(),
+            UiSession::<()>::new("console", "terminal").unwrap(),
             labelled_router("staying"),
             UiExpiry::Never,
         )
@@ -209,7 +209,7 @@ async fn a_lan_host_advertises_a_reachable_authority_for_every_session() {
         .with_advertised_host("192.168.1.4");
     let session = host
         .attach(
-            UiSession::<()>::new("afmail", "case_review").unwrap(),
+            UiSession::<()>::new("reviewer", "case_review").unwrap(),
             Router::new(),
             UiExpiry::After(Duration::from_secs(900)),
         )
@@ -226,7 +226,7 @@ async fn shutting_the_host_down_takes_every_session_with_it() {
     let host = UiHost::bind_local().await.unwrap();
     let session = host
         .attach(
-            UiSession::<()>::new("afpsql", "schema_inspect").unwrap(),
+            UiSession::<()>::new("inspector", "schema_inspect").unwrap(),
             labelled_router("panel"),
             UiExpiry::Never,
         )

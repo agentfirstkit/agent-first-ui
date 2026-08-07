@@ -685,7 +685,7 @@ mod tests {
     fn entry(session_id: &str, url: &str) -> UiSessionEntry {
         UiSessionEntry {
             session_id: session_id.to_owned(),
-            provider_id: "afterminal".to_owned(),
+            provider_id: "console".to_owned(),
             ui_kind: "terminal".to_owned(),
             subject: None,
             access_url_secret: url.to_owned(),

@@ -2,11 +2,17 @@
 
 /* What is running, refreshed, framed.
  *
- * Two rules run through this file.
+ * Three rules run through this file.
  *
- * A frame is never rebuilt for a reason other than its address changing. A
- * terminal that reloaded on every poll would be a terminal that lost its
- * scrollback every two seconds, so cards are added and removed and otherwise
+ * Every session is placed the same way. This page does not rank them, does not
+ * reserve a position for one, and has no notion of which kinds of interface
+ * exist — the only ordering is the one the listener reported. A layout that
+ * treated some session specially would be this page deciding, on behalf of a
+ * program it has never heard of, that its UI matters more than its neighbour's.
+ *
+ * A frame is never rebuilt for a reason other than its address changing. An
+ * interface that reloaded on every poll would lose whatever state it was
+ * holding every two seconds, so cards are added and removed and otherwise
  * left alone.
  *
  * Folding and removing are this page's, not the session's. Removing a card
@@ -22,13 +28,11 @@
   const countNode = document.querySelector('#count');
   const stateNode = document.querySelector('#state');
   const stateLine = document.querySelector('.state');
-  const terminalSlot = document.querySelector('#terminal-slot');
-  const terminalEmpty = document.querySelector('#terminal-empty');
   const uiSlot = document.querySelector('#ui-slot');
   const uiEmpty = document.querySelector('#ui-empty');
   const template = document.querySelector('#card');
 
-  /** session_id -> {card, frame, path, slot} */
+  /** session_id -> {card, frame, path} */
   const shown = new Map();
   /** session_ids the person has taken off their own page. */
   const dropped = new Set();
@@ -46,10 +50,6 @@
    * Reported rather than inferred: the addresses below are the listener's to
    * write and this page's only to use. */
   let isolation = 'opaque-origin';
-
-  function isTerminal(session) {
-    return session.provider_id === 'afterminal' && session.ui_kind === 'terminal';
-  }
 
   function frameFor(src, label) {
     const frame = document.createElement('iframe');
@@ -109,40 +109,31 @@
     shown.delete(sessionId);
   }
 
-  function place(session, slot) {
+  function place(session) {
     const existing = shown.get(session.session_id);
-    if (existing && existing.path === session.proxy_url_secret && existing.card.parentElement === slot) {
-      return;
-    }
-    // Either the address moved — a lapsed proxy credential was replaced — or
-    // the session changed slots. Both mean this frame is pointed at the wrong
-    // place, and a wrong address is the one thing worth a reload.
+    if (existing && existing.path === session.proxy_url_secret) return;
+    // The address moved: a lapsed proxy credential was replaced. That points
+    // this frame at the wrong place, and a wrong address is the one thing
+    // worth a reload.
     remove(session.session_id);
     const built = build(session);
-    slot.append(built.card);
+    uiSlot.append(built.card);
     shown.set(session.session_id, built);
   }
 
   function settle() {
-    terminalEmpty.hidden = terminalSlot.childElementCount > 0;
     uiEmpty.hidden = uiSlot.childElementCount > 0;
     countNode.textContent = String(shown.size);
   }
 
   function render(sessions) {
     const live = new Set();
-    let terminalTaken = false;
     for (const session of sessions) {
       // Live before dismissed: a session the person took off their page is
       // still running, and forgetting that would put it back two seconds later.
       live.add(session.session_id);
       if (dropped.has(session.session_id)) continue;
-      // One terminal has the pinned area. A second one is an interface like any
-      // other rather than a second pinned area — which area a session lands in
-      // is this page's decision and is not asked of anybody.
-      const pinned = isTerminal(session) && !terminalTaken;
-      if (pinned) terminalTaken = true;
-      place(session, pinned ? terminalSlot : uiSlot);
+      place(session);
     }
     for (const sessionId of [...shown.keys()]) {
       if (!live.has(sessionId)) remove(sessionId);

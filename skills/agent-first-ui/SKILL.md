@@ -81,8 +81,8 @@ port directly.
 
 Framing is isolation, and there are two ways to get it. By default every framed
 UI runs on an opaque origin, which costs it browser storage: an interface that
-reads `localStorage` shows its own error there instead of running — afhttp's
-KasmVNC takeover panel is the known one. `--session-origin-host <HOST>` moves
+reads `localStorage` shows its own error there instead of running, which
+third-party remote-framebuffer clients commonly do. `--session-origin-host <HOST>` moves
 each session onto an origin of its own, `s-<credential>.<HOST>`, which restores
 storage without loosening anything: the isolation becomes the browser's origin
 boundary instead of an attribute on a frame.

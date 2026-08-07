@@ -1,6 +1,6 @@
 //! A Provider that already has a listener hosts AFUI sessions inside it.
 //!
-//! afterminal serves its UI from its own API server, so it cannot let AFUI bind
+//! A Provider that serves its UI from its own API server, so it cannot let AFUI bind
 //! anything — and until there was a mount, it had to hand-write a credential
 //! store and a `/ui/{token}/` prefix to get many windows onto one port. This
 //! drives the affordance that replaces that: the Provider owns the router, the
@@ -106,7 +106,7 @@ async fn a_provider_hosts_afui_sessions_inside_the_router_and_listener_it_alread
         let _ignored = axum::serve(listener, app).await;
     });
 
-    let review = UiSession::<String>::new("afmail", "case_review")
+    let review = UiSession::<String>::new("reviewer", "case_review")
         .expect("session")
         .with_subject("case-42");
     let review_completion = review.completion();
@@ -117,7 +117,7 @@ async fn a_provider_hosts_afui_sessions_inside_the_router_and_listener_it_alread
             UiExpiry::Never,
         )
         .expect("attach the review");
-    let terminal = UiSession::<String>::new("afterminal", "terminal").expect("session");
+    let terminal = UiSession::<String>::new("console", "terminal").expect("session");
     let terminal_completion = terminal.completion();
     let terminal = mount
         .attach(
@@ -181,7 +181,7 @@ async fn a_provider_hosts_afui_sessions_inside_the_router_and_listener_it_alread
     assert_eq!(listed.len(), 2, "{listed:#?}");
     let announced = listed
         .iter()
-        .find(|entry| entry.provider_id == "afmail")
+        .find(|entry| entry.provider_id == "reviewer")
         .expect("the review is announced");
     assert_eq!(announced.ui_kind, "case_review");
     assert_eq!(announced.subject.as_deref(), Some("case-42"));
@@ -207,7 +207,7 @@ async fn a_provider_hosts_afui_sessions_inside_the_router_and_listener_it_alread
     assert_eq!(call(&review_url, "GET").await.status, 404);
     let remaining = list_sessions().expect("list");
     assert_eq!(remaining.len(), 1, "{remaining:#?}");
-    assert_eq!(remaining[0].provider_id, "afterminal");
+    assert_eq!(remaining[0].provider_id, "console");
     assert_eq!(call(terminal.access_url(), "GET").await.status, 200);
     assert_eq!(
         call(&format!("http://{address}/v1/health"), "GET")

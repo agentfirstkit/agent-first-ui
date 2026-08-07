@@ -85,9 +85,9 @@ the process that announced it is gone. `AFUI_NO_REGISTRY=1` keeps a session out
 entirely.
 
 Not every interface worth listing is one this crate serves. `UiUpstream` names
-one that already exists somewhere else — afhttp's takeover panel is a KasmVNC
-web client behind afhttp's own listener and its own credential — and announces
-it as an ordinary session, so nothing reading the list can tell which kind it is
+one that already exists somewhere else — a third-party web client behind its
+own listener and its own credential, say — and announces it as an ordinary
+session, so nothing reading the list can tell which kind it is
 holding. What AFUI takes on there is the listing and only the listing: a
 credential it did not mint is not one it can revoke, and ending an announcement
 withdraws the entry rather than the URL.
@@ -95,10 +95,12 @@ withdraws the entry rather than the URL.
 ## Reaching them from your phone
 
 `afui session serve --listen <ADDRESS>` puts that same list on a page, with each
-session proxied onto an address a phone can reach. On a narrow screen the
-terminal sits on top and everything else stacks below it; on a wide one the
-stack moves left and the terminal is pinned right. Arrangement is the page's and
-yours — no Provider is asked where it goes.
+session proxied onto an address a phone can reach. Every session is a card in
+one column, in the order the listener reported them, each with the same slice
+of the viewport, and you fold or drop the ones you are not using. No kind of
+interface has a reserved position: the page has no way to know which kinds
+exist, and reserving one would be this page ranking a program it has never
+heard of above its neighbour.
 
 Two things it will not do. It is **not a transport**: it binds a port, and
 crossing anything to reach that port is WireGuard, Tailscale, an SSH tunnel, or
@@ -121,7 +123,8 @@ By default every session is a path on the one origin this listener owns, and the
 frames are sandboxed into an *opaque* origin — which is what isolates them from
 each other and from the page, and also what denies them `localStorage`. A
 third-party client that reads storage without guarding it therefore refuses to
-load; KasmVNC does exactly that, in three places.
+load, and a remote-framebuffer client is quite likely to do exactly that in
+several places at once.
 
 `--session-origin-host <HOST>` moves the isolation onto a boundary the browser
 draws anyway. Each session becomes `s-<credential>.<HOST>`, an origin of its own,
@@ -183,7 +186,7 @@ never renders, and never sees a domain value.
 # fn example() -> agent_first_ui::Result<()> {
 use agent_first_ui::UiFrontend;
 
-let frontend = UiFrontend::resolve(std::path::Path::new("."), "afpsql", "table_inspect", "1")?;
+let frontend = UiFrontend::resolve(std::path::Path::new("."), "inspector", "table_inspect", "1")?;
 // `None` means "this override did not supply that file", not "there is no
 // override": the overlay is per file, so replacing one page keeps every other
 // file the Provider ships — including its language packs.
@@ -206,7 +209,7 @@ use agent_first_ui::{Outcome, UiSession, UiWindowConfig};
 use axum::{Router, routing::get};
 
 # async fn example() -> agent_first_ui::Result<()> {
-let session = UiSession::<String>::new("afmail", "case_review")?;
+let session = UiSession::<String>::new("reviewer", "case_review")?;
 let completion = session.completion();
 let router = Router::new().route(
     "/",

@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Something that is not AFUI, serving a UI behind a credential of its own.
 ///
-/// Shaped like afhttp's takeover panel: the credential arrives as a query
+/// Shaped like a proxied third-party panel: the credential arrives as a query
 /// parameter, and a request without it is refused. Nothing here is minted by,
 /// known to, or revocable by AFUI.
 async fn foreign_provider(secret: &'static str) -> String {
@@ -76,7 +76,7 @@ async fn an_upstream_is_listed_like_any_session_and_keeps_working_after_it_is_wi
         "the fixture must start usable"
     );
 
-    let announced = UiUpstream::new("afhttp", "takeover", &panel_url)
+    let announced = UiUpstream::new("remote", "takeover", &panel_url)
         .unwrap()
         .with_subject("captcha wall")
         .announce()
@@ -85,7 +85,7 @@ async fn an_upstream_is_listed_like_any_session_and_keeps_working_after_it_is_wi
     let listed = list_sessions().unwrap();
     assert_eq!(listed.len(), 1, "{listed:#?}");
     let entry = &listed[0];
-    assert_eq!(entry.provider_id, "afhttp");
+    assert_eq!(entry.provider_id, "remote");
     assert_eq!(entry.ui_kind, "takeover");
     assert_eq!(entry.subject.as_deref(), Some("captcha wall"));
     assert_eq!(entry.session_id, announced.metadata().session_id.as_str());

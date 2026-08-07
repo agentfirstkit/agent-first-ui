@@ -204,8 +204,8 @@ pub(crate) fn validate_identifier(field: &'static str, value: &str) -> Result<()
 /// File extensions an override may never supply, whatever it calls the file.
 ///
 /// This is the one place "no overridden JavaScript" is enforced rather than
-/// described. A Provider's behaviour is its own — afmail pins a nonce-bound
-/// trusted runtime, afpsql binds its decision controls the same way — and that
+/// described. A Provider's behaviour is its own — typically a nonce-bound
+/// trusted runtime its controls are wired to — and that
 /// only means anything if a person's frontend cannot ship code of its own
 /// beside it. Refusing by extension is deliberately blunt: it is a delivery
 /// rule about which bytes may leave this crate, not an attempt to read a
@@ -225,8 +225,8 @@ const SCRIPT_EXTENSIONS: [&str; 5] = ["js", "mjs", "cjs", "wasm", "jsx"];
 ///
 /// The overlay is per file, not per directory. Replacing a directory would
 /// make a person who wants to change one page responsible for shipping every
-/// other file the Provider ships — nine language packs, in afmail's case — so
-/// a one-page customisation would silently delete i18n.
+/// other file the Provider ships — a full set of language packs, say — so a
+/// one-page customisation would silently delete i18n.
 #[derive(Debug, Clone)]
 pub struct UiFrontend {
     provider_id: String,

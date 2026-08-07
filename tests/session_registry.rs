@@ -21,7 +21,7 @@ async fn a_session_is_announced_while_it_runs_and_withdrawn_when_it_ends() {
     let host = UiHost::bind_local().await.unwrap();
     let orders = host
         .attach(
-            UiSession::<()>::new("afpsql", "table_inspect")
+            UiSession::<()>::new("inspector", "table_inspect")
                 .unwrap()
                 .with_subject("public.orders"),
             Router::new(),
@@ -30,7 +30,7 @@ async fn a_session_is_announced_while_it_runs_and_withdrawn_when_it_ends() {
         .unwrap();
     let review = host
         .attach(
-            UiSession::<()>::new("afmail", "case_review")
+            UiSession::<()>::new("reviewer", "case_review")
                 .unwrap()
                 .with_subject("case-42"),
             Router::new(),
@@ -45,7 +45,7 @@ async fn a_session_is_announced_while_it_runs_and_withdrawn_when_it_ends() {
     // under-report rather than fail.
     let review_entry = listed
         .iter()
-        .find(|entry| entry.provider_id == "afmail")
+        .find(|entry| entry.provider_id == "reviewer")
         .unwrap();
     assert_eq!(review_entry.ui_kind, "case_review");
     assert_eq!(review_entry.subject.as_deref(), Some("case-42"));
@@ -74,7 +74,7 @@ async fn a_session_is_announced_while_it_runs_and_withdrawn_when_it_ends() {
     drop(orders);
     let remaining = list_sessions().unwrap();
     assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].provider_id, "afmail");
+    assert_eq!(remaining[0].provider_id, "reviewer");
 
     drop(review);
     assert!(list_sessions().unwrap().is_empty());

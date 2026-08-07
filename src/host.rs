@@ -41,7 +41,7 @@ use crate::{Error, OriginDecision, Result, UiAccessToken, UiSecurityPolicy};
 /// let mount = UiMount::new("http://127.0.0.1:8080/ui/")?;
 /// // The Provider's own server, with AFUI sessions living under `/ui/`.
 /// let app = provider_routes.nest_service("/ui", mount.router());
-/// let session = UiSession::<()>::new("afterminal", "terminal")?;
+/// let session = UiSession::<()>::new("console", "terminal")?;
 /// let active = mount.attach(session, session_routes, UiExpiry::Never)?;
 /// assert!(active.access_url().starts_with("http://127.0.0.1:8080/ui/"));
 /// # let _ = app;

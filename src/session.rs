@@ -398,7 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_value_returns_to_the_session() {
-        let session = UiSession::<u32>::new("afmail", "case_review").unwrap();
+        let session = UiSession::<u32>::new("reviewer", "case_review").unwrap();
         let completion = session.completion();
         assert!(completion.complete(42).await);
         assert_eq!(session.completion.wait().await, Outcome::Completed(42));
@@ -406,8 +406,8 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_sessions_route_results_independently() {
-        let first = UiSession::<u8>::new("afmail", "case_review").unwrap();
-        let second = UiSession::<u8>::new("afpay", "plan_confirm").unwrap();
+        let first = UiSession::<u8>::new("reviewer", "case_review").unwrap();
+        let second = UiSession::<u8>::new("ledger", "plan_confirm").unwrap();
         let first_completion = first.completion();
         let second_completion = second.completion();
         assert!(second_completion.complete(2).await);
@@ -418,14 +418,14 @@ mod tests {
 
     #[test]
     fn identifiers_are_stable_path_segments() {
-        assert!(UiSession::<()>::new("afmail", "case_review").is_ok());
+        assert!(UiSession::<()>::new("reviewer", "case_review").is_ok());
         assert!(UiSession::<()>::new("AfMail", "case_review").is_err());
-        assert!(UiSession::<()>::new("afmail", "../review").is_err());
+        assert!(UiSession::<()>::new("reviewer", "../review").is_err());
     }
 
     #[tokio::test]
     async fn a_url_delivery_advertises_the_named_host_rather_than_the_bound_wildcard() {
-        let session = UiSession::<()>::new("afmail", "case_review").unwrap();
+        let session = UiSession::<()>::new("reviewer", "case_review").unwrap();
         let active = session
             .serve(
                 Router::new(),
@@ -445,7 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_window_session_can_never_expire() {
-        let session = UiSession::<()>::new("afterminal", "terminal").unwrap();
+        let session = UiSession::<()>::new("console", "terminal").unwrap();
         let active = session
             .serve(Router::new(), UiUrlDelivery::new(UiExpiry::Never))
             .await
@@ -465,7 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_expired_url_delivery_stops_serving_before_the_waiter_notices() {
-        let session = UiSession::<()>::new("afmail", "case_review").unwrap();
+        let session = UiSession::<()>::new("reviewer", "case_review").unwrap();
         let active = session
             .serve(
                 Router::new(),

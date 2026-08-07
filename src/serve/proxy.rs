@@ -198,9 +198,9 @@ impl Proxied {
 /// One proxied session's cookies, kept here rather than in the browser.
 ///
 /// A cookie exists so a Provider can recognise the same visitor on the next
-/// request. afhttp's takeover hands its credential over exactly that way —
-/// `?handoff_secret=…` once, a cookie every time after — so a proxy that drops
-/// cookies cannot carry it at all.
+/// request. A panel that hands a credential over as `?handoff_secret=…` once
+/// and a cookie every time after depends on exactly that, so a proxy that
+/// drops cookies cannot carry it at all.
 ///
 /// It cannot be a browser cookie in the default shape. One origin answers for
 /// every framed UI there, so a cookie the browser held for one session would be
@@ -309,8 +309,8 @@ pub(super) struct Upstream {
     /// The part of the address that is not a path.
     ///
     /// A session AFUI serves never has one. A session that only *names* an
-    /// upstream may: afhttp's takeover panel puts its handoff credential in
-    /// `?handoff_secret=…`, and that is as much a part of the address as the
+    /// upstream may: a panel that puts its handoff credential in
+    /// `?handoff_secret=…` makes that as much a part of the address as the
     /// path is. It is reproduced on every request to this mount rather than
     /// interpreted — the proxy neither reads these parameters nor knows what
     /// they mean, exactly as it neither reads nor knows the path prefix.
@@ -679,7 +679,7 @@ mod tests {
 
     #[test]
     fn an_announced_upstream_keeps_the_query_its_credential_lives_in() {
-        // afhttp's takeover panel, verbatim. Dropping the query would proxy
+        // A handoff credential carried in the query. Dropping it would proxy
         // every request to a listener that answers 401.
         let upstream =
             Upstream::parse("http://127.0.0.1:9222/takeover/panel?handoff_secret=deadbeef")
@@ -808,16 +808,16 @@ mod tests {
         assert_eq!(sent(&jar), None);
 
         jar.store(&HeaderValue::from_static(
-            "afhttp_handoff=abc123; Path=/takeover; Max-Age=600; HttpOnly; SameSite=Lax",
+            "provider_handoff=abc123; Path=/takeover; Max-Age=600; HttpOnly; SameSite=Lax",
         ));
         // Only the pair crosses. Every other attribute instructs a browser, and
         // no browser is holding this.
-        assert_eq!(sent(&jar).as_deref(), Some("afhttp_handoff=abc123"));
+        assert_eq!(sent(&jar).as_deref(), Some("provider_handoff=abc123"));
 
         jar.store(&HeaderValue::from_static("theme=dark"));
         assert_eq!(
             sent(&jar).as_deref(),
-            Some("afhttp_handoff=abc123; theme=dark")
+            Some("provider_handoff=abc123; theme=dark")
         );
 
         // A later value for the same name replaces the earlier one rather than
@@ -825,13 +825,13 @@ mod tests {
         jar.store(&HeaderValue::from_static("theme=light"));
         assert_eq!(
             sent(&jar).as_deref(),
-            Some("afhttp_handoff=abc123; theme=light")
+            Some("provider_handoff=abc123; theme=light")
         );
 
         // How a Provider deletes one, and the only reason this jar reads
         // `Max-Age` at all.
         jar.store(&HeaderValue::from_static(
-            "afhttp_handoff=; Path=/takeover; Max-Age=0",
+            "provider_handoff=; Path=/takeover; Max-Age=0",
         ));
         assert_eq!(sent(&jar).as_deref(), Some("theme=light"));
     }

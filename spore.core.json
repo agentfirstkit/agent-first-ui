@@ -2,7 +2,7 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-ui",
   "name": "Agent-First UI",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
   "synopsis": "Let your AI agent hand you a real interface when a step needs a person — a window opens, you decide, and the agent gets a typed answer back.",
@@ -13,17 +13,10 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Replace the retired view-hint protocol and JSON schemas with a UI session library: a Provider brings an Axum Router and AFUI owns delivery — access credential, expiry, security headers, isolated window, cleanup — returning a typed Completed(T)/Closed/Expired outcome and never touching a domain value",
-    "Move expiry from the session to the delivery, so a window bounds itself and never expires while a shared URL must name a UiExpiry::After lifetime or a sliding UiExpiry::Idle",
-    "Separate sessions from ports via UiHost and UiMount, so many sessions share one listener routed by credential and a Provider can nest session routing into an Axum router it already owns",
-    "Announce every active session to a per-user registry so afui session list answers what is waiting for you across processes, with liveness probed by asking the host rather than checking a pid, and the credential never printed",
-    "Add afui session serve, a feature-gated page that reverse-proxies every live session on the machine so a phone or another device can reach interfaces bound to loopback",
-    "Add a frontend override capability with a single strict markup guard shared by all Providers, in a dependency tier that does not require axum",
-    "Fix the advertised session URL 404ing by stripping the credential before routing, so the trailing-slash URL that makes relative page assets resolve is actually served and the constant-time credential compare runs",
-    "Open the isolated Chromium window with --app= instead of --new-window, add a CSP nonce so a Provider can serve inline scripts, and stop advertising the bind address so a LAN session no longer publishes 0.0.0.0",
-    "Flatten the crate from rust/ to the spore root, add the spore's skill, and rewrite the README lead around what the spore does for an agent",
-    "Improve the served session page on mobile and give an unknown session a proper not-found page",
-    "Upgrade the agent-first-data dependency to 0.32.0"
+    "Rewrite the README, skill file and source documentation so the library argues its design from the shape of the problem rather than from named consumer programs, which a reader who installs this crate on its own does not have and cannot check",
+    "Stop the served session page reserving a position for any kind of session: every session is a card in one column in the order the listener reported, each with the same slice of the viewport, and the person folds or drops what they are not using",
+    "Widen the served page's column on a large screen rather than splitting it into two panes, since a second column would require deciding which sessions belong in it",
+    "Rename example and fixture identifiers, and the proxy's handoff cookie, to neutral names so nothing in the published crate reads as a registry of real consumers"
   ],
   "bonds": [],
   "tree": {

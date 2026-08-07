@@ -12,7 +12,7 @@ mod frontend_script;
 /// Everything under `session` binds a port, mints a credential, or launches a
 /// browser, and that is where axum and tokio come from. The guard and the
 /// frontend overlay above need neither, so a Provider that only has templates
-/// to check — afmail's, in a build with its Review UI compiled out — takes this
+/// to check — in a build with its human UI compiled out — takes this
 /// crate without them.
 #[cfg(feature = "session")]
 mod access_token;

@@ -78,7 +78,7 @@ async fn a_window_serves_its_page_and_closing_it_ends_the_session() {
     let capture = workdir.path().join("capture.txt");
     let browser = stub_browser(workdir.path(), &capture).unwrap();
 
-    let session = UiSession::<()>::new("afpsql", "table_inspect").unwrap();
+    let session = UiSession::<()>::new("inspector", "table_inspect").unwrap();
     let config = UiWindowConfig::default().with_browser_binary(&browser);
     let outcome = session.window(panel_router(), &config).await.unwrap();
 
@@ -122,7 +122,7 @@ async fn a_window_session_survives_longer_than_the_old_fixed_ttl() {
     )
     .unwrap();
 
-    let session = UiSession::<()>::new("afterminal", "terminal").unwrap();
+    let session = UiSession::<()>::new("console", "terminal").unwrap();
     let config = UiWindowConfig::default().with_browser_binary(&script);
     let window = session.window(panel_router(), &config);
     // Nothing should resolve while the stub browser just sits there.

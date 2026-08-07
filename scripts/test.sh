@@ -26,8 +26,8 @@ run_clippy() {
 }
 
 # Every tier a consumer can ask for, because a tier nothing builds is a tier
-# that compiles by accident. The guard tier is the one with a Provider depending
-# on it — afmail's ungated template loader — and it is also the one a default
+# that compiles by accident. The guard tier is the one a Provider depends on
+# from an ungated template loader, and it is also the one a default
 # build would never notice breaking, because the default build has axum in it.
 run_static() {
   afdata_run --quiet cargo fmt --all --check
@@ -49,11 +49,11 @@ run_unit() {
 
 # The guard tier's whole point is what it does *not* pull in.
 #
-# afmail puts this crate in its ungated `[dependencies]` so its template loader
-# can call the markup guard, and afmail's clippy gate includes a
-# `--no-default-features` profile. If a server crate ever leaks back into the
-# featureless build, afmail's minimal build grows a runtime and nothing else
-# here would say so.
+# A Provider puts this crate in its ungated `[dependencies]` so its template
+# loader can call the markup guard, and gates that build with a
+# `--no-default-features` clippy profile. If a server crate ever leaks back into
+# the featureless build, every such minimal build grows a runtime and nothing
+# else here would say so.
 check_guard_tier_dependencies() {
   local tree dependency
   tree="$(cargo tree --no-default-features --edges normal --prefix none)"
@@ -75,20 +75,20 @@ run_smoke() {
   (
     cd "$smoke_root"
     AFUI_CONFIG_DIR="$config_root" afdata_run --quiet \
-      "$ROOT_PATH/target/debug/afui" frontend init afmail case_review \
+      "$ROOT_PATH/target/debug/afui" frontend init reviewer case_review \
       --frontend-id custom_review
     AFUI_CONFIG_DIR="$config_root" afdata_run --quiet \
-      "$ROOT_PATH/target/debug/afui" frontend check afmail case_review
+      "$ROOT_PATH/target/debug/afui" frontend check reviewer case_review
     AFUI_CONFIG_DIR="$config_root" afdata_run --quiet \
-      "$ROOT_PATH/target/debug/afui" frontend enable afmail case_review
+      "$ROOT_PATH/target/debug/afui" frontend enable reviewer case_review
     AFUI_CONFIG_DIR="$config_root" afdata_run --quiet \
-      "$ROOT_PATH/target/debug/afui" frontend check afmail case_review
+      "$ROOT_PATH/target/debug/afui" frontend check reviewer case_review
     AFUI_CONFIG_DIR="$config_root" afdata_run --quiet \
-      "$ROOT_PATH/target/debug/afui" frontend diff afmail case_review
+      "$ROOT_PATH/target/debug/afui" frontend diff reviewer case_review
     AFUI_CONFIG_DIR="$config_root" afdata_run --quiet \
-      "$ROOT_PATH/target/debug/afui" frontend disable afmail case_review
+      "$ROOT_PATH/target/debug/afui" frontend disable reviewer case_review
     AFUI_CONFIG_DIR="$config_root" AFUI_SAFE_MODE=1 afdata_run --quiet \
-      "$ROOT_PATH/target/debug/afui" frontend check afmail case_review
+      "$ROOT_PATH/target/debug/afui" frontend check reviewer case_review
   )
   run_serve_smoke "$config_root"
   # The same verb in its other shape, where every session gets an origin of its
@@ -102,7 +102,7 @@ run_smoke() {
 #
 # Deliberately self-contained. What a browser and a real Provider do with the
 # page is covered by tests/session_serve.rs, which drives both in-process; this
-# spore's gate must not need afterminal or afmail to be built.
+# spore's gate must not need any consuming Provider to be built.
 #
 # Every request names its authority in a `Host` header and connects to loopback
 # regardless, because a session's own name is not something this machine's

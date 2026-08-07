@@ -10,14 +10,13 @@
 //! has to be identical across Providers, because what it protects is identical
 //! across Providers — each one binds its own behaviour to its own page with a
 //! nonce, and that is only worth anything if a frontend cannot run code beside
-//! it. afmail wrote this first and drove it through six real scenarios; this is
-//! that implementation, moved so every Provider inherits it rather than
-//! reimplements it.
+//! it. This is one implementation of that rule, in the one place every
+//! Provider inherits it from rather than reimplements it.
 //!
 //! Nothing above this line needs a server, which is why it is in the featureless
 //! tier. Two copies of a security rule drift silently, and the only thing that
-//! had kept afmail on its own copy was that taking this crate at all used to
-//! mean taking axum and tokio with it.
+//! had kept a Provider on its own copy was that taking this crate at all used
+//! to mean taking axum and tokio with it.
 
 use crate::{Error, Result};
 
@@ -33,8 +32,8 @@ const FORBIDDEN_ELEMENTS: [&str; 5] = ["<script", "</script", "<iframe", "<objec
 /// the values it prints are domain values — a subject line, a table name, a
 /// payee. A template that could turn escaping back off would make the frontend
 /// the thing that decides whether those values are markup, which is exactly
-/// what the rest of this file exists to prevent. afmail, afpsql and afterminal
-/// each wrote this check separately; it is one rule, so it is one place.
+/// what the rest of this file exists to prevent. It is one rule, so it is one
+/// place.
 const ESCAPE_HATCHES: [(&str, &str); 3] = [
     ("|safe", "the `safe` filter"),
     ("filtersafe", "a `{% filter safe %}` block"),
@@ -262,7 +261,7 @@ mod tests {
         // so declaring one must not read as behaviour.
         reject_frontend_script(
             "page",
-            "<button data-afpsql-decision=\"approve\">Run</button>",
+            "<button data-provider-decision=\"approve\">Run</button>",
         )
         .unwrap();
     }

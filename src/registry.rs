@@ -1,7 +1,7 @@
 //! Where live sessions announce themselves, so something else can find them.
 //!
-//! A session lives inside whichever process created it — an `afmail` review, an
-//! `afterminal` window, an `afpsql` panel. Nothing could see across those
+//! A session lives inside whichever process created it — a review, a terminal
+//! window, an inspection panel. Nothing could see across those
 //! processes, so a person had no way to ask "what is waiting for me?" and the
 //! `afui` CLI had nothing to schedule.
 //!
@@ -240,9 +240,9 @@ impl UiSessionEntry {
     /// of them used to be asked. Reachability answers "is this still being
     /// served?", which for a session AFUI serves is the whole story: the host
     /// lives in the owning process and stops accepting the moment that process
-    /// does. An announced upstream separates the two — afhttp's takeover panel
-    /// is served by a long-running `afhttp host` while the session belongs to
-    /// the shorter-lived command that minted its credential — so a crashed
+    /// does. An announced upstream separates the two — its page is served by a
+    /// long-running host while the session belongs to the shorter-lived command
+    /// that minted its credential — so a crashed
     /// announcer would otherwise leave a listing whose host is very much still
     /// answering.
     ///
@@ -342,7 +342,7 @@ mod tests {
     fn a_published_session_is_visible_then_disappears_when_it_ends() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _root = isolated_root();
-        let metadata = metadata("afpsql", "table_inspect");
+        let metadata = metadata("inspector", "table_inspect");
         let (host, url) = listening();
 
         let handle = publish(&metadata, Some("public.orders".to_owned()), &url);
@@ -350,7 +350,7 @@ mod tests {
         // every session in this binary announces itself, so the registry is
         // shared and a total count would be a race, not a fact.
         let mine = find_session(metadata.session_id.as_str()).unwrap().unwrap();
-        assert_eq!(mine.provider_id, "afpsql");
+        assert_eq!(mine.provider_id, "inspector");
         assert_eq!(mine.ui_kind, "table_inspect");
         assert_eq!(mine.subject.as_deref(), Some("public.orders"));
         assert_eq!(mine.access_url_secret, url);
@@ -370,7 +370,7 @@ mod tests {
     fn an_entry_whose_host_stopped_is_pruned_rather_than_offered() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _root = isolated_root();
-        let metadata = metadata("afmail", "case_review");
+        let metadata = metadata("reviewer", "case_review");
         let (host, url) = listening();
         // Leak the handle so nothing cleans up on drop: this is a Provider
         // that died, leaving its file behind with nothing on its port.
@@ -404,7 +404,7 @@ mod tests {
         // SAFETY: serialised by `TEST_LOCK`.
         unsafe { std::env::set_var(NO_REGISTRY_ENV, "1") };
         let (host, url) = listening();
-        let metadata = metadata("afmail", "case_review");
+        let metadata = metadata("reviewer", "case_review");
         let handle = publish(&metadata, None, &url);
         let found = find_session(metadata.session_id.as_str()).unwrap();
         drop(host);
@@ -421,15 +421,15 @@ mod tests {
         // The shape only an announced upstream has: the process that owns the
         // session is not the process that serves it. Here the server is still
         // up — it is this test's own listener — and the announcer is a pid that
-        // no longer exists, which is what a crashed `afhttp ui takeover` leaves
-        // behind while its `afhttp host` keeps running.
+        // no longer exists, which is what a crashed announcer leaves behind
+        // while the server it announced keeps running.
         let (host, url) = listening();
         let session_id = UiSessionId::generate().unwrap();
         let directory = sessions_directory().unwrap();
         fs::create_dir_all(&directory).unwrap();
         let entry = UiSessionEntry {
             session_id: session_id.as_str().to_owned(),
-            provider_id: "afhttp".to_owned(),
+            provider_id: "remote".to_owned(),
             ui_kind: "takeover".to_owned(),
             subject: None,
             access_url_secret: format!("{url}?handoff_secret=deadbeef"),
@@ -465,7 +465,7 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _root = isolated_root();
         let (host, url) = listening();
-        let published = metadata("afterminal", "terminal");
+        let published = metadata("console", "terminal");
         let handle = publish(&published, None, &url);
         let directory = sessions_directory().unwrap();
         // The URL carries a credential, so neither the file nor the directory

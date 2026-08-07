@@ -3,10 +3,11 @@
 //! Everywhere else in this crate a session ends with AFUI holding the socket: a
 //! [`crate::UiSession`] is mounted on a [`crate::UiMount`], AFUI routes its
 //! requests, AFUI minted the credential in its URL, and ending the session
-//! revokes it. Some Provider UIs are not shaped like that at all. afhttp's
-//! takeover panel is KasmVNC's own web client, reverse-proxied by afhttp's
-//! authenticated listener, behind a credential afhttp mints, on a port afhttp
-//! bound. There is nothing there for AFUI to serve and nothing for it to mint.
+//! revokes it. Some Provider UIs are not shaped like that at all: a
+//! third-party web client, reverse-proxied by the Provider's own
+//! authenticated listener, behind a credential the Provider mints, on a port
+//! the Provider bound. There is nothing there for AFUI to serve and nothing
+//! for it to mint.
 //!
 //! Until this existed, that meant the panel could not appear in `afui session
 //! list` and could not be reached by `afui session serve` — so the case that
@@ -50,7 +51,7 @@ use crate::{Error, Result, UiSessionMetadata};
 /// use agent_first_ui::UiUpstream;
 ///
 /// # fn example(panel_url_secret: &str) -> agent_first_ui::Result<()> {
-/// let announced = UiUpstream::new("afhttp", "takeover", panel_url_secret)?
+/// let announced = UiUpstream::new("remote", "takeover", panel_url_secret)?
 ///     .with_subject("captcha wall")
 ///     .announce()?;
 /// // Listed for as long as this value is held, and withdrawn when it is not.
@@ -82,7 +83,7 @@ impl UiUpstream {
     /// Name a UI that is already being served somewhere else.
     ///
     /// `access_url_secret` is the whole address a person would open, credential
-    /// included — for afhttp's panel that credential is a query parameter, and
+    /// included — such a panel often carries its credential as a query parameter, and
     /// the query is as much part of the address as the path is. It is
     /// `_secret`-suffixed because it carries one, and AFUI treats it the way it
     /// treats every session URL: stored `0600` in a private directory, handed
@@ -199,7 +200,7 @@ mod tests {
 
     #[test]
     fn a_foreign_url_keeps_the_query_its_credential_lives_in() {
-        // afhttp's panel, verbatim: the credential is a query parameter, so
+        // The awkward shape: the credential is a query parameter, so
         // dropping the query would announce a URL that answers 401.
         let announced =
             normalise_upstream_url("http://127.0.0.1:9222/takeover/panel?handoff_secret=deadbeef")
@@ -241,8 +242,8 @@ mod tests {
 
     #[test]
     fn an_upstream_is_identified_the_same_way_a_served_session_is() {
-        assert!(UiUpstream::new("afhttp", "takeover", "http://127.0.0.1:9222/p").is_ok());
+        assert!(UiUpstream::new("remote", "takeover", "http://127.0.0.1:9222/p").is_ok());
         assert!(UiUpstream::new("AfHttp", "takeover", "http://127.0.0.1:9222/p").is_err());
-        assert!(UiUpstream::new("afhttp", "../panel", "http://127.0.0.1:9222/p").is_err());
+        assert!(UiUpstream::new("remote", "../panel", "http://127.0.0.1:9222/p").is_err());
     }
 }

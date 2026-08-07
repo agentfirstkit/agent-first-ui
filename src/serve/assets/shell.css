@@ -1,12 +1,13 @@
-/* Two arrangements, one breakpoint, no layout engine.
+/* One arrangement, no layout engine.
  *
- * Narrow, which is the case this page exists for: the terminal on top, the
- * other interfaces stacked under it. Wide: the stack moves to the left and the
- * terminal is pinned to the right, tall enough to be worth typing into while
- * the stack beside it scrolls.
+ * Every session is a card in one column, in the order the listener reported
+ * them, each given the same slice of the viewport. No kind of interface has a
+ * reserved position, because this page has no way to know which kinds exist —
+ * a reserved position is a layout opinion about a program this page has never
+ * heard of, and the person can fold or drop whatever they are not using.
  *
- * The order is expressed once, in `order`, so the markup reads as content
- * rather than as a position. */
+ * The column widens on a large screen rather than splitting: a second column
+ * would have to decide what goes in it. */
 
 :root {
   --ink: #e8ebf2;
@@ -74,14 +75,6 @@ body {
   min-width: 0;
 }
 
-.terminal-pane {
-  order: 1;
-}
-
-.list-pane {
-  order: 2;
-}
-
 .pane-head {
   display: flex;
   align-items: center;
@@ -104,17 +97,6 @@ body {
   display: grid;
   gap: 12px;
   min-width: 0;
-}
-
-/* Tall enough to be a terminal on a phone, and measured in the viewport unit
- * that accounts for the browser's own chrome sliding in and out. */
-.terminal-pane .slot {
-  height: 58vh;
-  height: 58dvh;
-}
-
-.terminal-pane .slot:empty {
-  display: none;
 }
 
 .empty {
@@ -144,10 +126,6 @@ code {
   border-radius: 10px;
   background: var(--panel);
   overflow: hidden;
-}
-
-.terminal-pane .card {
-  height: 100%;
 }
 
 .card-head {
@@ -222,13 +200,9 @@ button:hover {
   background: var(--page);
 }
 
-.terminal-pane .frame {
-  height: auto;
-}
-
 .card[data-folded="true"] .frame {
-  /* Folded, not unloaded: a terminal that reloaded every time it was folded
-   * away would lose its scrollback. */
+  /* Folded, not unloaded: an interface that reloaded every time it was folded
+   * away would lose whatever state it was holding. */
   display: none;
 }
 
@@ -239,45 +213,24 @@ iframe {
   border: 0;
 }
 
-/* A phone gives the workbench less usable height than its CSS viewport once
- * Safari's bars are present. 58dvh left the framed terminal with enough room
- * for its navigation and controls but only one terminal row. Keep the frame
- * itself stable when the soft keyboard opens; the terminal inside tracks the
- * visual viewport and compacts its own chrome. The page may scroll, which is
- * preferable to resizing a live PTY to 1 row. */
+/* A phone gives less usable height than its CSS viewport once the browser's
+ * bars are present, and an interface a person is typing into needs the room.
+ * Keep the frame stable when the soft keyboard opens — whatever is inside it
+ * tracks the visual viewport itself. The page may scroll, which is preferable
+ * to resizing a live interface down to nothing. */
 @media (max-width: 560px) {
-  .terminal-pane .slot {
+  .frame {
     height: 82vh;
     height: 82dvh;
     min-height: 42rem;
   }
 }
 
+/* Wider, not split. */
 @media (min-width: 900px) {
   .deck {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    align-items: start;
-    height: calc(100dvh - 45px);
-  }
-
-  .list-pane {
-    order: 1;
-    overflow-y: auto;
-    max-height: 100%;
-  }
-
-  .terminal-pane {
-    order: 2;
-    position: sticky;
-    top: 0;
-    height: 100%;
-    display: flex;
-    flex-direction: column;
-  }
-
-  .terminal-pane .slot {
-    flex: 1;
-    height: auto;
-    min-height: 0;
+    max-width: 68rem;
+    margin: 0 auto;
+    width: 100%;
   }
 }
