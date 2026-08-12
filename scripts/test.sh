@@ -30,8 +30,15 @@ run_clippy() {
 # from an ungated template loader, and it is also the one a default
 # build would never notice breaking, because the default build has axum in it.
 run_static() {
+  # Parsing is not linting, and this ran neither until now. The pinned version
+  # lives in the script itself, mirrored from the monorepo and compared byte for
+  # byte there, so this spore and its siblings cannot drift onto different rules.
+  "$ROOT_PATH/scripts/install-shellcheck.sh" --check "$ROOT_PATH"
   afdata_run --quiet cargo fmt --all --check
   run_clippy --no-default-features
+  # `page` is orthogonal to `session` — a build that renders and checks a
+  # page but binds no port. Nothing else in this gate compiles it.
+  run_clippy --no-default-features --features page
   run_clippy
   # The shell and its reverse proxy are behind a feature, so the default build
   # never compiles them. A gate that only ran the default build would let the
@@ -41,8 +48,10 @@ run_static() {
 
 run_unit() {
   afdata_run --quiet cargo test --all-targets --no-default-features
+  afdata_run --quiet cargo test --all-targets --no-default-features --features page
   afdata_run --quiet cargo test --all-targets
   afdata_run --quiet cargo test --doc
+  afdata_run --quiet cargo test --doc --no-default-features --features page
   afdata_run --quiet cargo test --all-targets --features serve
   check_guard_tier_dependencies
 }
@@ -53,17 +62,22 @@ run_unit() {
 # loader can call the markup guard, and gates that build with a
 # `--no-default-features` clippy profile. If a server crate ever leaks back into
 # the featureless build, every such minimal build grows a runtime and nothing
-# else here would say so.
+# else here would say so. `page` gets the same check under its own flag: it
+# adds minijinja and nothing session brings with it, so axum and tokio must
+# still be absent from that tree too.
 check_guard_tier_dependencies() {
-  local tree dependency
-  tree="$(cargo tree --no-default-features --edges normal --prefix none)"
-  for dependency in axum tokio tower hyper agent-first-data; do
-    if [[ "$tree" == *"$dependency v"* ]]; then
-      afdata_error unexpected_dependency \
-        "$dependency must not be present in the no-default-features dependency tree" \
-        "keep it behind the session feature" || :
-      return 1
-    fi
+  local tree dependency flags
+  for flags in "--no-default-features" "--no-default-features --features page"; do
+    # shellcheck disable=SC2086
+    tree="$(cargo tree $flags --edges normal --prefix none)"
+    for dependency in axum tokio tower hyper agent-first-data; do
+      if [[ "$tree" == *"$dependency v"* ]]; then
+        afdata_error unexpected_dependency \
+          "$dependency must not be present in the '$flags' dependency tree" \
+          "keep it behind the session feature" || :
+        return 1
+      fi
+    done
   done
 }
 
@@ -118,8 +132,11 @@ run_serve_smoke() {
   [ -n "$session_origin_host" ] && extra_args=(--session-origin-host "$session_origin_host")
 
   afdata_run --quiet cargo build --bin afui --features serve
+  # `0` is how a person says "no limit", and the gate has to prove the CLI reads
+  # it that way: the alternative spelling of nothing is a listener that stops
+  # answering in the middle of this script.
   AFUI_CONFIG_DIR="$config_root" "$binary" session serve --listen 127.0.0.1:0 \
-    "${extra_args[@]}" >"$log" 2>&1 &
+    --idle-minutes 0 "${extra_args[@]}" >"$log" 2>&1 &
   serve_pid=$!
   # shellcheck disable=SC2064
   trap "kill $serve_pid 2>/dev/null || true; rm -rf '$TEST_TMP'" EXIT

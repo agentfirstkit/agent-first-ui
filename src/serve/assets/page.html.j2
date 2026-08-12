@@ -1,0 +1,76 @@
+{#-
+  The page that lists what is running on this machine.
+
+  Every id comes from `document.elements` and every card class from
+  `document.card`, so a replacement page cannot misspell one and a page that
+  drops one is reported before the listener binds. Actions and sizes are
+  declared rather than wired: the runtime reads `data-act` and `data-size` and
+  decides what pressing one does, so a control can be relabelled, reordered or
+  dropped without it becoming a control that does something else.
+
+  The script is not here. AFUI splices its own runtime in at the marker below,
+  and a frontend may not supply JavaScript at all.
+-#}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>{{ document.title }}</title>
+  <link rel="icon" href="__afui/app-icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="shell.css">
+  <!-- afui:trusted-runtime -->
+</head>
+<body data-ui-api-version="{{ document.ui_api_version }}">
+  <header class="bar">
+    <h1>{{ document.heading }}</h1>
+    <p id="{{ document.elements.state_line }}" class="state">
+      <span id="{{ document.elements.count }}">0</span> open ·
+      <span id="{{ document.elements.state }}">connecting</span>
+    </p>
+  </header>
+
+  <p id="{{ document.elements.notice }}" class="notice" role="status" hidden>
+    <span id="{{ document.elements.notice_text }}"></span>
+    <button type="button" id="{{ document.elements.notice_renew }}">{{ document.renew_label }}</button>
+  </p>
+
+  <main class="deck">
+    <section class="pane list-pane" aria-label="{{ document.heading }}">
+      <div class="pane-head"><h2>{{ document.slot_heading }}</h2></div>
+      <div id="{{ document.elements.slot }}" class="stack"></div>
+      <p id="{{ document.elements.empty }}" class="empty">{{ document.empty_label }}</p>
+    </section>
+  </main>
+
+  <template id="{{ document.elements.card }}">
+    <article class="{{ document.card.root }}">
+      <header class="card-head">
+        <div class="who">
+          <strong class="{{ document.card.provider }}"></strong>
+          <span class="{{ document.card.kind }}"></span>
+          <span class="{{ document.card.subject }}"></span>
+        </div>
+        <div class="acts">
+          <span class="{{ document.card.action_status }}" role="status" aria-live="polite"></span>
+          {#- The link is a link, so a long press offers the browser's own menu. -#}
+          <a class="{{ document.card.open }}" target="_blank" rel="noopener noreferrer" hidden>{{ document.open_label }}</a>
+          {%- for action in document.actions %}{% if not action.secondary %}
+          <button type="button" {{ document.action_attribute }}="{{ action.name }}"{% if action.hidden %} hidden{% endif %}>{{ action.label }}</button>
+          {%- endif %}{% endfor %}
+          <details class="act-menu">
+            <summary>{{ document.more_label }}</summary>
+            <div class="act-menu-items">
+              {%- for action in document.actions %}{% if action.secondary %}
+              <button type="button" {{ document.action_attribute }}="{{ action.name }}"{% if action.hidden %} hidden{% endif %}>{{ action.label }}</button>
+              {%- endif %}{% endfor %}
+            </div>
+          </details>
+        </div>
+      </header>
+      <p class="{{ document.card.notice }}" role="status" hidden></p>
+      <div class="{{ document.card.frame }}"></div>
+    </article>
+  </template>
+</body>
+</html>

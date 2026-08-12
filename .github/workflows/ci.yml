@@ -29,6 +29,15 @@ jobs:
             target
           key: ${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
+      # The runner images ship whatever ShellCheck their distribution packages
+      # — Ubuntu 24.04's is 0.9.0, two majors behind — and its rules differ from
+      # the pinned one's on real code. Provision the pin so this leg judges the
+      # tree by the same rules the local gate does.
+      - name: Setup ShellCheck
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./scripts/install-shellcheck.sh --install
+
       # scripts/test.sh is written against the afdata Bash kit and reads the
       # served URL back with `afdata value`, so afdata has to exist before the
       # gate runs, not merely before the skill is validated.

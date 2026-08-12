@@ -134,7 +134,7 @@ async fn three_sessions_share_one_port_and_stay_isolated() {
 #[tokio::test]
 async fn results_route_back_to_the_call_that_is_waiting_for_them() {
     // Plan §2.5 step 4: several concurrent UIs must be independently
-    // completable, in any order, with each answer reaching its own waiter.
+    // completable, in any order, with each outcome reaching its own waiter.
     let host = UiHost::bind_local().await.unwrap();
 
     let first = host

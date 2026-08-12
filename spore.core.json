@@ -2,10 +2,10 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-ui",
   "name": "Agent-First UI",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
-  "synopsis": "Let your AI agent hand you a real interface when a step needs a person — a window opens, you decide, and the agent gets a typed answer back.",
+  "synopsis": "Let your AI agent hand you a real interface when a step needs a person — a window opens, values can stay live in both directions, and the session ends with one typed outcome.",
   "intent": [
     "Host a Provider-owned Axum Router without interpreting its domain data or defining a shared domain UI protocol",
     "Deliver a session through an isolated Chromium-family window, an explicitly managed direct URL, or a page served to a browser on another device",
@@ -13,10 +13,11 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Rewrite the README, skill file and source documentation so the library argues its design from the shape of the problem rather than from named consumer programs, which a reader who installs this crate on its own does not have and cannot check",
-    "Stop the served session page reserving a position for any kind of session: every session is a card in one column in the order the listener reported, each with the same slice of the viewport, and the person folds or drops what they are not using",
-    "Widen the served page's column on a large screen rather than splitting it into two panes, since a second column would require deciding which sessions belong in it",
-    "Rename example and fixture identifiers, and the proxy's handoff cookie, to neutral names so nothing in the published crate reads as a registry of real consumers"
+    "Add an optional bounded full-duplex session channel carrying Provider-defined JSON in both directions, with no envelope, request ids, or retained history",
+    "Add UiPage and a page feature so turning a frontend's files into a checked page is one assembly rather than one per Provider",
+    "Collapse window, link and session delivery into one call with an environment default, and offer link only when a Provider declares its expiry",
+    "Reserve the __afui/ prefix and let any delivery be ended through __afui/end, including a served page that nobody is attending",
+    "Make the served session list a replaceable frontend whose every card action reports pending, done, or failed"
   ],
   "bonds": [],
   "tree": {

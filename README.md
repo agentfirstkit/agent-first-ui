@@ -1,20 +1,23 @@
 # Agent-First UI
 
-Let your AI agent hand you a real interface when a step needs a person — a window opens, you decide, and the agent gets a typed answer back.
+Let your AI agent hand you a real interface when a step needs a person — a window opens, values can stay live in both directions, and the session ends with one typed outcome.
 
 > **Ask your agent:** "Show me that in a window and wait for my answer before you continue."
 
 ## The problem: an agent that needs you has nowhere to put you
 
 An agent can ask a question in chat. What it cannot do in chat is show you
-twelve drafts and let you approve four, or put a diff in front of you, or hand
-you a form that validates as you type. So the moment a task needs human
-judgement on something shaped like a page, the agent either flattens it into
-text or invents a web server — a port, a token, a browser tab left open, and no
-reliable way to know whether you ever answered.
+twelve drafts and let you approve four, put a diff in front of you, stream live
+service state while you issue an inspection command, or hand you a form that
+validates as you type. So the moment a task needs something shaped like a page,
+the agent either flattens it into text or invents a web server — a port, a token,
+a browser tab left open, and no reliable way to know when that interaction
+ended.
 
 AFUI is that missing step, and only that step: one person, one interface, one
-answer, then gone.
+bounded lifetime. A Provider may use only the terminal outcome, or also attach
+a full-duplex channel for any number of non-terminal values while the session
+is open.
 
 ## What AFUI owns, and what stays yours
 
@@ -23,13 +26,15 @@ brings the mechanics nobody wants to write twice:
 
 - a revocable access credential, and the decision of when it lapses;
 - secure response headers, exact-origin and exact-host checks;
-- an isolated Chromium-family window on a disposable profile — never your
-  browser, never your cookies;
+- an isolated desktop window with non-persistent web data — never your browser,
+  never your cookies;
+- an optional bounded channel carrying Provider-defined JSON in both
+  directions, under the same session credential;
 - cleanup, and a typed outcome: `Completed(T)`, `Closed`, or `Expired`.
 
 A session carries stable `provider_id`, `ui_kind`, and `session_id`, so several
-interfaces can be open at once and each answer returns to the caller waiting
-for it.
+interfaces can be open at once and each remains bound to the process that owns
+it.
 
 AFUI never interprets what you put on the page. It does not know what a case,
 an invoice, or a query is.
@@ -57,11 +62,20 @@ Expiry belongs to the delivery rather than the session, because the same
 interface is worth fifteen minutes as a link and worth as long as you like as a
 window.
 
+`UiDeliveryPlan` collapses those three ways into one plan instead of a Provider
+writing its own `match` over `window`/`link`/`session`. Use
+`resolve(explicit_mode)?.deliver(session, router)` when one call is enough. If
+the caller must publish a link URL before waiting for the person, call
+`start(session, router)`, read `link_url_secret()`, then call `wait()`. `resolve`
+also reads `AFUI_DELIVERY`, so an outer unattended interface can pass
+`AFUI_DELIVERY=session` to a UI it starts without every downstream call
+inventing its own flag for it.
+
 ## Several at once, on one port
 
 Sessions and ports are orthogonal. Bind a `UiHost` once and `attach` as many
-sessions as you like: each is reached by its own credential, each answer returns
-to the call waiting for it, and ending one leaves its neighbours serving. That
+sessions as you like: each is reached by its own credential, each outcome and
+live channel stays with its owner, and ending one leaves its neighbours serving. That
 also survives the places a session has to live — a container with one mapped
 port, a machine behind a firewall, a single tunnel.
 
@@ -75,7 +89,11 @@ security policy, same typed outcome, and still listed by `afui session list`.
 
 A session lives inside whichever process created it, so nothing could see across
 them. Every active session now announces itself, and `afui session list` shows
-what is waiting; `afui session open <id>` puts a window onto one.
+what is waiting — including whether it is waiting on a *decision* or merely
+being watched, and how long it has been open — `afui session open <id>` puts a
+window onto one, and `afui session close <id>` ends it outright: whoever
+created it gets `Outcome::Closed`, on any delivery, the same as if they had
+closed a window themselves.
 
 The credential never appears in that listing — a session URL carries one, and
 stdout is where an agent reads. `open` hands the URL straight to a window
@@ -96,11 +114,49 @@ withdraws the entry rather than the URL.
 
 `afui session serve --listen <ADDRESS>` puts that same list on a page, with each
 session proxied onto an address a phone can reach. Every session is a card in
-one column, in the order the listener reported them, each with the same slice
-of the viewport, and you fold or drop the ones you are not using. No kind of
+one column, **in the order they were announced**, each with the same slice of
+the viewport, and you fold or drop the ones you are not using. Open a terminal,
+work in it, ask for a second interface, and that one arrives below the
+terminal — where what you just did put it, rather than wherever its Provider's
+name falls in an alphabet. No kind of
 interface has a reserved position: the page has no way to know which kinds
 exist, and reserving one would be this page ranking a program it has never
 heard of above its neighbour.
+
+### When you walk away
+
+The page is the one delivery nothing bounds. A window ends when you close it; a
+phone goes into a pocket with your terminal still on it. So the listener runs a
+clock: fifteen minutes with nobody attending, then a five-minute warning during
+which everything still works and the page offers to keep itself open, and then
+it stops. `--idle-minutes 0` turns that off; `--grace-minutes 0` removes the
+warning.
+
+Attending is stated rather than guessed. The page says so while it is visible,
+naming the sessions it is showing, and traffic through a frame says so too —
+that is the only evidence there is that someone is using a Provider UI, because
+what happens inside one is on an origin this listener cannot read. Polling for
+the session list is not attending; a poll that renewed what it reported would be
+a clock that never ran down.
+
+When a session's view lapses, its proxy credential is revoked and the frame
+comes off the page — an expiry that left the last screen painted on a phone
+somebody else picks up would be a warning, not an expiry. The session itself is
+untouched, still running and still listed, and one press of *Reopen* mounts it
+again at an address it has never had before. When the page itself lapses it
+stops answering for everything, frames included, and the way back is a new
+`session serve` URL from the machine doing the work.
+
+What this bounds is how long an unattended *view* lasts, not who may open one.
+Whoever holds the page's URL can reload it and mount every live session again.
+
+How tall each card is, is yours: one control cycles **Short / Tall / Full**, and
+the choice is remembered per session. It has to be a choice — what is inside a
+frame is on an origin this page cannot read, so the page cannot measure it and
+the frame cannot tell it without a protocol this listener refuses to have.
+Rather than guess a height for a program it has never heard of, it offers three.
+That choice is the only thing this page stores; folding and removing still come
+back on reload, because a view you only rearranged is expected to.
 
 Two things it will not do. It is **not a transport**: it binds a port, and
 crossing anything to reach that port is WireGuard, Tailscale, an SSH tunnel, or
@@ -116,6 +172,15 @@ rather than by the browser: each proxied session gets a jar of its own, and what
 is in it goes to that session and nowhere else. The same goes for an upgraded
 connection: a WebSocket is relayed once both ends have agreed to switch, which is
 what a remote framebuffer needs and what nothing above it can see anyway.
+
+Each card also offers to open its session as a page of its own — but only under
+`--session-origin-host`. In the default shape a session is a path on the
+listener's own origin, and opening it top-level would take the Provider UI out
+of the sandbox and put it on that origin, where it would share storage with
+every other Provider UI opened the same way. The isolation that makes the frames
+safe is exactly what a top-level navigation discards, so the control is absent
+there rather than dangerous. Where it does appear, the new page gets no handle
+on the one that opened it.
 
 ### One origin per session, when a framed UI needs storage
 
@@ -153,7 +218,7 @@ Three tiers, so a Provider pays for what it uses and nothing else:
 | Feature | What it adds | What it costs |
 | --- | --- | --- |
 | *(none)* | the frontend script guard, frontend discovery, the trust gate, the per-file overlay | file reading and hashing — no server |
-| `session` *(default)* | `UiSession`, `UiHost`, `UiMount`, `UiWindow`, credentials, security policy, the registry, `UiUpstream`, `UiFrontend::assets_router` | axum, tokio, tower |
+| `session` *(default)* | `UiSession`, optional full-duplex channels, `UiHost`, `UiMount`, `UiWindow`, credentials, security policy, the registry, `UiUpstream`, `UiFrontend::assets_router` | axum with WebSockets, tokio, tower |
 | `serve` | the reverse proxy and the shell above it | a streaming HTTP client |
 
 The featureless tier exists because keeping a frontend honest is not the same
@@ -169,6 +234,17 @@ your own features opens a window.
 The interface a Provider ships is a default, not a decision. `afui frontend`
 lets you replace it with your own — scaffold one, preview it, and enable it
 when it is ready. Run `afui frontend --help` for the full set.
+
+**This page is one of them.** `afui frontend init afui sessions` scaffolds a
+replacement for the session list itself, held to the same contract as any
+Provider's: it renders against a `document` that hands out every id, class and
+control name the runtime binds to, a page that drops one is refused before the
+port is bound, and a workspace file stays inert until somebody enables its exact
+fingerprint. Worth saying plainly, because this page is not like the others —
+its URL carries the credential for every session on the machine. A frontend
+cannot supply behaviour, so an override is markup and CSS and cannot read that
+URL; the page's own policy lets presentation load only from this listener and
+has nowhere to send anything elsewhere.
 
 Trust is content-addressed rather than path-based: workspace code stays ignored
 until you enable its exact fingerprint, and any later edit revokes that trust
@@ -192,7 +268,11 @@ let frontend = UiFrontend::resolve(std::path::Path::new("."), "inspector", "tabl
 // file the Provider ships — including its language packs.
 let page = frontend.text("templates/page.html.j2")?;
 let assets = frontend.assets_router();
-# let _ = (page, assets);
+// Every Provider supplies its own built-in SVG. An override may replace only
+// `assets/app-icon.svg`; the resolved icon then follows the frontend into its
+// browser favicon and desktop window rather than being chosen by AFUI.
+let app_icon = frontend.app_icon(include_str!("app-icon.svg"))?;
+# let _ = (page, assets, app_icon);
 # Ok(())
 # }
 ```
@@ -202,14 +282,74 @@ own behaviour under a nonce depends on them: an override may not supply a file
 whose name says it is a script, and `reject_frontend_script` refuses one hiding
 inside a template it does supply.
 
+## Live values in both directions
+
+Completion and live I/O are separate. `Outcome<T>` still says how the session
+ended exactly once. `UiSession::with_channel` optionally adds a bounded stream
+in each direction for everything that happens before then: snapshots flowing
+to a surface, commands flowing back, progress, invalidations, or any other
+Provider-defined JSON shape.
+
+AFUI deliberately adds no message envelope. It does not assign request ids,
+pair commands with responses, retain history, replay turns, or call the stream
+a conversation. The Provider defines both Rust types; the frontend decides
+whether it shows every value, only the latest one, or none. Each WebSocket frame
+at the relative `SESSION_CHANNEL_PATH` is exactly one encoded Provider value.
+Queues are bounded, one message is limited to 1 MiB, and only one surface
+connection is active at a time.
+
+```rust,no_run
+use agent_first_ui::UiSession;
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SurfaceCommand {
+    Inspect { target: String },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SurfaceUpdate {
+    Snapshot { load_percent: u8 },
+    Inspection { target: String, details: String },
+}
+
+# async fn example() -> agent_first_ui::Result<()> {
+let (session, channel) = UiSession::<()>::new("inspector", "live_status")?
+    .with_channel::<SurfaceCommand, SurfaceUpdate>()?;
+
+tokio::spawn(async move {
+    while let Ok(Some(command)) = channel.recv().await {
+        let SurfaceCommand::Inspect { target } = command;
+        let _ = channel.send(&SurfaceUpdate::Inspection {
+            details: format!("inspected {target}"),
+            target,
+        }).await;
+    }
+});
+
+// Deliver `session` with the Provider's Router in the ordinary way.
+# let _ = session;
+# Ok(())
+# }
+```
+
+If a Provider replaces the default CSP, its page must permit same-origin
+connections (normally `connect-src 'self'`). The channel endpoint receives the
+same credential, exact-host/origin checks, revocation, proxying, and session
+shutdown as the Provider's other routes.
+
 ## From Rust
 
 ```rust,no_run
-use agent_first_ui::{Outcome, UiSession, UiWindowConfig};
+use agent_first_ui::{Outcome, UiAppIcon, UiSession, UiWindowConfig};
 use axum::{Router, routing::get};
 
 # async fn example() -> agent_first_ui::Result<()> {
-let session = UiSession::<String>::new("reviewer", "case_review")?;
+let app_icon = UiAppIcon::from_svg(include_str!("app-icon.svg"))?;
+let session = UiSession::<String>::new("reviewer", "case_review")?
+    .with_app_icon(app_icon);
 let completion = session.completion();
 let router = Router::new().route(
     "/",
@@ -231,8 +371,9 @@ assert!(matches!(outcome, Outcome::Completed(_)));
 ## What AFUI is not
 
 Delivery infrastructure, and nothing else: not a domain UI protocol, not a
-generic renderer, not a remote-access transport, not a frontend package format.
-It proxies a Provider's UI without understanding one byte of it.
+conversation store, not a generic renderer, not a remote-access transport, not
+a frontend package format. It proxies a Provider's UI and transports its typed
+values without understanding one byte of either.
 
 ## Install
 

@@ -143,8 +143,11 @@ impl UiUpstream {
     /// it is no outcome. `AFUI_NO_REGISTRY` is still honoured: opting out is a
     /// decision rather than a failure, so it succeeds and lists nothing.
     pub fn announce(self) -> Result<AnnouncedUiUpstream> {
+        // No signal here: an announced upstream has no `T` for the automatic
+        // half of `waits_for_decision` to read and, unlike `UiSession`, no
+        // builder to declare it explicitly. See docs/providers.md.
         let announcement =
-            registry::publish_strictly(&self.metadata, self.subject, &self.access_url)?;
+            registry::publish_strictly(&self.metadata, self.subject, false, &self.access_url)?;
         Ok(AnnouncedUiUpstream {
             metadata: self.metadata,
             access_url: self.access_url,
@@ -243,7 +246,7 @@ mod tests {
     #[test]
     fn an_upstream_is_identified_the_same_way_a_served_session_is() {
         assert!(UiUpstream::new("remote", "takeover", "http://127.0.0.1:9222/p").is_ok());
-        assert!(UiUpstream::new("AfHttp", "takeover", "http://127.0.0.1:9222/p").is_err());
+        assert!(UiUpstream::new("Inspector", "takeover", "http://127.0.0.1:9222/p").is_err());
         assert!(UiUpstream::new("remote", "../panel", "http://127.0.0.1:9222/p").is_err());
     }
 }

@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use agent_first_ui::{
-    ActiveUiSession, Outcome, SessionServer, UiExpiry, UiSecurityPolicy, UiSession, UiUrlDelivery,
-    UiWindowConfig,
+    ActiveUiSession, Outcome, SessionServer, UiExpiry, UiIdlePolicy, UiSecurityPolicy, UiSession,
+    UiUrlDelivery, UiWindowConfig,
 };
 use axum::Router;
 use axum::body::Body;
@@ -134,8 +134,14 @@ struct Framed {
 
 #[allow(clippy::expect_used)]
 async fn serving(shape: Shape) -> Shell {
+    serving_with(shape, UiIdlePolicy::never()).await
+}
+
+#[allow(clippy::expect_used)]
+async fn serving_with(shape: Shape, idle_policy: UiIdlePolicy) -> Shell {
     registry_root();
-    let mut server = SessionServer::new("127.0.0.1:0".parse().expect("address"));
+    let mut server =
+        SessionServer::new("127.0.0.1:0".parse().expect("address")).with_idle_policy(idle_policy);
     if shape == Shape::OriginPerSession {
         server = server.with_session_origin_host("localhost");
     }
@@ -195,6 +201,26 @@ impl Shell {
             .iter()
             .find(|session| session["session_id"] == session_id)
             .cloned()
+    }
+
+    /// The same card, insisted upon: a session the page is showing.
+    #[allow(clippy::expect_used)]
+    async fn card(&self, session_id: &str) -> serde_json::Value {
+        self.listed(session_id)
+            .await
+            .expect("the session is listed")
+    }
+
+    /// The page saying somebody is in front of it, and what they can see.
+    async fn attend(&self, session_ids: &[&str]) -> u16 {
+        let body = serde_json::json!({ "sessions": session_ids }).to_string();
+        self.page(
+            "attention",
+            &[("Content-Type", "application/json")],
+            Some(&body),
+        )
+        .await
+        .status
     }
 
     /// Where one live session is framed, as the page was told it.
@@ -1133,6 +1159,167 @@ in_both_shapes! {
         }
 
         socket.close(None).await.expect("close");
+        drop(session);
+        shell.handle.abort();
+    }
+}
+
+// ── Walking away ────────────────────────────────────────────────────
+
+/// Short enough to run, long enough that a loaded machine cannot cross one of
+/// these windows between two requests on a real socket.
+const IDLE: Duration = Duration::from_millis(700);
+const GRACE: Duration = Duration::from_millis(700);
+
+fn lapsing() -> UiIdlePolicy {
+    UiIdlePolicy::after(IDLE).with_grace(GRACE)
+}
+
+/// Wait out one card's whole window with somebody still at the page.
+///
+/// This is the shape of a person who took that card off their page and carried
+/// on working: the heartbeat keeps arriving and stops naming the session, which
+/// is the only way one view can end while the rest of the page does not.
+async fn away_from_one_card(shell: &Shell) {
+    for _ in 0..5 {
+        tokio::time::sleep(IDLE / 2).await;
+        assert_eq!(shell.attend(&[]).await, 204);
+    }
+}
+
+in_both_shapes! {
+    /// The whole arc, through the wire the browser uses: warned while still
+    /// working, kept open by a person, then left alone until it is not.
+    async fn a_view_warns_then_ends_and_the_address_it_was_reached_at_stops_working(shape: Shape) {
+        let session = provider_session(Router::new().route("/", get(|| async { "panel" }))).await;
+        let shell = serving_with(shape, lapsing()).await;
+        let session_id = session.metadata().session_id.as_str().to_owned();
+        let framed = shell.framed(&session).await;
+        assert_eq!(framed.request("", &[], None).await.status, 200);
+        assert_eq!(shell.card(&session_id).await["state"], "live");
+
+        // Warned — and completely usable, which is the difference between a
+        // warning and the outage arriving five minutes early.
+        tokio::time::sleep(IDLE).await;
+        assert_eq!(shell.attend(&[]).await, 204);
+        let warned = shell.card(&session_id).await;
+        assert_eq!(warned["state"], "expiring");
+        assert!(warned["expires_in_ms"].as_u64().expect("a countdown") > 0);
+        assert_eq!(framed.request("", &[], None).await.status, 200);
+
+        // A person presses the button. The address does not move, so the frame
+        // is not rebuilt and whatever it was holding survives.
+        tokio::time::sleep(IDLE).await;
+        assert_eq!(shell.attend(&[]).await, 204);
+        assert_eq!(shell.card(&session_id).await["state"], "expiring");
+        assert_eq!(shell.attend(&[&session_id]).await, 204);
+        let kept = shell.card(&session_id).await;
+        assert_eq!(kept["state"], "live");
+        assert_eq!(kept["proxy_url_secret"], warned["proxy_url_secret"]);
+
+        // Then nobody comes back to this one.
+        away_from_one_card(&shell).await;
+        let lapsed = shell.card(&session_id).await;
+        assert_eq!(lapsed["state"], "dead");
+        assert!(
+            lapsed["proxy_url_secret"].is_null(),
+            "a lapsed card has no address, so the page has nothing to frame: {lapsed}"
+        );
+        assert_eq!(
+            framed.request("", &[], None).await.status,
+            404,
+            "the address a frame was reached at is what a leaked URL would be, \
+             and it has to stop working"
+        );
+        // The session itself is untouched: this expiry is a remote view ending,
+        // never a Provider being shut down from a phone.
+        assert!(!session.access_token().is_revoked());
+
+        drop(session);
+        shell.handle.abort();
+    }
+}
+
+in_both_shapes! {
+    /// Coming back is a person acting on one card, and it never resurrects the
+    /// credential that lapsed.
+    async fn a_lapsed_view_is_reopened_at_an_address_it_never_had_before(shape: Shape) {
+        let session = provider_session(Router::new().route("/", get(|| async { "panel" }))).await;
+        let shell = serving_with(shape, lapsing()).await;
+        let session_id = session.metadata().session_id.as_str().to_owned();
+        let was = shell.framed(&session).await;
+        away_from_one_card(&shell).await;
+        assert_eq!(shell.card(&session_id).await["state"], "dead");
+
+        // The heartbeat names it, as the page names everything it is showing.
+        // That must not undo the lapse, or nothing would ever stay lapsed.
+        assert_eq!(shell.attend(&[&session_id]).await, 204);
+        assert_eq!(shell.card(&session_id).await["state"], "dead");
+
+        let reopened = shell
+            .page(&format!("sessions/{session_id}/reopen"), &[], Some(""))
+            .await;
+        assert_eq!(reopened.status, 204, "{}", reopened.body);
+        let back = shell.card(&session_id).await;
+        assert_eq!(back["state"], "live");
+        let now = shell.frame_of(back["proxy_url_secret"].as_str().expect("an address"));
+        assert_eq!(now.request("", &[], None).await.status, 200);
+        assert_eq!(
+            was.request("", &[], None).await.status,
+            404,
+            "reopening mints a credential rather than resurrecting the revoked one"
+        );
+
+        drop(session);
+        shell.handle.abort();
+    }
+}
+
+in_both_shapes! {
+    /// The page's own ending, which takes its frames with it.
+    async fn the_page_stops_answering_for_everything_once_it_has_lapsed(shape: Shape) {
+        let session = provider_session(Router::new().route("/", get(|| async { "panel" }))).await;
+        let shell = serving_with(shape, lapsing()).await;
+        let framed = shell.framed(&session).await;
+
+        tokio::time::sleep(IDLE + GRACE).await;
+        let refused = shell.page("sessions", &[], None).await;
+        assert_eq!(refused.status, 404, "{}", refused.body);
+        assert_eq!(shell.page("", &[], None).await.status, 404);
+        assert_eq!(
+            framed.request("", &[], None).await.status,
+            404,
+            "a page that has stopped answering must not leave the frame showing \
+             a person's work to whoever picks the device up"
+        );
+        // And the page cannot talk its own way back: the person who could
+        // attend it is the one who is no longer there.
+        assert_eq!(shell.attend(&[]).await, 404);
+        assert_eq!(shell.page("sessions", &[], None).await.status, 404);
+
+        drop(session);
+        shell.handle.abort();
+    }
+}
+
+in_both_shapes! {
+    /// Traffic through a frame is the only evidence there is that somebody is
+    /// using a Provider UI, since what happens inside one is on an origin this
+    /// listener cannot read.
+    async fn a_frame_being_used_keeps_itself_and_the_page_alive(shape: Shape) {
+        let session = provider_session(Router::new().route("/", get(|| async { "panel" }))).await;
+        let shell = serving_with(shape, lapsing()).await;
+        let session_id = session.metadata().session_id.as_str().to_owned();
+        let framed = shell.framed(&session).await;
+
+        // Well past the idle window in total, with nothing but frame traffic and
+        // the page's own polling — which is not attention and must not count.
+        for _ in 0..4 {
+            tokio::time::sleep(IDLE / 2).await;
+            assert_eq!(framed.request("", &[], None).await.status, 200);
+            assert_eq!(shell.card(&session_id).await["state"], "live");
+        }
+
         drop(session);
         shell.handle.abort();
     }

@@ -32,6 +32,7 @@ A **shape** is one legal set of arguments that may appear together, under a stab
 - [`afui frontend enable`](#afui-frontend-enable) — Explicitly trust the current contents of one frontend.
 - [`afui frontend init`](#afui-frontend-init) — Create a frontend directory and manifest.
 - [`afui frontend preview`](#afui-frontend-preview) — Prepare a validated frontend for Provider-owned preview.
+- [`afui session close`](#afui-session-close) — End a running UI session from outside the process that created it. Whoever created it gets `Outcome::Closed`, the same as if a person had closed its window.
 - [`afui session list`](#afui-session-list) — List every UI session running on this machine.
 - [`afui session open`](#afui-session-open) — Open a window onto one running session.
 - [`afui session serve`](#afui-session-serve) — Serve every running session to a browser on another device. Binds a port and stops there: getting to that port is an SSH tunnel, WireGuard, Tailscale, or a TLS reverse proxy, none of which this is.
@@ -142,6 +143,18 @@ afui frontend preview <PROVIDER_ID> <UI_KIND> [--scope <workspace|global>] [--sa
 | `--scope` | Frontend scope |
 | `--safe-mode` | Ignore user frontend code before reading its manifest |
 
+### `afui session close`
+
+End a running UI session from outside the process that created it. Whoever created it gets `Outcome::Closed`, the same as if a person had closed its window.
+
+```
+afui session close <SESSION_ID>
+```
+
+| Argument | Meaning |
+|---|---|
+| `SESSION_ID` | Session identifier from `afui session list` |
+
 ### `afui session list`
 
 List every UI session running on this machine.
@@ -167,7 +180,7 @@ afui session open <SESSION_ID>
 Serve every running session to a browser on another device. Binds a port and stops there: getting to that port is an SSH tunnel, WireGuard, Tailscale, or a TLS reverse proxy, none of which this is.
 
 ```
-afui session serve [--listen <ADDRESS>] [--advertise-host <HOST>] [--session-origin-host <HOST>]
+afui session serve [--listen <ADDRESS>] [--advertise-host <HOST>] [--idle-minutes <MINUTES>] [--grace-minutes <MINUTES>] [--session-origin-host <HOST>]
 ```
 
 Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-to` stdout/stderr (default `stdout`).
@@ -176,6 +189,8 @@ Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-
 |---|---|
 | `--listen` | Address to bind. Loopback by default; widen it only behind a tunnel or VPN you trust |
 | `--advertise-host` | Authority to put in the URL when the bound address is not one anybody can open |
+| `--idle-minutes` | Stop answering this long after nobody is attending the page: no visible tab, no traffic through a session. `0` never stops |
+| `--grace-minutes` | How long the page warns first, still fully working, with a button that renews it. `0` lapses without warning |
 | `--session-origin-host` | Give every session an origin of its own, `s-<credential>.<HOST>`, so a framed UI keeps browser storage. Needs `*.<HOST>` to resolve here, and a wildcard certificate behind TLS; `localhost` needs neither, because browsers resolve `*.localhost` to this machine. Also the host the page itself is served on |
 
 ### `afui skill install`

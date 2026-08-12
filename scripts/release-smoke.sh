@@ -10,6 +10,12 @@
 # Called from scripts/test.sh (release-smoke, and `all`) and from the Release
 # workflow, against the same binary layout, so the check that can fail a release
 # fails locally first.
+#
+# MANUAL, before shipping any release that touches `src/lan.rs` or `link`
+# delivery (`src/delivery.rs`): on a machine with a VPN or overlay network
+# active, run a `link` delivery and confirm the advertised address is the
+# physical LAN address, not the VPN's. Nothing here can automate that check —
+# it depends on real interface and routing state this script cannot fake.
 set -euo pipefail
 
 BIN_DIR="${1:-target/release}"

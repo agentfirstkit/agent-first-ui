@@ -5,14 +5,44 @@ use std::sync::{Arc, Mutex};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{Response, StatusCode};
+use axum::http::{Method, Response, StatusCode};
 use axum::response::IntoResponse;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use tower::ServiceExt;
 
-use crate::{Error, OriginDecision, Result, UiAccessToken, UiSecurityPolicy};
+use crate::channel::{UiSessionChannelCloser, UiSessionChannelMount};
+use crate::{
+    APP_ICON_PATH, Error, OriginDecision, Result, UiAccessToken, UiAppIcon, UiSecurityPolicy,
+};
+
+/// The prefix every reserved AFUI route lives under, on every session's own
+/// credential — checked before the Provider's own router is ever reached, so
+/// nothing a Provider routes there is reachable, shadowed or not. A Provider
+/// must never claim any name under it: today those routes end a session and
+/// serve its Provider-owned application icon. Reserving the whole prefix
+/// rather than only today's paths is what lets AFUI add another one later
+/// without it silently colliding with something a Provider already routed
+/// there.
+const RESERVED_PATH_PREFIX: &str = "__afui/";
+
+/// Reserved for every session, under its own credential, on every delivery —
+/// `window`, `link`, and `session` alike, because they all share this one
+/// dispatch. `POST <access_url>SESSION_END_PATH` ends the session: whoever created it
+/// gets `Outcome::Closed`, the same as if a person had closed its window.
+///
+/// Written without a leading slash because every caller appends it to a
+/// credential that already ends in one —
+/// `format!("{access_url}{SESSION_END_PATH}")`.
+pub const SESSION_END_PATH: &str = "__afui/end";
+
+/// The optional full-duplex channel attached to a session.
+///
+/// A surface opens a WebSocket at `format!("{access_url}{SESSION_CHANNEL_PATH}")`.
+/// The session credential and same-origin checks are applied before the
+/// upgrade, exactly as they are for every Provider route.
+pub const SESSION_CHANNEL_PATH: &str = "__afui/channel";
 
 /// Many UI sessions behind one entry point, with no listener of its own.
 ///
@@ -81,6 +111,18 @@ struct MountedSession {
     token: UiAccessToken,
     policy: UiSecurityPolicy,
     router: Router,
+    /// The Provider frontend's resolved icon. AFUI serves the bytes but never
+    /// substitutes its own identity for a Provider that did not supply one.
+    app_icon: Option<UiAppIcon>,
+    /// Notified by [`SESSION_END_PATH`]. `notify_one` rather than `notify_waiters`:
+    /// there is exactly one waiter per session — whoever called
+    /// [`crate::ActiveUiSession::wait`] or `open_window` — and `notify_one`
+    /// stores a permit when nobody is listening yet, so an end request that
+    /// arrives before that call is not lost, and a repeat while nobody has
+    /// consumed the first one is not a second, redundant permit either.
+    close: Arc<Notify>,
+    channel_endpoint: Option<crate::channel::UiSessionChannelEndpoint>,
+    channel_closer: Option<UiSessionChannelCloser>,
 }
 
 /// Removes a session from its host when the session ends.
@@ -180,13 +222,25 @@ impl UiMount {
         &self,
         token: &UiAccessToken,
         policy: UiSecurityPolicy,
+        app_icon: Option<UiAppIcon>,
+        channel: Option<UiSessionChannelMount>,
         router: Router,
-    ) -> Result<(String, SessionRegistration)> {
+    ) -> Result<(
+        String,
+        SessionRegistration,
+        Arc<Notify>,
+        Option<UiSessionChannelCloser>,
+    )> {
         let secret = token.secret().expose_secret().to_owned();
         // Pin the authority the URL actually names, so a rebound DNS name
         // pointing at this socket is refused without the Provider opting in.
         let policy = policy.with_expected_host(self.authority.clone());
         let access_url = format!("{}{secret}/", self.base_url);
+        let close = Arc::new(Notify::new());
+        let (channel_endpoint, channel_closer) = match channel {
+            Some(channel) => (Some(channel.endpoint), Some(channel.closer)),
+            None => (None, None),
+        };
         let mut sessions = self
             .sessions
             .lock()
@@ -197,6 +251,10 @@ impl UiMount {
                 token: token.clone(),
                 policy,
                 router,
+                app_icon,
+                close: Arc::clone(&close),
+                channel_endpoint,
+                channel_closer: channel_closer.clone(),
             },
         );
         drop(sessions);
@@ -206,6 +264,8 @@ impl UiMount {
                 sessions: Arc::clone(&self.sessions),
                 secret,
             },
+            close,
+            channel_closer,
         ))
     }
 }
@@ -341,12 +401,65 @@ async fn dispatch(State(sessions): State<SessionRegistry>, mut request: Request)
     if mounted.policy.check_origin(&request) == OriginDecision::Rejected {
         return with_headers(StatusCode::FORBIDDEN.into_response(), &mounted.policy);
     }
+    // Everything under `RESERVED_PATH_PREFIX` is this dispatch's own, ahead of
+    // the Provider's router: reached here, a Provider's own route at the same
+    // name is never even tried, so there is nothing to shadow. Ending and
+    // Provider identity use this path under every delivery, window included,
+    // rather than being shapes only some of them can produce. The whole
+    // prefix is refused rather than only today's paths, so a name AFUI
+    // reserves later cannot already belong to a Provider that happened to
+    // route there first.
+    if let Some(reserved) = reserved_route(&remainder) {
+        let response = match (request.method(), reserved) {
+            (&Method::GET, APP_ICON_PATH) => match mounted.app_icon {
+                Some(icon) => (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        axum::http::HeaderValue::from_static("image/svg+xml"),
+                    )],
+                    icon.as_svg().to_owned(),
+                )
+                    .into_response(),
+                None => StatusCode::NOT_FOUND.into_response(),
+            },
+            (&Method::POST, SESSION_END_PATH) => {
+                // `ActiveUiSession::wait` and `open_window` are the only
+                // readers of `close`, so this never manufactures an outcome
+                // on its own — it only wakes whichever of them is waiting.
+                if let Some(channel) = &mounted.channel_closer {
+                    channel.close();
+                }
+                mounted.close.notify_one();
+                StatusCode::NO_CONTENT.into_response()
+            }
+            (&Method::GET, SESSION_CHANNEL_PATH) => match mounted.channel_endpoint {
+                Some(endpoint) => {
+                    rewrite_path(&mut request, "/");
+                    match endpoint.router().oneshot(request).await {
+                        Ok(response) => response,
+                        Err(infallible) => match infallible {},
+                    }
+                }
+                None => StatusCode::NOT_FOUND.into_response(),
+            },
+            _ => StatusCode::NOT_FOUND.into_response(),
+        };
+        return with_headers(response, &mounted.policy);
+    }
     rewrite_path(&mut request, &remainder);
     let response = match mounted.router.oneshot(request).await {
         Ok(response) => response,
         Err(infallible) => match infallible {},
     };
     with_headers(response, &mounted.policy)
+}
+
+/// A path already stripped of its session credential, as the reserved route
+/// name it names — `SESSION_END_PATH` included, its prefix — or `None` when
+/// this request is not this dispatch's to answer.
+fn reserved_route(remainder: &str) -> Option<&str> {
+    let rest = remainder.strip_prefix('/')?;
+    rest.starts_with(RESERVED_PATH_PREFIX).then_some(rest)
 }
 
 /// Clone what serving one request needs, so the registry lock is not held
@@ -358,6 +471,10 @@ fn lookup(sessions: &SessionRegistry, secret: &str) -> Option<MountedSession> {
         token: mounted.token.clone(),
         policy: mounted.policy.clone(),
         router: mounted.router.clone(),
+        app_icon: mounted.app_icon.clone(),
+        close: Arc::clone(&mounted.close),
+        channel_endpoint: mounted.channel_endpoint.clone(),
+        channel_closer: mounted.channel_closer.clone(),
     })
 }
 
@@ -411,6 +528,29 @@ fn with_headers(mut response: Response<Body>, policy: &UiSecurityPolicy) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_whole_reserved_prefix_is_taken_not_only_the_one_route_defined_today() {
+        assert_eq!(reserved_route("/__afui/end"), Some("__afui/end"));
+        assert_eq!(
+            reserved_route("/__afui/app-icon.svg"),
+            Some("__afui/app-icon.svg")
+        );
+        // A name under the prefix this dispatch does not yet recognise is
+        // still this dispatch's to answer — 404, not the Provider's router —
+        // which is what lets AFUI add another reserved route later without
+        // it silently already belonging to a Provider that routed there.
+        assert_eq!(reserved_route("/__afui/watch"), Some("__afui/watch"));
+        assert_eq!(reserved_route("/__afui/"), Some("__afui/"));
+        assert_eq!(
+            reserved_route("__afui/end"),
+            None,
+            "must still carry the leading slash"
+        );
+        assert_eq!(reserved_route("/__afuistuff"), None, "no prefix matching");
+        assert_eq!(reserved_route("/style.css"), None);
+        assert_eq!(reserved_route("/"), None);
+    }
 
     #[test]
     fn a_credential_segment_splits_off_whatever_follows_it() {

@@ -1,8 +1,8 @@
 [package]
 name = "agent-first-ui"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
-description = "Let your AI agent hand you a real interface when a step needs a person — a window opens, you decide, and the agent gets a typed answer back."
+description = "Let your AI agent hand you a real interface when a step needs a person — a window opens, values can stay live in both directions, and the session ends with one typed outcome."
 license = "MIT"
 repository = "https://github.com/agentfirstkit/agent-first-ui"
 readme = "README.md"
@@ -17,8 +17,8 @@ include = [
     "clippy.toml",
 ]
 
-# Three tiers, because a Provider that hosts no UI session still has a frontend
-# to keep honest.
+# Tiers, because a Provider that hosts no UI session still has a frontend to
+# keep honest.
 #
 # The featureless build is the markup guard plus frontend discovery, the trust
 # gate and the per-file overlay: reading files off disk and refusing some of
@@ -27,6 +27,12 @@ include = [
 # UI is itself an optional feature still has to refuse a smuggled `<script>` in
 # the build where that UI is compiled out. Without this tier the only way to
 # share the guard was to drag axum and tokio into a build that has neither.
+#
+# `page` is the same idea one step further: turning a frontend's files into a
+# rendered page still costs no port and no credential, only a template engine.
+# It is orthogonal to `session` rather than layered under it, so the build
+# that only has to prove its templates render and check out — no server, no
+# window — pays for minijinja and nothing session brings with it.
 [features]
 default = ["session"]
 # Everything that hands a UI to a person: the session, its host, its credential,
@@ -43,6 +49,7 @@ session = [
     "dep:tempfile",
     "dep:tokio",
     "dep:tower",
+    "tokio/io-util",
     "tokio/macros",
     "tokio/net",
     "tokio/process",
@@ -50,6 +57,11 @@ session = [
     "tokio/sync",
     "tokio/time",
 ]
+# The template environment policy, render, rendered-markup guard, and
+# element/runtime-marker contract check every Provider page goes through —
+# see `src/page.rs`. Independent of `session`: assembling a page this way
+# never binds a port or mints a credential.
+page = ["dep:minijinja"]
 # The third delivery: a page that serves this machine's live sessions to a
 # browser somewhere else, and the streaming reverse proxy underneath it.
 #
@@ -57,7 +69,7 @@ session = [
 # proxy anything: it opens a window or hands out one URL.
 # Only `afui session serve` needs this, so only a build of the binary that
 # wants that verb pays for it. It serves sessions, so it implies `session`.
-serve = ["session", "dep:hyper", "dep:hyper-util", "tokio/io-util", "tokio/signal"]
+serve = ["session", "dep:hyper", "dep:hyper-util", "dep:minijinja", "tokio/signal"]
 
 # Cargo discovers src/bin/afui.rs without being told. The release pipeline does
 # not: it reads this table to learn what a release ships, deriving the archive
@@ -76,11 +88,11 @@ required-features = ["session"]
 [dependencies]
 # The CLI's argument parsing, event stream and skill installer. Only the binary
 # uses it, and the binary is a `session` build.
-agent-first-data = { version = "0.32.0", default-features = false, features = ["cli", "skill-admin"], optional = true }
+agent-first-data = { version = "0.33.0", default-features = false, features = ["cli", "skill-admin"], optional = true }
 # A `provider_id` and a `ui_kind` are path segments in a frontend directory
 # before they are anything else, so the grammar is checked in the guard tier.
 agent-first-slug = { version = "0.6.2", default-features = false }
-axum = { version = "0.8", optional = true }
+axum = { version = "0.8", features = ["ws"], optional = true }
 blake3 = "1"
 dirs = "6"
 getrandom = { version = "0.4", optional = true }
@@ -91,8 +103,17 @@ hex = { version = "0.4", optional = true }
 # back frame by frame instead of collecting it.
 hyper = { version = "1", features = ["client", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+# The shell page is a template, not a Rust string, because a person has to be
+# able to replace it — the same engine every Provider page in this kit uses
+# rather than a second one for this crate's own page.
+minijinja = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Browser-grade parsing keeps the script guard and UiPage's structural
+# contracts aligned with what a browser actually sees.  No selector API is
+# needed here, and disabling the default CLI/error features keeps this in the
+# featureless guard tier without pulling in a server.
+scraper = { version = "0.27", default-features = false }
 subtle = { version = "2", optional = true }
 tempfile = { version = "3", optional = true }
 # Applied directly so the credential is stripped before the Provider router

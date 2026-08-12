@@ -94,11 +94,25 @@ jobs:
           sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256" 2>/dev/null || shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
+      # Retried because this is the step where a build that already succeeded
+      # gets thrown away. During a GitHub API degradation the v0.33.0 Intel
+      # macOS binary compiled fine and then lost its upload to a single
+      # "error connecting to api.github.com", failing the run and leaving the
+      # release one platform short. --clobber makes a retry idempotent: a
+      # partial or duplicate asset is replaced rather than refused.
       - name: Upload to release
         shell: bash
         run: |
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" --verify-tag --title "$TAG" --notes "Release $TAG"
-          gh release upload "$TAG" "$ARCHIVE" "${ARCHIVE}.sha256" --clobber
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$TAG" "$ARCHIVE" "${ARCHIVE}.sha256" --clobber; then
+              exit 0
+            fi
+            echo "upload attempt $attempt failed; retrying in $((attempt * 10))s" >&2
+            sleep $((attempt * 10))
+          done
+          echo "gh release upload failed after 5 attempts" >&2
+          exit 1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

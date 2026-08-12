@@ -19,6 +19,7 @@
 //! to mean taking axum and tokio with it.
 
 use crate::{Error, Result};
+use scraper::{Html, Node};
 
 const FORBIDDEN_ELEMENTS: [&str; 5] = ["<script", "</script", "<iframe", "<object", "<embed"];
 
@@ -52,7 +53,7 @@ pub fn reject_frontend_script(label: &str, markup: &str) -> Result<()> {
     let violation = forbidden_element(&lower)
         .or_else(|| dangerous_url_scheme(&lower))
         .or_else(|| escape_hatch(&lower))
-        .or_else(|| tag_violation(&lower));
+        .or_else(|| document_violation(&Html::parse_document(markup)));
     refuse(label, violation)
 }
 
@@ -64,9 +65,15 @@ pub fn reject_frontend_script(label: &str, markup: &str) -> Result<()> {
 /// a browser will fetch. So this reads elements and attributes, which is where
 /// a rendered value could actually become behaviour, and leaves prose alone.
 pub fn reject_rendered_script(label: &str, markup: &str) -> Result<()> {
-    let lower = markup.to_ascii_lowercase();
-    let violation = forbidden_element(&lower).or_else(|| tag_violation(&lower));
-    refuse(label, violation)
+    inspect_rendered_page(label, markup).map(drop)
+}
+
+/// Parse and inspect once so [`crate::UiPage`] can reuse the browser-shaped
+/// tree for its element and marker contracts.
+pub(crate) fn inspect_rendered_page(label: &str, markup: &str) -> Result<Html> {
+    let document = Html::parse_document(markup);
+    refuse(label, document_violation(&document))?;
+    Ok(document)
 }
 
 fn refuse(label: &str, violation: Option<&'static str>) -> Result<()> {
@@ -97,23 +104,26 @@ fn escape_hatch(lower: &str) -> Option<&'static str> {
         .map(|(_, violation)| *violation)
 }
 
-fn tag_violation(text: &str) -> Option<&'static str> {
-    let mut remaining = text;
-    while let Some(start) = remaining.find('<') {
-        let tag_and_rest = &remaining[start..];
-        let Some(end) = tag_and_rest.find('>') else {
-            break;
+fn document_violation(document: &Html) -> Option<&'static str> {
+    for node in document.tree.nodes() {
+        let Node::Element(element) = node.value() else {
+            continue;
         };
-        let tag = &tag_and_rest[..=end];
-        let violation = if contains_inline_event_handler(tag) {
-            Some("inline event handler")
-        } else {
-            dangerous_url_scheme(tag)
-        };
-        if violation.is_some() {
-            return violation;
+        if matches!(element.name(), "script" | "iframe" | "object" | "embed") {
+            return Some("executable element");
         }
-        remaining = &tag_and_rest[end + 1..];
+        for (name, value) in element.attrs() {
+            let name = name.to_ascii_lowercase();
+            if name
+                .strip_prefix("on")
+                .is_some_and(|suffix| !suffix.is_empty())
+            {
+                return Some("inline event handler");
+            }
+            if let Some(violation) = dangerous_url_scheme(value) {
+                return Some(violation);
+            }
+        }
     }
     None
 }
@@ -207,44 +217,6 @@ fn decode_numeric_character_reference(text: &str) -> Option<(char, usize)> {
     Some((character, consumed))
 }
 
-fn contains_inline_event_handler(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if !bytes[index].is_ascii_whitespace() && !matches!(bytes[index], b'/' | b'<') {
-            index += 1;
-            continue;
-        }
-        let mut cursor = index + 1;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if cursor + 2 > bytes.len() || &bytes[cursor..cursor + 2] != b"on" {
-            index = cursor;
-            continue;
-        }
-        cursor += 2;
-        let name_start = cursor;
-        while cursor < bytes.len()
-            && (bytes[cursor].is_ascii_alphanumeric() || matches!(bytes[cursor], b'-' | b'_'))
-        {
-            cursor += 1;
-        }
-        if cursor == name_start {
-            index = cursor;
-            continue;
-        }
-        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
-        if bytes.get(cursor) == Some(&b'=') {
-            return true;
-        }
-        index = cursor;
-    }
-    false
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -275,6 +247,9 @@ mod tests {
             "<embed src=\"x\">",
             "<button onclick=\"go()\">x</button>",
             "<button  ON-Click = 'go()'>x</button>",
+            // A quoted `>` does not end a tag for the browser.  The old
+            // hand-written scanner stopped there and missed the handler.
+            "<button title=\">\" onclick=\"go()\">x</button>",
             "<a href=\"javascript:alert(1)\">x</a>",
             // The encodings that hide the same URL from a plain substring test.
             "<a href=\"java&#115;cript&colon;alert(1)\">x</a>",

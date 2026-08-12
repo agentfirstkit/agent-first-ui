@@ -6,7 +6,7 @@ use agent_first_slug::{SlugValidationPolicy, validate_slug};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::{Error, Result};
+use crate::{APP_ICON_ASSET_PATH, Error, Result, UiAppIcon};
 
 pub const SAFE_MODE_ENV: &str = "AFUI_SAFE_MODE";
 pub const CONFIG_DIR_ENV: &str = "AFUI_CONFIG_DIR";
@@ -388,6 +388,85 @@ impl UiFrontend {
                 message: format!("{relative} is not valid UTF-8: {error}"),
             })
     }
+
+    /// This frontend's application icon, falling back to the Provider's own.
+    ///
+    /// The override path is fixed across Providers so the icon is part of the
+    /// same frontend package as its templates and stylesheet. A Provider still
+    /// supplies the built-in SVG: AFUI owns the overlay contract, not anybody
+    /// else's identity.
+    pub fn app_icon(&self, builtin_svg: &str) -> Result<UiAppIcon> {
+        let (svg, from_override) = match self.text(APP_ICON_ASSET_PATH)? {
+            Some(svg) => (svg, true),
+            None => (builtin_svg.to_owned(), false),
+        };
+        UiAppIcon::from_svg(svg).map_err(|error| {
+            if from_override {
+                Error::FrontendUnreadable {
+                    provider_id: self.provider_id.clone(),
+                    ui_kind: self.ui_kind.clone(),
+                    message: format!("{APP_ICON_ASSET_PATH} is invalid: {error}"),
+                }
+            } else {
+                error
+            }
+        })
+    }
+
+    /// List regular override files below one frontend-relative directory.
+    ///
+    /// The result is sorted and uses `/` separators.  Built-in frontends and
+    /// missing directories return an empty list.  Every returned path has gone
+    /// through the same traversal, script-extension, and symlink checks as
+    /// [`Self::file`], so a caller can safely feed the names back into
+    /// [`Self::text`].
+    pub fn files_under(&self, relative: &str) -> Result<Vec<String>> {
+        let Some(location) = &self.location else {
+            return Ok(Vec::new());
+        };
+        let relative = frontend_relative_path(relative)?;
+        reject_frontend_symlinks(&location.root, &relative)?;
+        let directory = location.root.join(&relative);
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        if !directory.is_dir() {
+            return Err(Error::FrontendFileName {
+                name: relative.to_string_lossy().into_owned(),
+                reason: "it is not a directory",
+            });
+        }
+        let mut files = Vec::new();
+        for entry in WalkDir::new(&directory).follow_links(false) {
+            let entry = entry.map_err(|error| Error::FrontendUnreadable {
+                provider_id: self.provider_id.clone(),
+                ui_kind: self.ui_kind.clone(),
+                message: error.to_string(),
+            })?;
+            let path = entry.path();
+            let path_relative =
+                path.strip_prefix(&location.root)
+                    .map_err(|error| Error::FrontendUnreadable {
+                        provider_id: self.provider_id.clone(),
+                        ui_kind: self.ui_kind.clone(),
+                        message: error.to_string(),
+                    })?;
+            if entry.file_type().is_symlink() {
+                return Err(Error::FrontendFileName {
+                    name: path_relative.to_string_lossy().into_owned(),
+                    reason: "it is a symlink, and a trusted fingerprint covers files rather than the places they point at",
+                });
+            }
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let name = path_relative.to_string_lossy().replace('\\', "/");
+            frontend_relative_path(&name)?;
+            files.push(name);
+        }
+        files.sort();
+        Ok(files)
+    }
 }
 
 /// Serving an override's static files needs a router, and a router needs a
@@ -441,7 +520,14 @@ mod assets {
             )
         }
 
-        fn asset_response(&self, relative: &str) -> Response {
+        /// One file out of `assets/`, named to a browser or refused.
+        ///
+        /// `pub(crate)` because AFUI's own page dispatches its routes by hand —
+        /// it has already taken a credential off the front of the path, so
+        /// there is no sub-router boundary to nest [`Self::assets_router`]
+        /// under. Sharing this rather than writing a second copy is what keeps
+        /// one answer to "which types may be named to a browser".
+        pub(crate) fn asset_response(&self, relative: &str) -> Response {
             let name = format!("assets/{relative}");
             let Some(content_type) = asset_content_type(relative) else {
                 return (
@@ -622,6 +708,25 @@ mod tests {
         assert!(frontend.is_builtin());
         assert_eq!(frontend.frontend_id(), None);
         assert_eq!(frontend.text("page.html.j2").unwrap(), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_app_icon_is_a_per_file_frontend_overlay() {
+        let root = temp_root("app-icon");
+        let directory = global_frontend(&root, "afdemo", "demo", "1");
+        fs::create_dir_all(directory.join("assets")).unwrap();
+        fs::write(
+            directory.join(APP_ICON_ASSET_PATH),
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"1\"/></svg>",
+        )
+        .unwrap();
+        let (_guard, frontend) = resolve(&root, "1");
+        let icon = frontend
+            .unwrap()
+            .app_icon("<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>")
+            .unwrap();
+        assert!(icon.as_svg().contains("<circle"));
         let _ = fs::remove_dir_all(root);
     }
 

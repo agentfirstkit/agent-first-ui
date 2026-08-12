@@ -34,48 +34,37 @@
 //! Getting a phone to that port is WireGuard, Tailscale, an SSH tunnel, or a
 //! TLS reverse proxy — mature things that already exist and are not this.
 
-use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{Response, StatusCode};
 use axum::response::{Html, IntoResponse};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::net::TcpListener;
 
 use crate::host::split_first_segment;
 use crate::{Error, Result, UiAccessToken, UiExpiry, UiSecurityPolicy, UiSessionEntry};
 
+mod addressing;
+mod attention;
+mod frontend;
+mod mounts;
 mod proxy;
 mod shell;
 
-use proxy::{Framing, Proxied, Upstream};
-
-/// The path segment every proxied Provider UI lives under.
-///
-/// It is not under the listener's own credential, and that is the point: the
-/// URL a Provider UI is framed at must be one the Provider UI may know.
-const PROXY_SEGMENT: &str = "s";
-
-/// What marks a hostname as one session's own origin.
-///
-/// A label rather than a whole name, so one wildcard record and one wildcard
-/// certificate cover every session there will ever be. The prefix keeps session
-/// names out of the way of anything else living under the same host.
-const ORIGIN_LABEL_PREFIX: &str = "s-";
-
-/// How long a proxy credential survives with nobody using it.
-///
-/// Sliding rather than fixed, because a page being used is a page that keeps
-/// asking: a terminal polls, a review saves. A panel nobody has touched for
-/// this long is one whose credential should stop working, and the next refresh
-/// mints it a new one if the session is still there.
-const PROXY_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+use addressing::{
+    ORIGIN_LABEL_PREFIX, PROXY_SEGMENT, advertised_authority, hostname_of, mount_secret_of,
+    requested_authority, session_origin_base,
+};
+pub use attention::UiIdlePolicy;
+use attention::{Attention, Phase};
+use mounts::Mounts;
+use proxy::{Framing, Proxied};
 
 /// What an address this listener does not recognise renders in a browser.
 ///
@@ -92,6 +81,8 @@ pub struct SessionServer {
     listen: SocketAddr,
     advertised_host: Option<String>,
     session_origin_host: Option<String>,
+    idle_policy: UiIdlePolicy,
+    workspace_root: Option<PathBuf>,
 }
 
 /// Where a framed session is reached, which is the only thing that differs
@@ -126,7 +117,31 @@ impl SessionServer {
             listen,
             advertised_host: None,
             session_origin_host: None,
+            idle_policy: UiIdlePolicy::default(),
+            workspace_root: None,
         }
+    }
+
+    /// Where a replacement page is looked for, if the caller does not want the
+    /// current directory — which is what `afui session serve` uses, the same
+    /// place every Provider looks for its own.
+    #[must_use]
+    pub fn with_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.workspace_root = Some(root.into());
+        self
+    }
+
+    /// When an unattended page lapses, and how much warning it gets.
+    ///
+    /// Applies to the page and to every session it frames, from the one signal:
+    /// the page saying somebody is looking at it, and traffic through a frame.
+    /// One policy rather than two, because a person attending the page is
+    /// attending what is on it, and splitting the two would ask them to keep a
+    /// terminal alive twice.
+    #[must_use]
+    pub fn with_idle_policy(mut self, policy: UiIdlePolicy) -> Self {
+        self.idle_policy = policy;
+        self
     }
 
     /// Advertise a different authority than the one bound.
@@ -195,16 +210,28 @@ impl SessionServer {
                          every frame it builds would be refused",
             });
         }
-        // The process is the bound, the way a window is the bound for a window
-        // delivery: when this call ends, the credential and every proxy mount
-        // it minted go with it. A person working from a phone should not have
-        // their page stop answering halfway through the afternoon.
+        // The credential itself never expires; what expires is the page's
+        // attention (§`UiIdlePolicy`), and that is a decision this listener
+        // makes rather than one the token's own clock could make for it. A
+        // token that slid forward on every authorized request would be renewed
+        // by the page polling — which is the page asking a question, not a
+        // person being there.
+        // Before the listener answers anything: a page that cannot be rendered
+        // should cost the person an error, not a bound port serving nothing.
+        let workspace_root = match self.workspace_root {
+            Some(root) => root,
+            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+        let shell = frontend::ShellUi::resolve(&workspace_root)?;
         let token = UiAccessToken::issue(UiExpiry::Never)?;
         let access_url = format!("http://{authority}/{}/", token.secret().expose_secret());
         Ok(ServedSessions {
             listener,
             state: Arc::new(ServeState {
                 token,
+                idle_policy: self.idle_policy,
+                attention: Mutex::new(Attention::new()),
+                shell,
                 mounts: Mutex::new(Mounts::default()),
                 addressing,
             }),
@@ -225,6 +252,16 @@ impl ServedSessions {
     #[must_use]
     pub fn access_url(&self) -> &str {
         &self.access_url
+    }
+
+    /// The workspace frontend serving this page, or `None` for AFUI's own.
+    ///
+    /// Reported rather than assumed: an untrusted override is skipped in
+    /// silence, so this is how a person tells "my page is running" from "my page
+    /// is sitting there inert waiting to be enabled".
+    #[must_use]
+    pub fn frontend_id(&self) -> Option<&str> {
+        self.state.shell.frontend_id()
     }
 
     /// Answer requests until `shutdown` resolves.
@@ -249,24 +286,20 @@ struct ServeState {
     /// What the person proves to reach the page and its data. Never forwarded,
     /// never rendered, never in a URL a Provider UI can see.
     token: UiAccessToken,
+    idle_policy: UiIdlePolicy,
+    /// The page's own clock. Its ending is final: this URL stops answering, and
+    /// the way back is a new `session serve` URL from the machine, which is
+    /// exactly the property that makes it a deadman rather than a nuisance.
+    attention: Mutex<Attention>,
+    /// The page this listener serves, resolved once before the port was bound.
+    /// A replacement AFUI cannot use is an error at `bind`, never a listener
+    /// quietly serving the built-in page to somebody expecting theirs.
+    shell: frontend::ShellUi,
     mounts: Mutex<Mounts>,
     /// Fixed when the listener was bound, because it decides what the page's
     /// own address means: in one shape everything answers on it, in the other
     /// it answers for the page and nothing else.
     addressing: Addressing,
-}
-
-/// The proxied sessions, indexed by the two things that look them up.
-#[derive(Default)]
-struct Mounts {
-    by_secret: HashMap<String, Mount>,
-    by_session: HashMap<String, String>,
-}
-
-/// One session, reachable through this listener.
-struct Mount {
-    token: UiAccessToken,
-    proxied: Arc<Proxied>,
 }
 
 impl ServeState {
@@ -288,101 +321,85 @@ impl ServeState {
         self.mount_live_sessions(&entries, shell_authority)
     }
 
-    /// Bring the mount table in line with what is actually running.
+    /// Bring the mount table in line with what is actually running, and
+    /// describe the result for the page.
     ///
-    /// This is the whole lifecycle: a session that has appeared gets a
-    /// credential, a session that has ended has its credential revoked and its
-    /// path removed. Nothing is asked of the Provider, and nothing here
-    /// survives the session it belongs to.
+    /// Reading this list is deliberately **not** attending to anything. The
+    /// page polls every couple of seconds whether or not a person is in front
+    /// of it, so a poll that renewed what it reported would be a clock that
+    /// never ran down.
     fn mount_live_sessions(
         &self,
         entries: &[UiSessionEntry],
         shell_authority: Option<&str>,
     ) -> Result<Vec<Value>> {
-        let mut mounts = self.mounts.lock().map_err(|_| poisoned())?;
-        let Mounts {
-            by_secret,
-            by_session,
-        } = &mut *mounts;
-        let live: HashSet<&str> = entries
-            .iter()
-            .map(|entry| entry.session_id.as_str())
-            .collect();
-        by_session.retain(|session_id, secret| {
-            if live.contains(session_id.as_str()) {
-                return true;
-            }
-            if let Some(mount) = by_secret.remove(secret) {
-                mount.token.revoke();
-            }
-            false
-        });
+        self.mounts.lock().map_err(|_| poisoned())?.reconcile(
+            entries,
+            &self.idle_policy,
+            shell_authority,
+        )
+    }
 
-        let mut cards = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let Some(upstream) = Upstream::parse(&entry.access_url_secret) else {
-                continue;
-            };
-            let usable = by_session
-                .get(&entry.session_id)
-                .and_then(|secret| by_secret.get(secret))
-                .is_some_and(|mount| {
-                    !mount.token.is_expired()
-                        && !mount.token.is_revoked()
-                        && mount.proxied.upstream == upstream
-                });
-            if !usable {
-                if let Some(stale) = by_session.remove(&entry.session_id)
-                    && let Some(mount) = by_secret.remove(&stale)
-                {
-                    mount.token.revoke();
-                }
-                let token = UiAccessToken::issue(UiExpiry::Idle(PROXY_IDLE_TTL))?;
-                let secret = token.secret().expose_secret().to_owned();
-                by_secret.insert(
-                    secret.clone(),
-                    Mount {
-                        token,
-                        proxied: Arc::new(Proxied::new(upstream)),
-                    },
-                );
-                by_session.insert(entry.session_id.clone(), secret);
-            }
-            let Some(secret) = by_session.get(&entry.session_id) else {
-                continue;
-            };
-            let Some(framed_at) = frame_address(secret, shell_authority) else {
-                continue;
-            };
-            let mut card = json!({
-                "session_id": entry.session_id,
-                "provider_id": entry.provider_id,
-                "ui_kind": entry.ui_kind,
-                // Where this session is framed. It carries the only credential
-                // the Provider UI is given, so it is named for what it is. The
-                // session's own `access_url_secret` never leaves this process.
-                "proxy_url_secret": framed_at,
-            });
-            if let Some(subject) = &entry.subject {
-                card["subject"] = Value::String(subject.clone());
-            }
-            cards.push(card);
+    /// The page's own clock, advanced.
+    fn shell_phase(&self) -> Phase {
+        match self.attention.lock() {
+            Ok(mut attention) => attention.phase(&self.idle_policy),
+            // A poisoned clock cannot be read, and refusing to serve is the
+            // wrong failure: the page is what a person is holding.
+            Err(_) => Phase::Live,
         }
-        Ok(cards)
+    }
+
+    /// Somebody is at the page, and looking at these sessions.
+    ///
+    /// The page is renewed whatever it names, because saying this at all is
+    /// evidence somebody is there. A session already lapsed is skipped rather
+    /// than revived — coming back is [`Self::reopen`], an act a person performs
+    /// on one card, not something a heartbeat does to everything it can reach.
+    fn attend(&self, session_ids: &[String]) {
+        if let Ok(mut attention) = self.attention.lock() {
+            attention.attend();
+        }
+        if let Ok(mut mounts) = self.mounts.lock() {
+            mounts.attend(session_ids);
+        }
+    }
+
+    /// Put a lapsed session back on the page, with a credential of its own.
+    ///
+    /// The old one is not resurrected — it was revoked when the view lapsed and
+    /// stays revoked. Returns whether there was a lapse to end, so the page can
+    /// tell "done" from "there was nothing there".
+    fn reopen(&self, session_id: &str) -> bool {
+        // Mounting is `mount_live_sessions`' job — it is the only place that
+        // knows the session is still running and where it answers. This only
+        // takes the refusal away, and the next poll does the rest.
+        let removed = match self.mounts.lock() {
+            Ok(mut mounts) => mounts.revive(session_id),
+            Err(_) => false,
+        };
+        if removed && let Ok(mut attention) = self.attention.lock() {
+            attention.attend();
+        }
+        removed
     }
 
     /// The mount a proxy credential names, if it is still live.
+    ///
+    /// Traffic through a frame is the other half of attention: it is the only
+    /// evidence this listener has that somebody is using a Provider UI, since
+    /// what happens inside one is on an origin it cannot read. So a request
+    /// that authorizes here renews both this session and the page around it.
     fn mount(&self, secret: &str) -> Option<Arc<Proxied>> {
-        let mounts = self.mounts.lock().ok()?;
-        let mount = mounts.by_secret.get(secret)?;
-        // The lookup above is a hash of the candidate; this is the check that
-        // decides, in constant time and honouring expiry and revocation. A
-        // credential that fails it never reaches this session's cookie jar,
-        // which is what keeps one session's cookies out of another's requests.
-        mount
-            .token
-            .authorize(secret)
-            .then(|| Arc::clone(&mount.proxied))
+        let proxied = self
+            .mounts
+            .lock()
+            .ok()?
+            .authorize(secret, &self.idle_policy)?;
+        if let Ok(mut attention) = self.attention.lock() {
+            attention.attend();
+        }
+        Some(proxied)
     }
 }
 
@@ -392,6 +409,13 @@ impl ServeState {
 /// session host answers that way: there is nothing there to authenticate
 /// against, and saying otherwise would confirm that this port hosts something.
 async fn dispatch(State(state): State<Arc<ServeState>>, request: Request) -> Response<Body> {
+    // The page's own lapse ends everything this listener answers, frames
+    // included. A page that stopped answering while the terminal it framed kept
+    // going would leave the part that shows a person's work as the one part
+    // that outlived them walking away.
+    if state.shell_phase() == Phase::Dead {
+        return not_found();
+    }
     match &state.addressing {
         Addressing::Path => on_one_origin(&state, request).await,
         Addressing::PerSession { base_host } => across_origins(&state, base_host, request).await,
@@ -485,201 +509,15 @@ fn not_found() -> Response<Body> {
     response
 }
 
-/// The authority the browser asked for, lowercased.
-///
-/// The `Host` header is what a browser sends; the request target carries one
-/// only when a proxy wrote it. Either is read, because which one arrives is not
-/// this listener's decision.
-fn requested_authority<B>(request: &axum::http::Request<B>) -> Option<String> {
-    let host = request
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .or_else(|| request.uri().authority().map(|value| value.to_string()))?;
-    Some(host.to_ascii_lowercase())
-}
-
-/// The name part of an authority, without the port.
-fn hostname_of(authority: &str) -> &str {
-    match authority.rsplit_once(':') {
-        Some((host, port))
-            if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
-        {
-            host
-        }
-        _ => authority,
-    }
-}
-
-/// Where the page points a frame at one session.
-///
-/// Scheme-relative in the per-session shape, so the frame is fetched over
-/// whatever the page itself was: a TLS terminator in front would otherwise turn
-/// every frame into blocked mixed content.
-fn frame_address(secret: &str, shell_authority: Option<&str>) -> Option<String> {
-    match shell_authority {
-        Some(authority) => Some(format!(
-            "//{ORIGIN_LABEL_PREFIX}{}.{authority}/",
-            origin_label(secret)?
-        )),
-        None => Some(format!("/{PROXY_SEGMENT}/{secret}/")),
-    }
-}
-
-/// The alphabet a session's own name is written in.
-///
-/// RFC 4648 base32, lowercased: letters and digits that are all legal in a DNS
-/// label, in an encoding that is case-insensitive the way a hostname is. The
-/// credential is re-encoded rather than shortened because hex would spell it in
-/// 64 characters and a label may have 63.
-const LABEL_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-
-/// The label that names the mount this credential opens.
-fn origin_label(secret: &str) -> Option<String> {
-    let bytes = hex::decode(secret).ok()?;
-    let mut label = String::with_capacity(bytes.len().div_ceil(5) * 8);
-    let mut buffer = 0_u16;
-    let mut bits = 0_u32;
-    for byte in bytes {
-        buffer = (buffer << 8) | u16::from(byte);
-        bits += 8;
-        while bits >= 5 {
-            bits -= 5;
-            label.push(char::from(
-                LABEL_ALPHABET[usize::from((buffer >> bits) & 0x1f)],
-            ));
-        }
-    }
-    if bits > 0 {
-        label.push(char::from(
-            LABEL_ALPHABET[usize::from((buffer << (5 - bits)) & 0x1f)],
-        ));
-    }
-    Some(label)
-}
-
-/// The credential a session's own name carries, in the form the mount table
-/// keys on.
-///
-/// Every step can refuse: a character outside the alphabet, or padding bits
-/// that are not zero. The second one matters — without it sixteen spellings of
-/// one label would open the same mount, and a session would have sixteen
-/// addresses instead of one.
-fn mount_secret_of(label: &str) -> Option<String> {
-    let mut bytes = Vec::with_capacity(label.len() * 5 / 8);
-    let mut buffer = 0_u16;
-    let mut bits = 0_u32;
-    for character in label.bytes() {
-        let value = LABEL_ALPHABET
-            .iter()
-            .position(|candidate| *candidate == character)?;
-        buffer = (buffer << 5) | u16::try_from(value).ok()?;
-        bits += 5;
-        if bits >= 8 {
-            bits -= 8;
-            bytes.push(u8::try_from((buffer >> bits) & 0xff).ok()?);
-        }
-    }
-    if bits > 0 && buffer & ((1 << bits) - 1) != 0 {
-        return None;
-    }
-    Some(hex::encode(bytes))
-}
-
-/// A host every session can be given a name under.
-///
-/// Returns the name itself, without whatever port came with it: the port is the
-/// page's business and every session shares it.
-fn session_origin_base(host: &str) -> Result<String> {
-    let refuse = |reason: &'static str| Error::InvalidSessionOriginHost {
-        value: host.to_owned(),
-        reason,
-    };
-    let name = hostname_of(host.trim()).to_ascii_lowercase();
-    if name.is_empty() {
-        return Err(refuse("it names no host at all"));
-    }
-    if name.parse::<IpAddr>().is_ok() || name.starts_with('[') {
-        return Err(refuse(
-            "an address has no names under it, and no wildcard record can be written for one",
-        ));
-    }
-    if !name
-        .split('.')
-        .all(|label| !label.is_empty() && label.len() <= 63 && is_host_label(label))
-    {
-        return Err(refuse(
-            "a host is dot-separated labels of letters, digits and hyphens",
-        ));
-    }
-    // 253 is the whole name a resolver will carry, and a session spends the
-    // first 55 of them on `s-` and its own credential.
-    if name.len() + ORIGIN_LABEL_PREFIX.len() + LABEL_LENGTH + 1 > 253 {
-        return Err(refuse(
-            "a session's own name is 55 characters longer, and that is past what a hostname may be",
-        ));
-    }
-    Ok(name)
-}
-
-/// How long a credential is once it is spelled as a label: 32 bytes at five
-/// bits a character.
-const LABEL_LENGTH: usize = 52;
-
-fn is_host_label(label: &str) -> bool {
-    label
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        && !label.starts_with('-')
-        && !label.ends_with('-')
-}
-
 fn poisoned() -> Error {
     Error::Io(std::io::Error::other("served session registry is poisoned"))
 }
 
-/// The authority to put in the URL when the caller did not name one.
-///
-/// A wildcard bind is reachable from elsewhere but cannot be typed into
-/// anything, so it is the one case worth resolving to a real interface.
-fn advertised_authority(local_addr: SocketAddr) -> String {
-    if local_addr.ip().is_unspecified()
-        && let Some(lan) = primary_lan_ipv4()
-    {
-        return format!("{lan}:{}", local_addr.port());
-    }
-    local_addr.to_string()
-}
-
-/// This machine's address on the local network, as far as its routing table
-/// knows.
-///
-/// Probes the IPv4 all-hosts multicast route rather than a unicast default
-/// route: VPN and overlay interfaces commonly capture the latter without owning
-/// the route that reaches another device on the physical network. Nothing is
-/// sent — a connected UDP socket only fixes a source address.
-fn primary_lan_ipv4() -> Option<Ipv4Addr> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-    socket.connect((Ipv4Addr::new(224, 0, 0, 1), 9)).ok()?;
-    match socket.local_addr().ok()?.ip() {
-        IpAddr::V4(ip)
-            if !ip.is_loopback()
-                && !ip.is_unspecified()
-                && !ip.is_multicast()
-                && !ip.is_broadcast()
-                && !ip.is_link_local() =>
-        {
-            Some(ip)
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use super::addressing::LABEL_LENGTH;
     use super::*;
 
     fn entry(session_id: &str, url: &str) -> UiSessionEntry {
@@ -688,17 +526,39 @@ mod tests {
             provider_id: "console".to_owned(),
             ui_kind: "terminal".to_owned(),
             subject: None,
+            waits_for_decision: false,
             access_url_secret: url.to_owned(),
+            announced_at_epoch_ms: 0,
             owner_pid: 1,
         }
     }
 
     fn state() -> Result<ServeState> {
+        state_with(UiIdlePolicy::never())
+    }
+
+    fn state_with(idle_policy: UiIdlePolicy) -> Result<ServeState> {
         Ok(ServeState {
             token: UiAccessToken::issue(UiExpiry::Never)?,
+            idle_policy,
+            attention: Mutex::new(Attention::new()),
+            shell: frontend::ShellUi::resolve(std::path::Path::new("/nonexistent"))?,
             mounts: Mutex::new(Mounts::default()),
             addressing: Addressing::Path,
         })
+    }
+
+    /// The proxy credential inside a framed address, which is what the mount
+    /// table keys on and what a leaked frame URL would carry.
+    fn proxy_secret(card: &Value) -> String {
+        card["proxy_url_secret"]
+            .as_str()
+            .unwrap()
+            .trim_matches('/')
+            .split('/')
+            .nth(1)
+            .unwrap()
+            .to_owned()
     }
 
     #[test]
@@ -727,8 +587,7 @@ mod tests {
         // seconds, which for a terminal means losing the terminal.
         assert_eq!(first, second);
 
-        let path = first[0]["proxy_url_secret"].as_str().unwrap().to_owned();
-        let secret = path.trim_matches('/').split('/').nth(1).unwrap().to_owned();
+        let secret = proxy_secret(&first[0]);
         assert!(state.mount(&secret).is_some());
 
         assert!(state.mount_live_sessions(&[], None).unwrap().is_empty());
@@ -736,6 +595,212 @@ mod tests {
             state.mount(&secret).is_none(),
             "a proxy credential must stop working when its session ends"
         );
+    }
+
+    /// Short enough to run, long enough that a loaded machine cannot cross it
+    /// between two statements.
+    const IDLE: Duration = Duration::from_millis(300);
+    const GRACE: Duration = Duration::from_millis(300);
+
+    fn lapsing() -> Result<ServeState> {
+        state_with(UiIdlePolicy::after(IDLE).with_grace(GRACE))
+    }
+
+    #[test]
+    fn a_warning_is_a_warning_and_not_the_outage_arriving_early() {
+        let state = lapsing().unwrap();
+        let live = [entry("one", "http://127.0.0.1:9/aabbccdd/")];
+        let card = state.mount_live_sessions(&live, None).unwrap()[0].clone();
+        assert_eq!(card["state"], "live");
+        let secret = proxy_secret(&card);
+
+        std::thread::sleep(IDLE);
+        let warned = state.mount_live_sessions(&live, None).unwrap()[0].clone();
+        assert_eq!(warned["state"], "expiring");
+        assert!(warned["expires_in_ms"].as_u64().unwrap() > 0);
+        // The address is the same one, so the page has no reason to rebuild the
+        // frame — losing a half-filled form is what the warning exists to
+        // prevent, not something it does on the way.
+        assert_eq!(warned["proxy_url_secret"], card["proxy_url_secret"]);
+        // And it still works, which is the whole difference between a warning
+        // and an outage.
+        assert!(state.mount(&secret).is_some());
+    }
+
+    #[test]
+    fn nobody_attending_ends_the_view_and_revokes_the_address_it_was_reached_at() {
+        let state = lapsing().unwrap();
+        let live = [entry("one", "http://127.0.0.1:9/aabbccdd/")];
+        let secret = proxy_secret(&state.mount_live_sessions(&live, None).unwrap()[0]);
+
+        std::thread::sleep(IDLE);
+        // Enters the warning, which is what starts the grace clock.
+        let _warned = state.mount_live_sessions(&live, None).unwrap();
+        std::thread::sleep(GRACE);
+        let lapsed = state.mount_live_sessions(&live, None).unwrap()[0].clone();
+        assert_eq!(lapsed["state"], "dead");
+        // No address at all: the page has nothing to frame, rather than an
+        // iframe left holding the last thing it painted.
+        assert!(lapsed["proxy_url_secret"].is_null());
+        assert!(
+            state.mount(&secret).is_none(),
+            "a frame address that leaked has to stop working, which is the only \
+             thing this expiry can actually promise"
+        );
+
+        // And a poll two seconds later must not quietly undo it.
+        let still = state.mount_live_sessions(&live, None).unwrap()[0].clone();
+        assert_eq!(still["state"], "dead");
+        assert!(still["proxy_url_secret"].is_null());
+    }
+
+    #[test]
+    fn attending_during_the_warning_keeps_the_very_same_address() {
+        let state = lapsing().unwrap();
+        let live = [entry("one", "http://127.0.0.1:9/aabbccdd/")];
+        let card = state.mount_live_sessions(&live, None).unwrap()[0].clone();
+
+        std::thread::sleep(IDLE);
+        assert_eq!(
+            state.mount_live_sessions(&live, None).unwrap()[0]["state"],
+            "expiring"
+        );
+        state.attend(&["one".to_owned()]);
+        let kept = state.mount_live_sessions(&live, None).unwrap()[0].clone();
+        assert_eq!(kept["state"], "live");
+        assert_eq!(kept["proxy_url_secret"], card["proxy_url_secret"]);
+        assert!(state.mount(&proxy_secret(&kept)).is_some());
+    }
+
+    #[test]
+    fn a_lapsed_view_comes_back_only_when_asked_and_never_at_its_old_address() {
+        let state = lapsing().unwrap();
+        let live = [entry("one", "http://127.0.0.1:9/aabbccdd/")];
+        let was = proxy_secret(&state.mount_live_sessions(&live, None).unwrap()[0]);
+        std::thread::sleep(IDLE + GRACE);
+        assert_eq!(
+            state.mount_live_sessions(&live, None).unwrap()[0]["state"],
+            "dead"
+        );
+
+        // Attending is not reviving: a heartbeat that brought back everything it
+        // could name would undo the lapse on the next tick.
+        state.attend(&["one".to_owned()]);
+        assert_eq!(
+            state.mount_live_sessions(&live, None).unwrap()[0]["state"],
+            "dead"
+        );
+
+        assert!(state.reopen("one"));
+        let back = state.mount_live_sessions(&live, None).unwrap()[0].clone();
+        assert_eq!(back["state"], "live");
+        // Reopen lands back on the very same session — the frame just inside
+        // it rebuilds from scratch, which is why `docs/providers.md` asks a
+        // Provider's page to be able to reconstruct itself from its own URL
+        // alone — at a new address, never the revoked one.
+        assert_eq!(back["session_id"], "one");
+        let now = proxy_secret(&back);
+        assert_ne!(now, was);
+        assert!(state.mount(&now).is_some());
+        assert!(
+            state.mount(&was).is_none(),
+            "reopening mints a credential; it does not resurrect the revoked one"
+        );
+    }
+
+    #[test]
+    fn traffic_through_a_frame_is_attention_and_the_page_polling_is_not() {
+        let state = lapsing().unwrap();
+        let live = [entry("one", "http://127.0.0.1:9/aabbccdd/")];
+        let secret = proxy_secret(&state.mount_live_sessions(&live, None).unwrap()[0]);
+
+        // Half an idle window of nothing but polls, then a request through the
+        // frame: the polls must not have renewed anything and the request must.
+        std::thread::sleep(IDLE / 2);
+        assert_eq!(state.shell_phase(), Phase::Live);
+        assert!(state.mount(&secret).is_some());
+        std::thread::sleep(IDLE / 2 + IDLE / 4);
+        assert_eq!(
+            state.mount_live_sessions(&live, None).unwrap()[0]["state"],
+            "live",
+            "a request through the frame is the only evidence there is that a \
+             person is using a Provider UI, and it has to count"
+        );
+        // The page's own clock was renewed by that same request, for the same
+        // reason: something is talking to a frame this page is holding.
+        assert_eq!(state.shell_phase(), Phase::Live);
+    }
+
+    /// Names the trade-off `attention.rs` documents for a desktop with
+    /// several cards open: a self-refreshing panel's own traffic keeps the
+    /// *page* alive, not only the card it came through — even for a
+    /// neighbour whose own view lapses right on schedule because nothing
+    /// ever touched it.
+    #[test]
+    fn traffic_through_one_session_renews_the_whole_page() {
+        let state = lapsing().unwrap();
+        let live = [
+            entry("chatty", "http://127.0.0.1:9/aaaaaaaa/"),
+            entry("quiet", "http://127.0.0.1:9/bbbbbbbb/"),
+        ];
+        let cards = state.mount_live_sessions(&live, None).unwrap();
+        let chatty_secret = proxy_secret(&cards[0]);
+
+        // "chatty" keeps generating frame traffic on its own; "quiet" is
+        // never proxied to and never named to `attend`. Five touches well
+        // under `IDLE` apart, spanning past `IDLE + GRACE` in total, so
+        // "chatty" itself never comes close to lapsing while "quiet" ages
+        // the whole time untouched.
+        for _ in 0..5 {
+            std::thread::sleep(IDLE / 2);
+            assert!(state.mount(&chatty_secret).is_some());
+        }
+
+        let cards = state.mount_live_sessions(&live, None).unwrap();
+        assert_eq!(
+            cards[1]["state"], "dead",
+            "an untouched session's own view lapses on its own schedule"
+        );
+        // But the page around it did not: "chatty"'s traffic alone kept the
+        // shared clock renewed the whole time.
+        assert_eq!(state.shell_phase(), Phase::Live);
+    }
+
+    #[test]
+    fn the_page_itself_lapses_and_a_policy_of_never_does_not() {
+        let lapsing = lapsing().unwrap();
+        assert_eq!(lapsing.shell_phase(), Phase::Live);
+        std::thread::sleep(IDLE);
+        assert!(matches!(
+            lapsing.shell_phase(),
+            Phase::Expiring { remaining } if remaining > Duration::ZERO
+        ));
+        lapsing.attend(&[]);
+        assert_eq!(lapsing.shell_phase(), Phase::Live);
+        std::thread::sleep(IDLE + GRACE);
+        assert_eq!(lapsing.shell_phase(), Phase::Dead);
+        // Final: attending a dead page does not bring it back, because the
+        // person who could attend it is the one who is no longer there.
+        lapsing.attend(&[]);
+        assert_eq!(lapsing.shell_phase(), Phase::Dead);
+
+        let forever = state_with(UiIdlePolicy::after(Duration::ZERO)).unwrap();
+        let live = [entry("one", "http://127.0.0.1:9/aabbccdd/")];
+        let secret = proxy_secret(&forever.mount_live_sessions(&live, None).unwrap()[0]);
+        std::thread::sleep(IDLE + GRACE);
+        assert_eq!(forever.shell_phase(), Phase::Live);
+        assert_eq!(
+            forever.mount_live_sessions(&live, None).unwrap()[0]["state"],
+            "live"
+        );
+        assert!(forever.mount(&secret).is_some());
+    }
+
+    #[test]
+    fn a_grace_of_nothing_lapses_without_a_warning() {
+        let state = state_with(UiIdlePolicy::after(IDLE).with_grace(Duration::ZERO)).unwrap();
+        std::thread::sleep(IDLE);
+        assert_eq!(state.shell_phase(), Phase::Dead);
     }
 
     #[test]
@@ -774,49 +839,5 @@ mod tests {
         // And the name round-trips to the credential the mount table keys on.
         let secret = mount_secret_of(&label).unwrap();
         assert!(state.mount(&secret).is_some());
-    }
-
-    #[test]
-    fn a_name_that_is_not_exactly_one_sessions_opens_nothing() {
-        assert_eq!(mount_secret_of("not base32: !"), None);
-        // Padding bits that are not zero: a second spelling of one credential,
-        // refused so that a session has one address rather than sixteen.
-        let label = origin_label(&"ab".repeat(32)).unwrap();
-        assert_eq!(
-            mount_secret_of(&label).as_deref(),
-            Some("ab".repeat(32).as_str())
-        );
-        let mut tampered = label.clone();
-        tampered.pop();
-        tampered.push('b');
-        assert_eq!(mount_secret_of(&tampered), None);
-    }
-
-    #[test]
-    fn a_host_nothing_can_be_named_under_is_refused_before_binding() {
-        assert_eq!(session_origin_base("localhost").unwrap(), "localhost");
-        assert_eq!(session_origin_base("localhost:8787").unwrap(), "localhost");
-        assert_eq!(
-            session_origin_base("UI.Example.COM").unwrap(),
-            "ui.example.com"
-        );
-        // An address has nothing under it: no wildcard record, no certificate.
-        assert!(session_origin_base("127.0.0.1").is_err());
-        assert!(session_origin_base("127.0.0.1:8787").is_err());
-        assert!(session_origin_base("[::1]:8787").is_err());
-        assert!(session_origin_base("").is_err());
-        assert!(session_origin_base("under_score.example").is_err());
-        assert!(session_origin_base("-leading.example").is_err());
-        assert!(session_origin_base("http://localhost").is_err());
-        // No room left for a session's own name.
-        assert!(session_origin_base(&format!("{}.example", "a".repeat(200))).is_err());
-    }
-
-    #[test]
-    fn an_authority_is_read_without_its_port() {
-        assert_eq!(hostname_of("localhost:8787"), "localhost");
-        assert_eq!(hostname_of("localhost"), "localhost");
-        assert_eq!(hostname_of("[::1]"), "[::1]");
-        assert_eq!(hostname_of("ui.example.com"), "ui.example.com");
     }
 }

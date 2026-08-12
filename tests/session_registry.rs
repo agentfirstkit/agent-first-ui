@@ -71,6 +71,60 @@ async fn a_session_is_announced_while_it_runs_and_withdrawn_when_it_ends() {
         "sessions did not share a port: {ports:?}"
     );
 
+    // The order is the order things happened, and it has to survive a name
+    // that sorts the other way. `inspector` precedes `reviewer` in the
+    // alphabet and was announced first, so a third session whose name sorts
+    // before both of them still belongs last — it is the one the person asked
+    // for while the other two were already open.
+    //
+    // This is the whole reason the entry carries a timestamp: a person who
+    // opens a terminal, works in it, and asks for a second interface expects
+    // that one below the terminal, not filed wherever its Provider's name falls
+    // in an alphabet they never think about.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let latecomer = host
+        .attach(
+            UiSession::<()>::new("aardvark", "panel").unwrap(),
+            Router::new(),
+            UiExpiry::Never,
+        )
+        .unwrap();
+    let ordered: Vec<&str> = list_sessions()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.provider_id.as_str())
+        .map(|name| Box::leak(name.to_owned().into_boxed_str()) as &str)
+        .collect();
+    assert_eq!(
+        ordered,
+        vec!["inspector", "reviewer", "aardvark"],
+        "sessions must be listed in the order they were announced"
+    );
+
+    // And that order does not depend on which build of this crate wrote the
+    // entry. Nothing about the time is in the file — it is the file's own
+    // modification time — so a Provider pinned to an older version announces
+    // an entry that sorts exactly like everyone else's rather than sorting
+    // first forever.
+    let written = std::fs::read_to_string(
+        agent_first_ui::sessions_directory()
+            .unwrap()
+            .join(format!("{}.json", listed[0].session_id)),
+    )
+    .unwrap();
+    assert!(
+        !written.contains("announced_at"),
+        "the announcement time must not be a stored field: {written}"
+    );
+    assert!(
+        list_sessions()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.announced_at_epoch_ms > 0),
+        "every entry still reports when it was announced"
+    );
+    drop(latecomer);
+
     drop(orders);
     let remaining = list_sessions().unwrap();
     assert_eq!(remaining.len(), 1);

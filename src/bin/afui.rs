@@ -43,6 +43,15 @@ fn stream_output() -> OutputSpec {
 /// Loopback, because reaching this from another device is a decision.
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 
+/// How long an unattended page keeps working, and how long it warns first.
+///
+/// Expiring by default is the safe direction: the page is the one delivery
+/// nobody is bounded by, so left alone it should stop showing a person's
+/// terminal rather than keep showing it to whoever picks the phone up. Opting
+/// out is one flag, and an attended page never reaches either number.
+const DEFAULT_IDLE_MINUTES: i64 = 15;
+const DEFAULT_GRACE_MINUTES: i64 = 5;
+
 /// The skill this binary installs. `assets` is empty because the skill is a
 /// single file: it points agents at `afui frontend --help` rather than shipping
 /// a reference tree that would have to be kept in step with the CLI.
@@ -115,6 +124,24 @@ fn cli_spec() -> Result<BuiltCliSpec, CliSpecError> {
                 ),
         )
         .command(
+            CommandSpec::new(["session", "close"])
+                .about(
+                    "End a running UI session from outside the process that created it. \
+                     Whoever created it gets `Outcome::Closed`, the same as if a person had \
+                     closed its window.",
+                )
+                .arg(
+                    ArgSpec::positional("session_id", 0, "SESSION_ID")
+                        .about("Session identifier from `afui session list`"),
+                )
+                .combination(
+                    Combination::new("session-close")
+                        .action("session_close")
+                        .required(["session_id"])
+                        .output(output()),
+                ),
+        )
+        .command(
             CommandSpec::new(["session", "serve"])
                 .about(
                     "Serve every running session to a browser on another device. \
@@ -133,6 +160,22 @@ fn cli_spec() -> Result<BuiltCliSpec, CliSpecError> {
                     "Authority to put in the URL when the bound address is not one \
                          anybody can open",
                 ))
+                .arg(
+                    ArgSpec::option_i64("--idle-minutes", "MINUTES")
+                        .default_i64(DEFAULT_IDLE_MINUTES)
+                        .about(
+                            "Stop answering this long after nobody is attending the page: no \
+                             visible tab, no traffic through a session. `0` never stops",
+                        ),
+                )
+                .arg(
+                    ArgSpec::option_i64("--grace-minutes", "MINUTES")
+                        .default_i64(DEFAULT_GRACE_MINUTES)
+                        .about(
+                            "How long the page warns first, still fully working, with a button \
+                             that renews it. `0` lapses without warning",
+                        ),
+                )
                 .arg(ArgSpec::option("--session-origin-host", "HOST").about(
                     "Give every session an origin of its own, `s-<credential>.<HOST>`, so a \
                      framed UI keeps browser storage. Needs `*.<HOST>` to resolve here, and a \
@@ -143,7 +186,13 @@ fn cli_spec() -> Result<BuiltCliSpec, CliSpecError> {
                 .combination(
                     Combination::new("session-serve")
                         .action("session_serve")
-                        .optional(["listen", "advertise_host", "session_origin_host"])
+                        .optional([
+                            "listen",
+                            "advertise_host",
+                            "session_origin_host",
+                            "idle_minutes",
+                            "grace_minutes",
+                        ])
                         .output(stream_output()),
                 ),
         );
@@ -236,6 +285,7 @@ fn main() -> ExitCode {
         ),
         ("session_list", run_session_list),
         ("session_open", run_session_open),
+        ("session_close", run_session_close),
         ("session_serve", run_session_serve),
         ("frontend_check", run_check),
         ("frontend_dev", run_dev),
@@ -618,6 +668,24 @@ fn flag(invocation: &ResolvedInvocation, id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// How long the page outlives the person looking at it.
+///
+/// Zero and negative both mean "no limit". A person reaching for that reaches
+/// for `0`, and telling them `-1` is an error while `0` is not would be a
+/// distinction with nothing behind it.
+#[cfg(feature = "serve")]
+fn idle_policy(invocation: &ResolvedInvocation) -> agent_first_ui::UiIdlePolicy {
+    let minutes = |id: &str, fallback: i64| -> std::time::Duration {
+        let value = invocation
+            .optional(id)
+            .and_then(CliValue::as_i64)
+            .unwrap_or(fallback);
+        std::time::Duration::from_secs(u64::try_from(value.max(0)).unwrap_or(0) * 60)
+    };
+    agent_first_ui::UiIdlePolicy::after(minutes("idle_minutes", DEFAULT_IDLE_MINUTES))
+        .with_grace(minutes("grace_minutes", DEFAULT_GRACE_MINUTES))
+}
+
 /// List the sessions Providers currently have open.
 ///
 /// The credential never appears here. A session URL carries one, and this is
@@ -634,6 +702,14 @@ fn run_session_list(invocation: &ResolvedInvocation) -> ExitCode {
                     "provider_id": entry.provider_id,
                     "ui_kind": entry.ui_kind,
                     "owner_pid": entry.owner_pid,
+                    // Whether a person is being waited on, not merely
+                    // watched, and how long they have been waiting — the two
+                    // facts a person or an agent needs to tell "a stopped
+                    // agent" from "an open monitor" before assuming nothing
+                    // is blocked. How to draw that is the caller's; this only
+                    // reports what afui already knows.
+                    "waits_for_decision": entry.waits_for_decision,
+                    "announced_at_epoch_ms": entry.announced_at_epoch_ms,
                 });
                 if let Some(subject) = &entry.subject {
                     value["subject"] = Value::String(subject.clone());
@@ -677,12 +753,101 @@ fn run_session_open(invocation: &ResolvedInvocation) -> ExitCode {
                 .map_err(|error| error.to_string())
         })?;
         Ok(serde_json::json!({
-            "code": "session_closed",
+            // Not `session_closed`: closing this window only ends this
+            // *view*, exactly as closing the Provider's own window would.
+            // The session itself may still be running — `session close` is
+            // the verb for actually ending it, and its result carries that
+            // name instead.
+            "code": "session_view_closed",
             "session_id": entry.session_id,
             "provider_id": entry.provider_id,
             "ui_kind": entry.ui_kind,
         }))
     })
+}
+
+/// End a session from outside the process that created it.
+///
+/// Reaches the same reserved route the served shell's own "End" control and a
+/// closed window both reach: `POST <access_url>` + [`agent_first_ui::SESSION_END_PATH`].
+/// The credential bar is the session's own URL, exactly the one `session open`
+/// already reads — whoever can list a session can end it, because that URL is
+/// already the whole credential: the same threshold as seeing it, not a
+/// higher one.
+///
+/// This reports only that the request was accepted, not that the owning
+/// process has exited: the two are usually a heartbeat apart, but this command
+/// has no way to wait for the second one.
+fn run_session_close(invocation: &ResolvedInvocation) -> ExitCode {
+    run_domain(invocation, || {
+        let session_id = required(invocation, "session_id");
+        let entry = agent_first_ui::find_session(&session_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "no running session `{session_id}`; run `afui session list` to see what is open"
+                )
+            })?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let status = runtime.block_on(post_session_end(&entry.access_url_secret))?;
+        match status {
+            204 => Ok(serde_json::json!({
+                "code": "session_close_requested",
+                "session_id": entry.session_id,
+                "provider_id": entry.provider_id,
+                "ui_kind": entry.ui_kind,
+            })),
+            404 => Err(format!(
+                "session `{session_id}` is already gone; there is nothing left to close"
+            )),
+            other => Err(format!(
+                "closing session `{session_id}` failed: the session answered HTTP {other}"
+            )),
+        }
+    })
+}
+
+/// `POST <access_url><SESSION_END_PATH>`, by hand.
+///
+/// One request, no redirects, no body, no TLS — every property an HTTP client
+/// dependency exists for is one this does not need, and every other verb in
+/// this binary that talks to a session's own URL (`session serve`'s proxy
+/// aside) already does the same by hand.
+async fn post_session_end(access_url_secret: &str) -> Result<u16, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let rest = access_url_secret
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("session URL `{access_url_secret}` is not an http:// URL"))?;
+    let (authority, path) = rest
+        .split_once('/')
+        .ok_or_else(|| format!("session URL `{access_url_secret}` has no path"))?;
+    let mut stream = tokio::net::TcpStream::connect(authority)
+        .await
+        .map_err(|error| format!("could not reach the session at `{authority}`: {error}"))?;
+    stream
+        .write_all(
+            format!(
+                "POST /{path}{} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n",
+                agent_first_ui::SESSION_END_PATH
+            )
+            .as_bytes(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .await
+        .map_err(|error| error.to_string())?;
+    response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| format!("no HTTP status in the session's response: {response}"))
 }
 
 /// Serve the sessions running here to a browser that is not here.
@@ -728,8 +893,9 @@ fn run_session_serve(invocation: &ResolvedInvocation) -> ExitCode {
     let mut emitter = CliEmitter::from_output_to(output_to, format).with_strict_protocol();
     let advertise_host = optional(invocation, "advertise_host");
     let session_origin_host = optional(invocation, "session_origin_host");
+    let idle_policy = idle_policy(invocation);
     let outcome = runtime.block_on(async {
-        let mut server = agent_first_ui::SessionServer::new(address);
+        let mut server = agent_first_ui::SessionServer::new(address).with_idle_policy(idle_policy);
         if let Some(host) = advertise_host {
             server = server.with_advertised_host(host);
         }
@@ -749,6 +915,16 @@ fn run_session_serve(invocation: &ResolvedInvocation) -> ExitCode {
                     "message": "Open this URL from your device. Reaching this port is a tunnel, a VPN, or a TLS reverse proxy you already trust — this command is none of them.",
                     "serve_url": served.access_url(),
                     "listen_address": bound,
+                    // Absent when AFUI's own page is serving. An untrusted
+                    // workspace frontend is skipped in silence, so this is how
+                    // an agent tells "my override is running" from "my override
+                    // is inert".
+                    "ui_frontend_id": served.frontend_id(),
+                    // Said at handoff, because it is the one thing about this
+                    // URL a person cannot discover by looking at it: how long
+                    // it lasts once they stop looking.
+                    "idle_ms": idle_policy.idle().map(|idle| idle.as_millis()),
+                    "grace_ms": idle_policy.grace().as_millis(),
                 }))
                 .build(),
             )
@@ -997,5 +1173,37 @@ mod tests {
         let first = fingerprint(directory.path()).unwrap();
         fs::write(directory.path().join("frontend.json"), b"two").unwrap();
         assert_ne!(first, fingerprint(directory.path()).unwrap());
+    }
+
+    /// `post_session_end` against a real running session — the exact request
+    /// `session close` sends, without the registry lookup around it. Not
+    /// gated on `AFUI_CONFIG_DIR`, so it needs no isolation from the other
+    /// tests in this binary.
+    #[tokio::test]
+    async fn post_session_end_reaches_a_real_session_and_reports_its_status() {
+        let host = agent_first_ui::UiHost::bind_local().await.unwrap();
+        let session = agent_first_ui::UiSession::<()>::new("reviewer", "case_review").unwrap();
+        let active = host
+            .attach(
+                session,
+                axum::Router::new(),
+                agent_first_ui::UiExpiry::Never,
+            )
+            .unwrap();
+        let url = active.access_url().to_owned();
+
+        assert_eq!(post_session_end(&url).await.unwrap(), 204);
+        assert_eq!(
+            active.wait().await.unwrap(),
+            agent_first_ui::Outcome::Closed
+        );
+        // Gone now, the same as any credential that never existed.
+        assert_eq!(post_session_end(&url).await.unwrap(), 404);
+    }
+
+    #[tokio::test]
+    async fn post_session_end_reports_a_clear_error_for_a_url_it_cannot_use() {
+        assert!(post_session_end("https://example.com/abc/").await.is_err());
+        assert!(post_session_end("http://127.0.0.1:1/").await.is_err());
     }
 }

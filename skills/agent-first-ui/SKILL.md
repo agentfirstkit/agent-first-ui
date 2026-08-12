@@ -1,16 +1,17 @@
 ---
 name: agent-first-ui
-description: "Hand a person a real interface mid-task — a scoped window, a short-lived credential, and one typed answer back — instead of flattening a decision into chat or standing up an ad-hoc web server. Trigger when a step needs human judgement on something page-shaped, when embedding a UI session in a Provider, or when managing `afui frontend` overrides."
+description: "Hand a person a real interface mid-task — a scoped window, a short-lived credential, optional live typed values in both directions, and one terminal outcome — instead of flattening a page-shaped interaction into chat or standing up an ad-hoc web server. Trigger when a step needs a human-facing page, when embedding a UI session in a Provider, or when managing `afui frontend` overrides."
 allowed-tools: Bash, Read
 ---
 
 # Agent-First UI
 
-Use this skill when a task reaches a point only a person can settle and the
-thing they must judge is shaped like a page rather than a sentence — a set of
-drafts to approve, a diff to accept, a form whose fields validate each other.
-AFUI delivers one interface to one person and returns one typed answer. It is
-delivery infrastructure: it never interprets what is on the page.
+Use this skill when a task reaches a point whose human interaction is shaped
+like a page rather than a sentence — a set of drafts to approve, a diff to
+accept, a form whose fields validate each other, or live state with commands
+that act on it. AFUI delivers one interface to one person, may carry live typed
+values in both directions, and returns one terminal outcome. It is delivery
+infrastructure: it never interprets what is on the page or on the channel.
 
 For flag-level detail, ask the command itself: `afui frontend --help` returns
 every legal shape of the call at once. This skill covers behavior, decisions,
@@ -24,45 +25,116 @@ and recovery only.
 - Exit 2 means the invocation was rejected before anything ran, and `error.code`
   is a `cli_*` code — retrying the same call unchanged cannot help. Exit 1 means
   the command ran and failed, carrying its own domain `error.code`.
-- A session is one person, one interface, one answer. `provider_id`, `ui_kind`,
-  and `session_id` are what route that answer back; never reuse a session to ask
-  a second question.
+- A session is one person, one interface, and one bounded lifetime with one
+  terminal outcome. `provider_id`, `ui_kind`, and `session_id` route it back to
+  its owner. A Provider may attach a full-duplex channel for any number of
+  non-terminal values while that same session remains open.
 - AFUI owns the credential, the origin checks, the isolated window, and the
   cleanup. The Provider owns the Router, the HTML, the typed API, and what
   completion *means*. Do not ask AFUI to render or validate domain data — it has
   no opinion about cases, invoices, or queries.
 
-## Open a window only when the decision is page-shaped
+## Open a window only when the interaction is page-shaped
 
 Chat already handles a yes/no. A window earns its interruption when the person
 needs to see structure — compare items, scan a diff, fill a form that checks
-itself. Reaching for one to ask a question you could have asked in text costs
-the user a context switch and buys nothing.
+itself, or watch changing state while issuing commands against it. Reaching for
+one to ask a question you could have asked in text costs the user a context
+switch and buys nothing.
 
-## All three outcomes are answers
+## A channel is transport, not a conversation model
 
-- `Completed(T)` — the person decided. `T` is their decision, not a suggestion
-  to weigh against your own plan.
-- `Closed` — they closed the window without deciding. That is a refusal to
-  answer right now, not a transient error: reopening the same window is nagging.
-  Report it and stop.
+Use `UiSession::with_channel` when a surface and its controlling process need
+to exchange values before the terminal outcome. The Provider defines the two
+JSON types. AFUI adds the authenticated WebSocket endpoint, bounded queues,
+backpressure, size limit, lifecycle, and proxy support; it does not wrap values,
+assign request ids, match replies, or decide which direction leads.
+
+Do not put history policy into AFUI. It retains and replays nothing. A Provider
+frontend may show every value from the current page load, replace one live
+snapshot, or display no history at all. If something must survive reload, store
+it in Provider-owned state and rebuild from the page's own URL. If a Provider
+uses a custom CSP, allow same-origin connections with `connect-src 'self'`.
+
+Keep both directions moving. Queues are bounded and nothing is dropped, so a
+Provider that never reads eventually cannot write either, and one that pushes
+state on a timer to a session nobody has opened stalls on that timer and then
+delivers a backlog instead of the current state. Read for as long as the
+session is open, and send the latest value from Provider-owned state rather
+than trusting the queue to hold it.
+
+## Build the Provider page for the person, not the event
+
+AFUI deliberately has no shared domain renderer, so the Provider must do the
+human translation before it opens a session. Do not hand a template the raw
+union, row set, protocol envelope, or generic field map merely because that is
+what the agent consumed. Build a typed document around the thing the person is
+looking at: one object with its attached facts, a scannable group of related
+objects, or one decision with everything needed to refuse it safely. Preserve
+the untouched source behind an optional details section when verification
+matters; summarising is not permission to hide evidence.
+
+Use the smallest page shape that matches the task:
+
+- Put the fact or action the session exists for first. Context follows it;
+  implementation identifiers and raw records do not compete with it.
+- Collapse repeated history and technical detail by default, while keeping the
+  newest or currently actionable item open.
+- Render safe visual material as visual material. A filename is not a preview,
+  and an image someone must judge should not require a second tool to see.
+- Put the safe refusal before a consequential approval in source and focus
+  order. Closing or expiry still refuses at the typed Provider boundary.
+- Say what is saving, stale, disconnected, expired, or complete next to the
+  thing affected. Never make color the only carrier of that state.
+
+The built-in frontend is real product UI, not a debugging fallback. It must
+honor `prefers-color-scheme`, expose a visible `:focus-visible` state, work at a
+coarse-pointer touch size, reflow without horizontal page scrolling, and keep
+status changes available to assistive technology without announcing every
+keystroke. Use native HTML controls and disclosure elements before inventing
+custom behavior. A replacement may change presentation; the Provider's trusted
+runtime remains the only owner of behavior and decision routing.
+
+These are Provider responsibilities, not a reason to grow AFUI into a component
+library. Similar-looking pages may share principles and still keep separate CSS,
+typed documents, templates, and runtimes when their human tasks differ.
+
+## Terminal outcomes stay separate from channel traffic
+
+- `Completed(T)` — a decision session completed. `T` is the person's decision,
+  not a suggestion to weigh against your own plan.
+- `Closed` — the session ended: a closed window, "End" pressed on a served card,
+  or `afui session close`. For a decision session this means no decision; for a
+  watched/live surface it is the ordinary terminal outcome. It is not a
+  transient channel disconnect and does not imply consent.
 - `Expired` — the credential ran out before they acted. Reopening is legitimate
   here, but say plainly that the first one timed out. This can only happen to a
   managed URL; a window never expires, because the window is what bounds it.
 
-Never read `Closed` or `Expired` as consent. If the step needed a human before,
-it still does.
+Any number of channel values may precede these, and none of them completes the
+session. Never read `Closed` or `Expired` as consent. If the step needed a human
+decision before, it still does.
 
 ## Finding sessions other processes are running
 
 `afui session list` reports every UI session live on this machine, whichever
 Provider owns it. Use it to answer "what is waiting for me?" before assuming a
 person has nothing open, and to tell two sessions of the same kind apart by
-their `subject`.
+their `subject`. Each entry also reports `waits_for_decision` — a stopped
+agent versus an open monitor someone merely has up — and
+`announced_at_epoch_ms`, so several waiting entries can be read oldest-first
+rather than by whichever happens to sort first alphabetically.
 
 `afui session open <id>` puts a window onto one. It does not take the session
 over: whoever created it still decides what completing it means, and closing
 this window ends this view the same way closing the Provider's own would.
+
+`afui session close <id>` ends the session itself, not merely a view of it —
+whoever created it gets `Outcome::Closed`, indistinguishable from a person
+closing it themselves. Use it to cancel a session you started that no longer
+needs an answer, never one someone else is using: ending is available to
+anyone who can already reach or list the session, the same access `session
+open` already assumes, not a reason to reach for it more freely.
 
 The listing never contains the credential. Do not go looking for a session URL
 to hand out — `open` is the sanctioned way to reach one.
@@ -87,6 +159,12 @@ each session onto an origin of its own, `s-<credential>.<HOST>`, which restores
 storage without loosening anything: the isolation becomes the browser's origin
 boundary instead of an attribute on a frame.
 
+One more thing it buys: with an origin per session, each card can be opened as a
+page of its own. Without it that control is absent — not broken — because a
+top-level navigation would put the Provider UI on the page's own origin and end
+the isolation the frames rely on. If somebody wants a session full-screen on a
+phone, that is the reason to suggest `--session-origin-host localhost`.
+
 It is opt-in because it asks for names. Suggest `--session-origin-host localhost`
 freely — browsers resolve `*.localhost` to the machine itself, so it needs no
 setup. Suggest any other host only once the person has said that `*.<HOST>`
@@ -98,9 +176,29 @@ The URL it prints carries the credential for everything running on that machine.
 Give it to the person and nowhere else: not into a file, not into a commit
 message, not into a chat transcript you do not control.
 
+That URL also stops working once nobody is attending the page — fifteen minutes,
+after a five-minute warning the page shows with a button. So a person reporting
+"the page went blank" or "the terminal card is gone" has usually walked away, not
+hit a bug: a lapsed card comes back with *Reopen*, and a lapsed page needs a new
+`serve` URL from you. Do not reach for `--idle-minutes 0` to make either
+complaint go away. It is the right answer only when the person says they want a
+view that outlives them leaving, and it is theirs to ask for, because what it
+turns off is the thing that stops their terminal being readable by whoever picks
+the device up.
+
+A person who says a card wastes the screen wants the size control in its head —
+Short / Tall / Full, remembered per session. Do not suggest they reload, and do
+not go looking for a way to make a card fit its contents: what is inside a frame
+is on an origin the page cannot measure, and that is deliberate.
+
 ## Frontend overrides are trusted by content, not by path
 
-`afui frontend` manages Provider-owned interface replacements. Trust is pinned
+`afui frontend` manages interface replacements — Provider pages, and AFUI's own
+session list under `afui frontend init afui sessions`. That page is held to the
+same contract as any other, with one thing worth saying out loud when a person
+asks for it: its URL carries the credential for every session on the machine, so
+an override is markup and CSS only and the trust gate is the whole guardrail.
+Never enable one on somebody's behalf. Trust is pinned
 to an exact content fingerprint: workspace code stays ignored until someone
 enables that fingerprint, and any later edit revokes it until it is enabled
 again.
@@ -127,12 +225,36 @@ directory is not replaced, so a Provider's remaining templates, partials and
 language packs keep serving. Replacing a whole tree instead is how a one-page
 customisation silently deletes localisation.
 
+`assets/app-icon.svg` is part of that same overlay. It identifies the Provider
+frontend being shown, so it follows the page into its browser favicon and Dock
+icon. Do not replace it with an AFUI-wide icon: only AFUI's own `afui sessions`
+frontend uses the AFUI icon. If you customise the asset, its bytes participate
+in the same trusted fingerprint as every other frontend file.
+
 If a Provider says a frontend will not load, it did not fall back — nothing you
 are looking at is the override, and nothing is the Provider's page either. Fix
 the frontend, or set `AFUI_SAFE_MODE=1` to get the Provider's own interface
 back. A frontend that is merely untrusted is silent by design; read the
 Provider's readiness event for a frontend id to tell "mine is running" from
 "mine is inert".
+
+## Delivery follows the environment, not each command
+
+A session reaches a person as a `window`, a `link`, or a `session` — chosen
+once per process by `AFUI_DELIVERY`, overridable per invocation by a
+Provider's own `--mode` flag if it has one. Do not assume a step will pop a
+window: a terminal that is itself being shown to someone away from the
+machine sets `AFUI_DELIVERY=session` for whatever it spawns, so a step that
+would otherwise open a window quietly registers instead and waits. If a step
+you expected to open a window seems to hang, check that process's environment
+for `AFUI_DELIVERY` before assuming something broke, and use `afui session
+list` to see what is actually waiting.
+
+A `link` URL is the one delivery that reaches another device with no tunnel in
+the way — treat it exactly like the `session serve` URL above and hand it only
+to the person it is for. Not every Provider offers `link`; one that does not
+simply does not list it as a `--mode` value, which is a capability being
+absent rather than broken.
 
 ## Recovery
 
@@ -141,9 +263,9 @@ Provider's readiness event for a frontend id to tell "mine is running" from
   adding more flags makes it less likely to match, not more.
 - `cli_unknown_argument` and `cli_unknown_command` are spelling errors against a
   closed registry — the flag does not exist, so no amount of retrying invents it.
-- A window that never opens is an environment problem (no Chromium-family
-  browser, no display), not an argument problem. Report it rather than falling
-  back to printing a URL the person never asked for.
+- A window that never opens is an environment problem (no supported desktop
+  runtime or no display), not an argument problem. Report it rather than
+  falling back to printing a URL the person never asked for.
 
 ## Setup Checklist
 

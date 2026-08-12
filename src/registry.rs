@@ -39,8 +39,45 @@ pub struct UiSessionEntry {
     /// never decides anything from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
+    /// Whether a person is being waited on, as opposed to a session someone
+    /// merely watches.
+    ///
+    /// True automatically for every session whose completion type is not
+    /// `()` — handing a value back is, by definition, waiting on whoever
+    /// supplies it — and true as well for a `T = ()` session that called
+    /// `UiSession::awaiting_person` because it is unmistakably waited on even
+    /// though it has nothing to hand back. A Provider that forgets to declare
+    /// the second case only under-reports; the automatic half can never claim
+    /// a watched session is waiting on someone, so the direction this can get
+    /// wrong is the safe one.
+    pub waits_for_decision: bool,
     /// The session URL, credential included. `_secret` because it is one.
     pub access_url_secret: String,
+    /// When this session announced itself.
+    ///
+    /// Load-bearing: it is what puts a session where a person expects to find
+    /// it. Somebody opens a terminal, works in it, and asks for a second
+    /// interface — that one belongs *after* the terminal, because that is when
+    /// it happened. Sorting by name instead would file it wherever its
+    /// Provider's name falls in the alphabet, which is a fact about this kit's
+    /// naming and not about anything the person did.
+    ///
+    /// **Not stored, and deliberately not.** It is the entry file's own
+    /// modification time, read when the entry is read. A Provider announces by
+    /// writing that file exactly once, so the file already knows when — and
+    /// taking the answer from the file rather than from a field means every
+    /// announcement carries one, including announcements written by a build of
+    /// this crate that predates the ordering entirely. A stored field would
+    /// have made a Provider pinned to an older version sort first forever, and
+    /// Providers pin versions.
+    ///
+    /// Wall clock rather than monotonic, because the readers are other
+    /// processes and there is nothing for a monotonic instant to be relative
+    /// to. A clock that jumps, or a filesystem too coarse to tell two
+    /// announcements apart, falls back on the stable key below, so the order
+    /// stays total either way.
+    #[serde(skip)]
+    pub announced_at_epoch_ms: u64,
     /// The process the session belongs to.
     ///
     /// Load-bearing, not a label. For a session AFUI serves it is also the
@@ -78,6 +115,7 @@ impl Drop for RegistryHandle {
 pub(crate) fn publish(
     metadata: &UiSessionMetadata,
     subject: Option<String>,
+    waits_for_decision: bool,
     access_url: &str,
 ) -> RegistryHandle {
     if opted_out() {
@@ -85,7 +123,7 @@ pub(crate) fn publish(
     }
     // Announcing is a convenience, never a precondition. A session that cannot
     // write here still works; it is only invisible to `afui session list`.
-    let path = write_entry(metadata, subject, access_url).ok();
+    let path = write_entry(metadata, subject, waits_for_decision, access_url).ok();
     RegistryHandle { path }
 }
 
@@ -100,19 +138,26 @@ pub(crate) fn publish(
 pub(crate) fn publish_strictly(
     metadata: &UiSessionMetadata,
     subject: Option<String>,
+    waits_for_decision: bool,
     access_url: &str,
 ) -> Result<RegistryHandle> {
     if opted_out() {
         return Ok(RegistryHandle { path: None });
     }
     Ok(RegistryHandle {
-        path: Some(write_entry(metadata, subject, access_url)?),
+        path: Some(write_entry(
+            metadata,
+            subject,
+            waits_for_decision,
+            access_url,
+        )?),
     })
 }
 
 fn write_entry(
     metadata: &UiSessionMetadata,
     subject: Option<String>,
+    waits_for_decision: bool,
     access_url: &str,
 ) -> Result<PathBuf> {
     let directory = sessions_directory()?;
@@ -123,7 +168,11 @@ fn write_entry(
         provider_id: metadata.provider_id.clone(),
         ui_kind: metadata.ui_kind.clone(),
         subject,
+        waits_for_decision,
         access_url_secret: access_url.to_owned(),
+        // Read back from the file this call is about to write; nothing is
+        // stamped into the entry itself.
+        announced_at_epoch_ms: 0,
         owner_pid: std::process::id(),
     };
     let path = directory.join(format!("{}.json", entry.session_id));
@@ -183,12 +232,23 @@ pub fn list_sessions() -> Result<Vec<UiSessionEntry>> {
             }
         }
     }
+    // The order things happened, which is the order a person remembers them
+    // in. The identity tuple only breaks ties, so two sessions announced in the
+    // same millisecond still come back in one stable order rather than
+    // swapping places between polls.
     entries.sort_by(|left, right| {
-        (&left.provider_id, &left.ui_kind, &left.session_id).cmp(&(
-            &right.provider_id,
-            &right.ui_kind,
-            &right.session_id,
-        ))
+        (
+            left.announced_at_epoch_ms,
+            &left.provider_id,
+            &left.ui_kind,
+            &left.session_id,
+        )
+            .cmp(&(
+                right.announced_at_epoch_ms,
+                &right.provider_id,
+                &right.ui_kind,
+                &right.session_id,
+            ))
     });
     Ok(entries)
 }
@@ -201,7 +261,22 @@ pub fn find_session(session_id: &str) -> Result<Option<UiSessionEntry>> {
 }
 
 fn read_entry(path: &Path) -> Option<UiSessionEntry> {
-    serde_json::from_slice(&fs::read(path).ok()?).ok()
+    let mut entry: UiSessionEntry = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    entry.announced_at_epoch_ms = announced_at(path);
+    Some(entry)
+}
+
+/// When this entry was written, which is when its session announced itself.
+///
+/// A filesystem that cannot say sorts the entry first rather than costing it
+/// its listing: being in an odd place beats not being there.
+fn announced_at(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 pub fn sessions_directory() -> Result<PathBuf> {
@@ -345,7 +420,7 @@ mod tests {
         let metadata = metadata("inspector", "table_inspect");
         let (host, url) = listening();
 
-        let handle = publish(&metadata, Some("public.orders".to_owned()), &url);
+        let handle = publish(&metadata, Some("public.orders".to_owned()), true, &url);
         // Assert on this session rather than on the directory as a whole:
         // every session in this binary announces itself, so the registry is
         // shared and a total count would be a race, not a fact.
@@ -355,6 +430,7 @@ mod tests {
         assert_eq!(mine.subject.as_deref(), Some("public.orders"));
         assert_eq!(mine.access_url_secret, url);
         assert_eq!(mine.owner_pid, std::process::id());
+        assert!(mine.waits_for_decision);
 
         drop(handle);
         assert!(
@@ -374,7 +450,7 @@ mod tests {
         let (host, url) = listening();
         // Leak the handle so nothing cleans up on drop: this is a Provider
         // that died, leaving its file behind with nothing on its port.
-        std::mem::forget(publish(&metadata, None, &url));
+        std::mem::forget(publish(&metadata, None, false, &url));
         assert!(
             find_session(metadata.session_id.as_str())
                 .unwrap()
@@ -405,7 +481,7 @@ mod tests {
         unsafe { std::env::set_var(NO_REGISTRY_ENV, "1") };
         let (host, url) = listening();
         let metadata = metadata("reviewer", "case_review");
-        let handle = publish(&metadata, None, &url);
+        let handle = publish(&metadata, None, false, &url);
         let found = find_session(metadata.session_id.as_str()).unwrap();
         drop(host);
         unsafe { std::env::remove_var(NO_REGISTRY_ENV) };
@@ -432,7 +508,9 @@ mod tests {
             provider_id: "remote".to_owned(),
             ui_kind: "takeover".to_owned(),
             subject: None,
+            waits_for_decision: false,
             access_url_secret: format!("{url}?handoff_secret=deadbeef"),
+            announced_at_epoch_ms: 0,
             owner_pid: departed_pid(),
         };
         let path = directory.join(format!("{}.json", entry.session_id));
@@ -466,7 +544,7 @@ mod tests {
         let _root = isolated_root();
         let (host, url) = listening();
         let published = metadata("console", "terminal");
-        let handle = publish(&published, None, &url);
+        let handle = publish(&published, None, false, &url);
         let directory = sessions_directory().unwrap();
         // The URL carries a credential, so neither the file nor the directory
         // that lists it may be readable by anyone else.
