@@ -9,57 +9,29 @@
  * The column widens on a large screen rather than splitting: a second column
  * would have to decide what goes in it. */
 
+/* The palette, the reset, the focus ring and the type scale come from
+ * `__afui/base.css`, which every session serves and this page links first.
+ * What remains here is this page's own: three surfaces the baseline has no
+ * opinion about, and the arrangement above. */
 :root {
-  color-scheme: light dark;
-  --ink: #1c2329;
-  --dim: #626d77;
-  --line: #d8dde2;
-  --panel: #ffffff;
-  --panel-strong: #f3f5f7;
-  --page: #f6f7f8;
   --button: #ffffff;
   --button-hover: #edf1f3;
   --frame: #ffffff;
-  --accent: #08745f;
-  --focus: #1769d2;
-  --warning-ink: #775000;
-  --warning-bg: #fff6d9;
-  --danger-ink: #a33a47;
-  --danger-bg: #fff0f2;
-  --shadow: 0 8px 24px rgba(26, 34, 41, .08);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --ink: #e8ebf2;
-    --dim: #99a2b5;
-    --line: #2b3240;
-    --panel: #141821;
-    --panel-strong: #171c26;
-    --page: #0b0d12;
     --button: #1d2330;
     --button-hover: #252d3a;
     --frame: #0b0d12;
-    --accent: #71e6c2;
-    --focus: #8ab4ff;
-    --warning-ink: #f1cb75;
-    --warning-bg: #241f14;
-    --danger-ink: #e9a0a8;
-    --danger-bg: #21161a;
-    --shadow: none;
   }
 }
 
-* {
-  box-sizing: border-box;
-}
-
+/* This page places its own insets: the bar is sticky and the deck is
+ * edge-to-edge, so the notch is cleared inside them rather than by moving the
+ * whole page down and leaving cards to scroll past above the bar. */
 body {
-  margin: 0;
-  background: var(--page);
-  color: var(--ink);
-  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-  -webkit-text-size-adjust: 100%;
+  padding: 0;
 }
 
 .bar {
@@ -70,11 +42,11 @@ body {
   justify-content: space-between;
   padding: 10px 14px;
   padding-top: max(10px, env(safe-area-inset-top));
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--afui-line);
   position: sticky;
   top: 0;
   z-index: 2;
-  background: var(--page);
+  background: var(--afui-page);
 }
 
 .bar h1 {
@@ -86,12 +58,12 @@ body {
 
 .state {
   margin: 0;
-  color: var(--dim);
+  color: var(--afui-muted);
   font-size: 13px;
 }
 
 .state.stale {
-  color: var(--warning-ink);
+  color: var(--afui-warn-ink);
 }
 
 .deck {
@@ -120,7 +92,7 @@ body {
   font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--dim);
+  color: var(--afui-muted);
 }
 
 .slot,
@@ -133,20 +105,16 @@ body {
 .empty {
   margin: 0;
   padding: 18px 14px;
-  border: 1px dashed var(--line);
+  border: 1px dashed var(--afui-line);
   border-radius: 10px;
-  color: var(--dim);
+  color: var(--afui-muted);
   font-size: 13px;
-}
-
-.empty[hidden] {
-  display: none;
 }
 
 code {
   font-family: "SFMono-Regular", "Cascadia Code", "Liberation Mono", monospace;
   font-size: 12px;
-  color: var(--accent);
+  color: var(--afui-accent);
 }
 
 /* A warning, or the thing it warned about.
@@ -162,19 +130,15 @@ code {
   justify-content: space-between;
   margin: 0;
   padding: 10px 14px;
-  border-bottom: 1px solid var(--line);
-  background: var(--warning-bg);
-  color: var(--warning-ink);
+  border-bottom: 1px solid var(--afui-line);
+  background: var(--afui-warn-bg);
+  color: var(--afui-warn-ink);
   font-size: 13px;
 }
 
-.notice[hidden] {
-  display: none;
-}
-
 .notice[data-state="dead"] {
-  background: var(--danger-bg);
-  color: var(--danger-ink);
+  background: var(--afui-danger-bg);
+  color: var(--afui-danger-ink);
 }
 
 .card {
@@ -182,10 +146,10 @@ code {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  border: 1px solid var(--line);
+  border: 1px solid var(--afui-line);
   border-radius: 10px;
-  background: var(--panel);
-  box-shadow: var(--shadow);
+  background: var(--afui-panel);
+  box-shadow: var(--afui-shadow);
   overflow: visible;
 }
 
@@ -201,8 +165,8 @@ code {
   justify-content: space-between;
   gap: 10px;
   padding: 8px 10px;
-  border-bottom: 1px solid var(--line);
-  background: var(--panel-strong);
+  border-bottom: 1px solid var(--afui-line);
+  background: var(--afui-panel-strong);
   border-radius: 10px 10px 0 0;
 }
 
@@ -221,7 +185,7 @@ code {
 
 .kind,
 .subject {
-  color: var(--dim);
+  color: var(--afui-muted);
   font-size: 12px;
   white-space: nowrap;
   overflow: hidden;
@@ -240,10 +204,27 @@ code {
   flex: none;
 }
 
+/* Two voices, kept apart. The first is the interface inside the frame saying
+ * how what it is showing is going; the second is this page's own answer to a
+ * control somebody just pressed. They are about different things, so they get
+ * different slots rather than one that overwrites. */
+.card-page-status,
 .card-action-status {
   align-self: center;
-  color: var(--dim);
+  color: var(--afui-muted);
   font-size: 12px;
+}
+
+.card-page-status {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.card-page-status:empty {
+  display: none;
 }
 
 .card-action-status:empty {
@@ -251,24 +232,20 @@ code {
 }
 
 .card-action-status[data-state="pending"] {
-  color: var(--warning-ink);
+  color: var(--afui-warn-ink);
 }
 
 .card-action-status[data-state="error"] {
-  color: var(--danger-ink);
-}
-
-.acts[hidden] {
-  display: none;
+  color: var(--afui-danger-ink);
 }
 
 button,
 .act-open,
 .act-menu > summary {
-  border: 1px solid var(--line);
+  border: 1px solid var(--afui-line);
   border-radius: 7px;
   background: var(--button);
-  color: var(--ink);
+  color: var(--afui-ink);
   font: inherit;
   font-size: 12px;
   /* Compact with a mouse; the coarse-pointer rule below expands this to a
@@ -281,7 +258,7 @@ button,
 button:hover,
 .act-open:hover,
 .act-menu > summary:hover {
-  border-color: var(--accent);
+  border-color: var(--afui-accent);
   background: var(--button-hover);
 }
 
@@ -291,13 +268,37 @@ button:active,
   transform: translateY(1px);
 }
 
-:where(button, .act-open, summary):focus-visible {
-  outline: 3px solid var(--focus);
-  outline-offset: 2px;
+[data-act="end"] {
+  color: var(--afui-danger-ink);
 }
 
-[data-act="end"] {
-  color: var(--danger-ink);
+/* A control that is a glyph rather than a word: square, centred, and no
+ * narrower than it is tall, so a row of them reads as a row. The word is still
+ * there — it is the control's name, which is what a pointer resting on it and
+ * anything reading the page out loud both get. */
+.act-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  padding: 4px 6px;
+  font-size: 15px;
+  line-height: 1;
+}
+
+/* The way out of wherever the interface inside this card has gone. It leads
+ * the bar, ahead of the title, because that is the corner every window a
+ * person has used keeps for it — and it carries no border of its own: it acts
+ * on what is inside the frame, not on the card the other controls act on. */
+.act-nav {
+  flex: none;
+  border-color: transparent;
+  background: none;
+}
+
+.act-nav:hover {
+  border-color: var(--afui-line);
+  background: var(--button-hover);
 }
 
 button:disabled {
@@ -324,14 +325,8 @@ button:disabled {
   display: none;
 }
 
-.act-menu > summary::after {
-  content: " ⌄";
-  margin-left: 4px;
-  color: var(--dim);
-}
-
 .act-menu[open] > summary {
-  border-color: var(--accent);
+  border-color: var(--afui-accent);
 }
 
 .act-menu-items {
@@ -343,10 +338,10 @@ button:disabled {
   gap: 4px;
   min-width: 150px;
   padding: 6px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--afui-line);
   border-radius: 9px;
-  background: var(--panel);
-  box-shadow: var(--shadow);
+  background: var(--afui-panel);
+  box-shadow: var(--afui-shadow);
 }
 
 .act-menu-items button {
@@ -360,19 +355,15 @@ button:disabled {
 .card-notice {
   margin: 0;
   padding: 9px 10px;
-  border-bottom: 1px solid var(--line);
-  background: var(--warning-bg);
-  color: var(--warning-ink);
+  border-bottom: 1px solid var(--afui-line);
+  background: var(--afui-warn-bg);
+  color: var(--afui-warn-ink);
   font-size: 13px;
 }
 
 .card-notice[data-state="dead"] {
-  background: var(--danger-bg);
-  color: var(--danger-ink);
-}
-
-.card-notice[hidden] {
-  display: none;
+  background: var(--afui-danger-bg);
+  color: var(--afui-danger-ink);
 }
 
 /* A link, not a button, because it is one — which is also what lets a person
@@ -383,16 +374,18 @@ button:disabled {
   text-decoration: none;
 }
 
-.act-open[hidden] {
-  display: none;
-}
-
 .frame {
   flex: 1;
   min-height: 0;
   background: var(--frame);
   overflow: hidden;
   border-radius: 0 0 10px 10px;
+}
+
+/* Folded: the one control that acts on what is inside the frame goes with it.
+ * Everything else in this head acts on the card, and the card is still here. */
+.card[data-folded="true"] .act-nav {
+  display: none;
 }
 
 .card[data-folded="true"] .frame {
@@ -451,14 +444,13 @@ iframe {
  * tracks the visual viewport itself. The page may scroll, which is preferable
  * to resizing a live interface down to nothing. */
 @media (max-width: 560px) {
+  /* The head stays one row here, which is the width it matters at: with its
+     controls drawn as glyphs it fits, and giving a phone's scarcest dimension
+     its own line for two icons would be spending it on nothing. Wrapping is
+     left in as the way out for the one state that puts a word back in the bar.
+   */
   .card-head {
-    align-items: flex-start;
     flex-wrap: wrap;
-  }
-
-  .acts {
-    flex: 1 1 100%;
-    justify-content: flex-start;
   }
 
   .card[data-size="tall"] .frame {
@@ -485,6 +477,12 @@ iframe {
   button,
   .act-open {
     min-height: 44px;
+  }
+
+  /* A glyph is a smaller thing to hit than a word, so on a thumb it gets the
+     same square the words get in height. */
+  .act-icon {
+    min-width: 44px;
   }
 }
 

@@ -22,7 +22,7 @@ use axum::response::IntoResponse;
 
 use super::attention::Phase;
 use super::{Addressing, ServeState, not_found};
-use crate::{APP_ICON_PATH, OriginDecision, UiSecurityPolicy};
+use crate::{APP_ICON_PATH, BASE_STYLE_PATH, OriginDecision, UiSecurityPolicy};
 
 /// The most a page may say about who it is watching.
 ///
@@ -32,7 +32,8 @@ const MAX_ATTENTION_BODY_BYTES: usize = 64 * 1024;
 
 pub(super) const SHELL_JS: &str = include_str!("assets/shell.js");
 
-/// The page loads its own two files, talks to its own listener, and frames
+/// The page loads its own files — the baseline stylesheet, its own stylesheet
+/// and its own script, all from here — talks to its own listener, and frames
 /// Provider UIs. `frame-src` is what admits those frames; nothing else is
 /// allowed to load, and nothing may frame this page.
 ///
@@ -77,6 +78,13 @@ pub(super) async fn respond(
             "image/svg+xml",
             state.shell.app_icon().as_svg().as_bytes().to_vec(),
         ),
+        // The same floor, at the same reserved name, as the sessions this page
+        // frames. A card and the page inside it disagreeing about what a focus
+        // ring or a warning looks like is the one place that difference is
+        // visible side by side.
+        (&Method::GET, rest) if rest.strip_prefix('/') == Some(BASE_STYLE_PATH) => {
+            asset("text/css; charset=utf-8", crate::page_style::BASE_STYLE)
+        }
         (&Method::GET, "/sessions") => sessions(state, shell_authority).await,
         // A replacement page's own static files. Every path 404s when there is
         // no replacement, so the route is answered without asking whether one

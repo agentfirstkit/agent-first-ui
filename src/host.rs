@@ -12,37 +12,18 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use tower::ServiceExt;
 
-use crate::channel::{UiSessionChannelCloser, UiSessionChannelMount};
-use crate::{
-    APP_ICON_PATH, Error, OriginDecision, Result, UiAccessToken, UiAppIcon, UiSecurityPolicy,
+use crate::UiExpiry;
+use crate::reserved::{
+    APP_ICON_PATH, BASE_STYLE_PATH, RESERVED_PATH_PREFIX, SESSION_BLOB_PATH_PREFIX,
+    SESSION_END_PATH, SESSION_RUNTIME_PATH,
 };
-
-/// The prefix every reserved AFUI route lives under, on every session's own
-/// credential — checked before the Provider's own router is ever reached, so
-/// nothing a Provider routes there is reachable, shadowed or not. A Provider
-/// must never claim any name under it: today those routes end a session and
-/// serve its Provider-owned application icon. Reserving the whole prefix
-/// rather than only today's paths is what lets AFUI add another one later
-/// without it silently colliding with something a Provider already routed
-/// there.
-const RESERVED_PATH_PREFIX: &str = "__afui/";
-
-/// Reserved for every session, under its own credential, on every delivery —
-/// `window`, `link`, and `session` alike, because they all share this one
-/// dispatch. `POST <access_url>SESSION_END_PATH` ends the session: whoever created it
-/// gets `Outcome::Closed`, the same as if a person had closed its window.
-///
-/// Written without a leading slash because every caller appends it to a
-/// credential that already ends in one —
-/// `format!("{access_url}{SESSION_END_PATH}")`.
-pub const SESSION_END_PATH: &str = "__afui/end";
-
-/// The optional full-duplex channel attached to a session.
-///
-/// A surface opens a WebSocket at `format!("{access_url}{SESSION_CHANNEL_PATH}")`.
-/// The session credential and same-origin checks are applied before the
-/// upgrade, exactly as they are for every Provider route.
-pub const SESSION_CHANNEL_PATH: &str = "__afui/channel";
+use crate::runtime::{
+    DEFAULT_UI_RUNTIME_CALL_CAPACITY, DEFAULT_UI_RUNTIME_EVENT_CAPACITY, UiSessionRuntime,
+    UiSessionRuntimeCloser, UiSessionRuntimeMount,
+};
+use crate::{
+    Error, OriginDecision, Result, UiAccessToken, UiAppIcon, UiBlobPolicy, UiSecurityPolicy,
+};
 
 /// Many UI sessions behind one entry point, with no listener of its own.
 ///
@@ -121,8 +102,13 @@ struct MountedSession {
     /// arrives before that call is not lost, and a repeat while nobody has
     /// consumed the first one is not a second, redundant permit either.
     close: Arc<Notify>,
-    channel_endpoint: Option<crate::channel::UiSessionChannelEndpoint>,
-    channel_closer: Option<UiSessionChannelCloser>,
+    runtime_endpoint: Option<crate::runtime::UiSessionRuntimeEndpoint>,
+    runtime_closer: Option<UiSessionRuntimeCloser>,
+    /// Set when this credential's lifetime belongs to the host process rather
+    /// than to a session waiting on an outcome. `__afui/end` then means "this
+    /// URL is finished with", so it revokes the credential instead of waking a
+    /// waiter that does not exist.
+    external: bool,
 }
 
 /// Removes a session from its host when the session ends.
@@ -134,10 +120,27 @@ pub(crate) struct SessionRegistration {
     secret: String,
 }
 
+pub(crate) struct RegisteredSession {
+    pub(crate) access_url: String,
+    pub(crate) registration: SessionRegistration,
+    pub(crate) close: Arc<Notify>,
+    pub(crate) runtime_closer: Option<UiSessionRuntimeCloser>,
+}
+
 impl Drop for SessionRegistration {
     fn drop(&mut self) {
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.remove(&self.secret);
+        if let Ok(mut sessions) = self.sessions.lock()
+            && let Some(mounted) = sessions.remove(&self.secret)
+        {
+            mounted.close_runtime();
+        }
+    }
+}
+
+impl MountedSession {
+    fn close_runtime(&self) {
+        if let Some(runtime) = &self.runtime_closer {
+            runtime.close();
         }
     }
 }
@@ -173,6 +176,31 @@ impl UiMount {
             authority: authority.to_owned(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Serve one router under credentials this process issues and revokes
+    /// itself, rather than one per session created here.
+    ///
+    /// Everything a session gets comes with it: the 404 for a credential that
+    /// is not there, the `Host` and `Origin` checks, the response headers, the
+    /// reserved `__afui/` prefix, the Provider icon route, and `__afui/end` —
+    /// which for these credentials revokes the one it arrived on, since there
+    /// is no session waiting on an outcome to wake.
+    #[must_use]
+    pub fn external_access(
+        &self,
+        router: Router,
+        policy: UiSecurityPolicy,
+        app_icon: Option<UiAppIcon>,
+    ) -> UiMountAccess {
+        UiMountAccess {
+            base_url: self.base_url.clone(),
+            authority: self.authority.clone(),
+            sessions: Arc::clone(&self.sessions),
+            policy,
+            app_icon,
+            router,
+        }
     }
 
     /// The routes that serve every session on this mount.
@@ -223,22 +251,17 @@ impl UiMount {
         token: &UiAccessToken,
         policy: UiSecurityPolicy,
         app_icon: Option<UiAppIcon>,
-        channel: Option<UiSessionChannelMount>,
+        runtime: Option<UiSessionRuntimeMount>,
         router: Router,
-    ) -> Result<(
-        String,
-        SessionRegistration,
-        Arc<Notify>,
-        Option<UiSessionChannelCloser>,
-    )> {
+    ) -> Result<RegisteredSession> {
         let secret = token.secret().expose_secret().to_owned();
         // Pin the authority the URL actually names, so a rebound DNS name
         // pointing at this socket is refused without the Provider opting in.
         let policy = policy.with_expected_host(self.authority.clone());
         let access_url = format!("{}{secret}/", self.base_url);
         let close = Arc::new(Notify::new());
-        let (channel_endpoint, channel_closer) = match channel {
-            Some(channel) => (Some(channel.endpoint), Some(channel.closer)),
+        let (runtime_endpoint, runtime_closer) = match runtime {
+            Some(runtime) => (Some(runtime.endpoint), Some(runtime.closer)),
             None => (None, None),
         };
         let mut sessions = self
@@ -253,20 +276,284 @@ impl UiMount {
                 router,
                 app_icon,
                 close: Arc::clone(&close),
-                channel_endpoint,
-                channel_closer: channel_closer.clone(),
+                runtime_endpoint,
+                runtime_closer: runtime_closer.clone(),
+                external: false,
             },
         );
         drop(sessions);
-        Ok((
+        Ok(RegisteredSession {
             access_url,
-            SessionRegistration {
+            registration: SessionRegistration {
                 sessions: Arc::clone(&self.sessions),
                 secret,
             },
             close,
-            channel_closer,
-        ))
+            runtime_closer,
+        })
+    }
+}
+
+/// One router reached through credentials the host process issues itself.
+///
+/// The usual shape is one credential per session, minted when a Provider hands
+/// AFUI a session and dropped when that session ends. Some Providers have the
+/// other shape: a long-lived listener with a domain API of its own that hands
+/// out access to the same UI on request, and takes it away again. Reimplemented
+/// on the Provider's side, that arrives at a second copy of credential routing
+/// — and every such copy so far has lost something on the way: the `Host` and
+/// `Origin` checks, the policy headers, `__afui/end`, and the reserved prefix
+/// that stops a Provider route from colliding with a name AFUI adds later.
+///
+/// This is the same dispatch, driven from outside. What stays the Provider's is
+/// the part that is genuinely its own: *which* request deserves a credential,
+/// what its own endpoint for asking looks like, and what it does with the URL
+/// afterwards.
+///
+/// The idle expiry here is crash cleanup, not a lifetime a person sees. A
+/// process that revokes on its way out never reaches it; one that dies without
+/// revoking leaves a credential that stops working on its own.
+pub struct UiMountAccess {
+    base_url: String,
+    authority: String,
+    sessions: SessionRegistry,
+    policy: UiSecurityPolicy,
+    app_icon: Option<UiAppIcon>,
+    router: Router,
+}
+
+/// One credential this process issued, and the URL it reaches.
+#[derive(Debug, Clone)]
+pub struct UiMountCredential {
+    secret: String,
+    access_url: String,
+}
+
+impl UiMountCredential {
+    /// The credential itself. Treat it the way its name says: anyone holding
+    /// it reaches the UI until it lapses or is revoked.
+    #[must_use]
+    pub fn secret(&self) -> &str {
+        &self.secret
+    }
+
+    /// The URL a person opens, credential included.
+    #[must_use]
+    pub fn access_url_secret(&self) -> &str {
+        &self.access_url
+    }
+}
+
+impl UiMountAccess {
+    /// Mint one credential for this router.
+    ///
+    /// `expiry` is the crash-cleanup bound; [`UiExpiry::Idle`] is what a
+    /// long-lived listener wants, so a credential nobody is using stops
+    /// working without anybody having to notice.
+    pub fn issue(&self, expiry: UiExpiry) -> Result<UiMountCredential> {
+        self.issue_mounted(expiry, None)
+    }
+
+    /// Mint one credential with its own typed AFUI session runtime.
+    ///
+    /// This is the long-lived-listener counterpart of
+    /// [`crate::UiSession::with_runtime`]. The returned runtime belongs only
+    /// to the returned credential: revoking, expiring, or ending that
+    /// credential closes the runtime and wakes a Provider waiting in
+    /// [`UiSessionRuntime::recv`].
+    pub fn issue_with_runtime<Action, Reply, SurfaceState>(
+        &self,
+        expiry: UiExpiry,
+    ) -> Result<(
+        UiMountCredential,
+        UiSessionRuntime<Action, Reply, SurfaceState>,
+    )> {
+        self.issue_with_runtime_capacities(
+            expiry,
+            DEFAULT_UI_RUNTIME_CALL_CAPACITY,
+            DEFAULT_UI_RUNTIME_EVENT_CAPACITY,
+        )
+    }
+
+    /// Mint a runtime-backed credential with explicit bounded capacities.
+    pub fn issue_with_runtime_capacities<Action, Reply, SurfaceState>(
+        &self,
+        expiry: UiExpiry,
+        call_capacity: usize,
+        event_capacity: usize,
+    ) -> Result<(
+        UiMountCredential,
+        UiSessionRuntime<Action, Reply, SurfaceState>,
+    )> {
+        self.issue_runtime(expiry, call_capacity, event_capacity, None)
+    }
+
+    /// Mint one runtime-backed credential with AFUI-managed byte bodies.
+    pub fn issue_with_runtime_and_blobs<Action, Reply, SurfaceState>(
+        &self,
+        expiry: UiExpiry,
+        blob_policy: UiBlobPolicy,
+    ) -> Result<(
+        UiMountCredential,
+        UiSessionRuntime<Action, Reply, SurfaceState>,
+    )> {
+        self.issue_with_runtime_capacities_and_blobs(
+            expiry,
+            DEFAULT_UI_RUNTIME_CALL_CAPACITY,
+            DEFAULT_UI_RUNTIME_EVENT_CAPACITY,
+            blob_policy,
+        )
+    }
+
+    /// Mint a blob-enabled runtime credential with explicit bounded capacities.
+    pub fn issue_with_runtime_capacities_and_blobs<Action, Reply, SurfaceState>(
+        &self,
+        expiry: UiExpiry,
+        call_capacity: usize,
+        event_capacity: usize,
+        blob_policy: UiBlobPolicy,
+    ) -> Result<(
+        UiMountCredential,
+        UiSessionRuntime<Action, Reply, SurfaceState>,
+    )> {
+        self.issue_runtime(expiry, call_capacity, event_capacity, Some(blob_policy))
+    }
+
+    fn issue_runtime<Action, Reply, SurfaceState>(
+        &self,
+        expiry: UiExpiry,
+        call_capacity: usize,
+        event_capacity: usize,
+        blob_policy: Option<UiBlobPolicy>,
+    ) -> Result<(
+        UiMountCredential,
+        UiSessionRuntime<Action, Reply, SurfaceState>,
+    )> {
+        if self.policy.page_allows_runtime() == Some(false) {
+            return Err(Error::SessionRuntimeUnreachable);
+        }
+        let (runtime, mounted) = match blob_policy {
+            Some(policy) => {
+                UiSessionRuntime::bounded_with_blob_policy(call_capacity, event_capacity, policy)?
+            }
+            None => UiSessionRuntime::bounded(call_capacity, event_capacity)?,
+        };
+        let credential = self.issue_mounted(expiry, Some(mounted))?;
+        Ok((credential, runtime))
+    }
+
+    fn issue_mounted(
+        &self,
+        expiry: UiExpiry,
+        runtime: Option<UiSessionRuntimeMount>,
+    ) -> Result<UiMountCredential> {
+        self.reap();
+        let token = UiAccessToken::issue(expiry)?;
+        let secret = token.secret().expose_secret().to_owned();
+        let access_url = format!("{}{secret}/", self.base_url);
+        let (runtime_endpoint, runtime_closer) = match runtime {
+            Some(runtime) => (Some(runtime.endpoint), Some(runtime.closer)),
+            None => (None, None),
+        };
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Error::Io(std::io::Error::other("UI host registry is poisoned")))?;
+        sessions.insert(
+            secret.clone(),
+            MountedSession {
+                token,
+                policy: self
+                    .policy
+                    .clone()
+                    .with_expected_host(self.authority.clone()),
+                router: self.router.clone(),
+                app_icon: self.app_icon.clone(),
+                close: Arc::new(Notify::new()),
+                runtime_endpoint,
+                runtime_closer,
+                external: true,
+            },
+        );
+        Ok(UiMountCredential { secret, access_url })
+    }
+
+    /// Stop this credential from working, now.
+    ///
+    /// `true` when it was one of this mount's and is now gone. `false` for one
+    /// that was never issued here, or had already lapsed — the same answer
+    /// either way, because there is nothing a caller does differently.
+    pub fn revoke(&self, secret: &str) -> bool {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return false;
+        };
+        // Compared through the token rather than by key, so revoking is the
+        // same constant-time check as authorizing.
+        let Some(found) = sessions
+            .iter()
+            .find(|(_, mounted)| mounted.external && mounted.token.authorize(secret))
+            .map(|(key, _)| key.clone())
+        else {
+            return false;
+        };
+        if let Some(mounted) = sessions.remove(&found) {
+            mounted.close_runtime();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Slide one credential's idle deadline forward without a request having
+    /// arrived on it.
+    ///
+    /// A credential issued here idles out, and its holder is somewhere else —
+    /// so the renewal arrives over the Provider's own API rather than on the
+    /// credential itself. AFUI owns the check and the cadence
+    /// ([`crate::UiCredentialLease`]); which endpoint carries the renewal, and
+    /// what authorizes it, stays the Provider's.
+    ///
+    /// `true` when it was one of this mount's and is now good for another idle
+    /// window. `false` for one that was never issued here, or had already
+    /// lapsed — the same answer either way, as with [`Self::revoke`].
+    pub fn renew(&self, secret: &str) -> bool {
+        self.reap();
+        let Ok(sessions) = self.sessions.lock() else {
+            return false;
+        };
+        // `authorize` is the constant-time check and it slides the deadline, so
+        // renewing is the same operation a request on the credential performs.
+        sessions
+            .values()
+            .any(|mounted| mounted.external && mounted.token.authorize(secret))
+    }
+
+    /// How many of this mount's credentials are still usable.
+    #[must_use]
+    pub fn live_count(&self) -> usize {
+        self.reap();
+        self.sessions
+            .lock()
+            .map(|sessions| sessions.values().filter(|mounted| mounted.external).count())
+            .unwrap_or(0)
+    }
+
+    /// Drop every credential that has lapsed or been revoked.
+    ///
+    /// Called before issuing and counting, so a process that never revokes
+    /// still does not accumulate. Exposed because a listener that goes quiet
+    /// for a long time may want to say so explicitly.
+    pub fn reap(&self) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.retain(|_, mounted| {
+                let retain = !mounted.external
+                    || !(mounted.token.is_expired() || mounted.token.is_revoked());
+                if !retain {
+                    mounted.close_runtime();
+                }
+                retain
+            });
+        }
     }
 }
 
@@ -351,6 +638,18 @@ impl UiHost {
         &self.mount
     }
 
+    /// Serve one router under credentials this process issues and revokes
+    /// itself — see [`UiMount::external_access`].
+    #[must_use]
+    pub fn external_access(
+        &self,
+        router: Router,
+        policy: UiSecurityPolicy,
+        app_icon: Option<UiAppIcon>,
+    ) -> UiMountAccess {
+        self.mount.external_access(router, policy, app_icon)
+    }
+
     /// Stop the listener. Mounted sessions stop being reachable.
     pub async fn shutdown(&self) -> Result<()> {
         let _ignored = self.shutdown_tx.send(true);
@@ -410,7 +709,28 @@ async fn dispatch(State(sessions): State<SessionRegistry>, mut request: Request)
     // reserves later cannot already belong to a Provider that happened to
     // route there first.
     if let Some(reserved) = reserved_route(&remainder) {
+        if request.method() == Method::GET
+            && let Some(blob_id) = reserved.strip_prefix(SESSION_BLOB_PATH_PREFIX)
+        {
+            let response = mounted.runtime_endpoint.as_ref().map_or_else(
+                || StatusCode::NOT_FOUND.into_response(),
+                |runtime| runtime.blob_response(blob_id),
+            );
+            return with_headers(response, &mounted.policy);
+        }
         let response = match (request.method(), reserved) {
+            // Answered for every session on every delivery, and identical for
+            // all of them: a page links it, an override that supplied no
+            // stylesheet at all still gets it, and neither has to be served by
+            // whatever router the Provider brought.
+            (&Method::GET, BASE_STYLE_PATH) => (
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("text/css; charset=utf-8"),
+                )],
+                crate::page_style::BASE_STYLE,
+            )
+                .into_response(),
             (&Method::GET, APP_ICON_PATH) => match mounted.app_icon {
                 Some(icon) => (
                     [(
@@ -423,16 +743,29 @@ async fn dispatch(State(sessions): State<SessionRegistry>, mut request: Request)
                 None => StatusCode::NOT_FOUND.into_response(),
             },
             (&Method::POST, SESSION_END_PATH) => {
+                if mounted.external {
+                    // Nobody is waiting on an outcome here — the credential's
+                    // lifetime belongs to the host process. "Finished with
+                    // this" therefore means the URL stops working, which is
+                    // the same thing ending means everywhere else: the way in
+                    // closes.
+                    if let Ok(mut sessions) = sessions.lock()
+                        && let Some(mounted) = sessions.remove(&secret)
+                    {
+                        mounted.close_runtime();
+                    }
+                    return with_headers(StatusCode::NO_CONTENT.into_response(), &mounted.policy);
+                }
                 // `ActiveUiSession::wait` and `open_window` are the only
                 // readers of `close`, so this never manufactures an outcome
                 // on its own — it only wakes whichever of them is waiting.
-                if let Some(channel) = &mounted.channel_closer {
-                    channel.close();
+                if let Some(runtime) = &mounted.runtime_closer {
+                    runtime.close();
                 }
                 mounted.close.notify_one();
                 StatusCode::NO_CONTENT.into_response()
             }
-            (&Method::GET, SESSION_CHANNEL_PATH) => match mounted.channel_endpoint {
+            (&Method::GET, SESSION_RUNTIME_PATH) => match mounted.runtime_endpoint {
                 Some(endpoint) => {
                     rewrite_path(&mut request, "/");
                     match endpoint.router().oneshot(request).await {
@@ -473,8 +806,9 @@ fn lookup(sessions: &SessionRegistry, secret: &str) -> Option<MountedSession> {
         router: mounted.router.clone(),
         app_icon: mounted.app_icon.clone(),
         close: Arc::clone(&mounted.close),
-        channel_endpoint: mounted.channel_endpoint.clone(),
-        channel_closer: mounted.channel_closer.clone(),
+        runtime_endpoint: mounted.runtime_endpoint.clone(),
+        runtime_closer: mounted.runtime_closer.clone(),
+        external: mounted.external,
     })
 }
 

@@ -16,13 +16,12 @@
 //! show. This is §4.6 clause 1's other half: a session gives a web UI either by
 //! serving one itself, or by naming one that already exists.
 //!
-//! **What AFUI owns here is the listing, and only the listing.** The credential
-//! inside the URL belongs to whoever serves it: they minted it, they scoped it,
-//! their TTL governs it, and they are the only ones who can revoke it. The
-//! difference is structural rather than a promise in a comment —
-//! [`AnnouncedUiUpstream`] holds no [`crate::UiAccessToken`], so there is
-//! nothing for it to revoke. Withdrawing an announcement stops the session
-//! being listed; it does not and cannot stop the URL working.
+//! AFUI still owns how this session reaches a person. [`crate::UiDeliveryPlan`]
+//! opens its local window, wraps it in the same fixed-session remote page used
+//! by every `link`, or only registers it for `session`. What AFUI cannot own is
+//! the credential inside the upstream URL: whoever serves that URL minted it
+//! and is responsible for keeping it live for the announced session and
+//! revoking it when the session ends.
 //!
 //! Nothing new reaches the registry. An announced upstream writes the same
 //! [`crate::UiSessionEntry`] a served session writes, so anything reading that
@@ -74,6 +73,7 @@ pub struct UiUpstream {
 /// withdraws the listing and touches nothing else.
 pub struct AnnouncedUiUpstream {
     metadata: UiSessionMetadata,
+    subject: Option<String>,
     access_url: String,
     /// Withdraws the entry from the cross-process registry when dropped.
     _announcement: RegistryHandle,
@@ -94,11 +94,12 @@ impl UiUpstream {
     /// announcement removes the listing and leaves the URL exactly as valid as
     /// its owner says it is.
     ///
-    /// Only `http://` is accepted, with a host — the registry's liveness probe
-    /// and the `afui session serve` proxy both read this URL back on that
-    /// assumption. A fragment is refused because it is a browser-side artefact
-    /// that never reaches the server and would only mislead whoever read it
-    /// back.
+    /// `http://` and `https://` are accepted, with a host. A local window can
+    /// open either directly. Link and Session need AFUI's streaming proxy and
+    /// therefore require `http://`; the delivery plan reports that limitation
+    /// before publishing anything. A fragment is refused because it is a
+    /// browser-side artefact that never reaches the server and would only
+    /// mislead whoever read it back.
     pub fn new(
         provider_id: impl Into<String>,
         ui_kind: impl Into<String>,
@@ -143,13 +144,51 @@ impl UiUpstream {
     /// it is no outcome. `AFUI_NO_REGISTRY` is still honoured: opting out is a
     /// decision rather than a failure, so it succeeds and lists nothing.
     pub fn announce(self) -> Result<AnnouncedUiUpstream> {
+        self.announce_for_delivery(crate::UiDeliveryMode::Session)
+    }
+
+    /// Publish for one AFUI delivery.
+    ///
+    /// A registered-only delivery has no other route to the person, so its
+    /// registry write is strict. A window or direct link is already reachable;
+    /// for those, a failed convenience listing must not take the delivery away.
+    pub(crate) fn announce_for_delivery(
+        self,
+        mode: crate::UiDeliveryMode,
+    ) -> Result<AnnouncedUiUpstream> {
+        let proxyable = self.access_url.starts_with("http://");
+        if !proxyable && mode != crate::UiDeliveryMode::Window {
+            return Err(Error::UpstreamDeliveryRequiresHttp {
+                mode: mode.as_str(),
+            });
+        }
+        self.announce_with(mode == crate::UiDeliveryMode::Session, proxyable)
+    }
+
+    fn announce_with(self, strict: bool, publishable: bool) -> Result<AnnouncedUiUpstream> {
         // No signal here: an announced upstream has no `T` for the automatic
         // half of `waits_for_decision` to read and, unlike `UiSession`, no
         // builder to declare it explicitly. See docs/providers.md.
-        let announcement =
-            registry::publish_strictly(&self.metadata, self.subject, false, &self.access_url)?;
+        let announcement = if !publishable {
+            registry::unpublished()
+        } else if strict {
+            registry::publish_strictly(
+                &self.metadata,
+                self.subject.clone(),
+                false,
+                &self.access_url,
+            )?
+        } else {
+            registry::publish(
+                &self.metadata,
+                self.subject.clone(),
+                false,
+                &self.access_url,
+            )
+        };
         Ok(AnnouncedUiUpstream {
             metadata: self.metadata,
+            subject: self.subject,
             access_url: self.access_url,
             _announcement: announcement,
         })
@@ -167,10 +206,25 @@ impl AnnouncedUiUpstream {
     pub fn access_url(&self) -> &str {
         &self.access_url
     }
+
+    /// The same private entry the cross-process registry holds, for an
+    /// AFUI-owned direct Link page restricted to this one upstream.
+    pub(crate) fn remote_entry(&self) -> crate::UiSessionEntry {
+        crate::UiSessionEntry {
+            session_id: self.metadata.session_id.as_str().to_owned(),
+            provider_id: self.metadata.provider_id.clone(),
+            ui_kind: self.metadata.ui_kind.clone(),
+            subject: self.subject.clone(),
+            waits_for_decision: false,
+            access_url_secret: self.access_url.clone(),
+            announced_at_epoch_ms: 0,
+            owner_pid: std::process::id(),
+        }
+    }
 }
 
-/// Check a foreign URL is one this crate can hand back and probe, and give it
-/// the trailing-slash-free shape the rest of the crate stores.
+/// Check a foreign URL is one this crate can hand to a browser, and give it the
+/// trailing-slash-free shape the rest of the crate stores.
 ///
 /// The path matters twice over: [`crate::UiSessionEntry`] finds the authority to
 /// probe by splitting at the first `/`, and the proxy splits the same URL into a
@@ -180,7 +234,15 @@ fn normalise_upstream_url(supplied: &str) -> Result<String> {
     let invalid = || Error::InvalidUpstreamUrl {
         value: supplied.to_owned(),
     };
-    let rest = supplied.strip_prefix("http://").ok_or_else(invalid)?;
+    let (scheme, rest) = supplied
+        .strip_prefix("http://")
+        .map(|rest| ("http", rest))
+        .or_else(|| {
+            supplied
+                .strip_prefix("https://")
+                .map(|rest| ("https", rest))
+        })
+        .ok_or_else(invalid)?;
     let boundary = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, remainder) = rest.split_at(boundary);
     if authority.is_empty() || remainder.contains('#') {
@@ -192,8 +254,8 @@ fn normalise_upstream_url(supplied: &str) -> Result<String> {
     };
     let path = if path.is_empty() { "/" } else { path };
     Ok(match query {
-        Some(query) => format!("http://{authority}{path}?{query}"),
-        None => format!("http://{authority}{path}"),
+        Some(query) => format!("{scheme}://{authority}{path}?{query}"),
+        None => format!("{scheme}://{authority}{path}"),
     })
 }
 
@@ -229,11 +291,8 @@ mod tests {
     }
 
     #[test]
-    fn a_url_this_crate_could_not_probe_or_proxy_is_refused() {
+    fn a_url_a_browser_could_not_open_is_refused() {
         for supplied in [
-            // TLS is a terminator in front of the owner's listener, not
-            // something the probe or the proxy speaks.
-            "https://example.com/takeover/panel",
             "http:///takeover/panel",
             "127.0.0.1:9222/takeover/panel",
             // Never sent to a server, so storing it would only mislead.
@@ -246,7 +305,21 @@ mod tests {
     #[test]
     fn an_upstream_is_identified_the_same_way_a_served_session_is() {
         assert!(UiUpstream::new("remote", "takeover", "http://127.0.0.1:9222/p").is_ok());
+        assert!(UiUpstream::new("remote", "takeover", "https://example.test/p").is_ok());
         assert!(UiUpstream::new("Inspector", "takeover", "http://127.0.0.1:9222/p").is_err());
         assert!(UiUpstream::new("remote", "../panel", "http://127.0.0.1:9222/p").is_err());
+    }
+
+    #[test]
+    fn https_is_direct_window_only() {
+        let upstream = UiUpstream::new("remote", "takeover", "https://example.test/p").unwrap();
+        let error = match upstream.announce_for_delivery(crate::UiDeliveryMode::Session) {
+            Err(error) => error,
+            Ok(_) => panic!("Session delivery must not publish an HTTPS upstream"),
+        };
+        assert!(matches!(
+            error,
+            Error::UpstreamDeliveryRequiresHttp { mode: "session" }
+        ));
     }
 }

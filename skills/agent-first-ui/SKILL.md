@@ -1,6 +1,6 @@
 ---
 name: agent-first-ui
-description: "Hand a person a real interface mid-task — a scoped window, a short-lived credential, optional live typed values in both directions, and one terminal outcome — instead of flattening a page-shaped interaction into chat or standing up an ad-hoc web server. Trigger when a step needs a human-facing page, when embedding a UI session in a Provider, or when managing `afui frontend` overrides."
+description: "Hand a person a real interface mid-task — a scoped window, an attention-bounded remote page, one typed live runtime, and one terminal outcome — instead of flattening a page-shaped interaction into chat or standing up an ad-hoc web server. Trigger when a step needs a human-facing page, when embedding a UI session in a Provider, or when managing `afui frontend` overrides."
 allowed-tools: Bash, Read
 ---
 
@@ -11,7 +11,7 @@ like a page rather than a sentence — a set of drafts to approve, a diff to
 accept, a form whose fields validate each other, or live state with commands
 that act on it. AFUI delivers one interface to one person, may carry live typed
 values in both directions, and returns one terminal outcome. It is delivery
-infrastructure: it never interprets what is on the page or on the channel.
+infrastructure: it never interprets the Provider's domain payloads.
 
 For flag-level detail, ask the command itself: `afui frontend --help` returns
 every legal shape of the call at once. This skill covers behavior, decisions,
@@ -27,12 +27,19 @@ and recovery only.
   the command ran and failed, carrying its own domain `error.code`.
 - A session is one person, one interface, and one bounded lifetime with one
   terminal outcome. `provider_id`, `ui_kind`, and `session_id` route it back to
-  its owner. A Provider may attach a full-duplex channel for any number of
-  non-terminal values while that same session remains open.
+  its owner. A Provider may attach the AFUI runtime for retained state, typed
+  calls, progress, ordered events, and managed blobs while it remains open.
 - AFUI owns the credential, the origin checks, the isolated window, and the
   cleanup. The Provider owns the Router, the HTML, the typed API, and what
   completion *means*. Do not ask AFUI to render or validate domain data — it has
   no opinion about cases, invoices, or queries.
+- If the page already exists on another listener, `UiUpstream` makes it a
+  source for the same `UiDeliveryPlan`; it does not create a second meaning for
+  `link`. AFUI still owns the local window or outer remote page. The source
+  owner must keep its private credential live while the delivery exists and
+  revoke it afterwards.
+- An HTTPS upstream is Window-only. Link and Session require a private HTTP
+  source because the AFUI streaming proxy does not terminate upstream TLS.
 
 ## Open a window only when the interaction is page-shaped
 
@@ -42,26 +49,86 @@ itself, or watch changing state while issuing commands against it. Reaching for
 one to ask a question you could have asked in text costs the user a context
 switch and buys nothing.
 
-## A channel is transport, not a conversation model
+## Use the AFUI runtime; do not define another UI transport
 
-Use `UiSession::with_channel` when a surface and its controlling process need
-to exchange values before the terminal outcome. The Provider defines the two
-JSON types. AFUI adds the authenticated WebSocket endpoint, bounded queues,
-backpressure, size limit, lifecycle, and proxy support; it does not wrap values,
-assign request ids, match replies, or decide which direction leads.
+Use `UiSession::with_runtime` when a page and its controlling process exchange
+anything before the terminal outcome. The Provider defines typed action, reply,
+and state payloads. AFUI owns the explicit envelope, call identity, progress,
+result/error completion, cancellation, reconnect, deduplication, bounds, and
+session shutdown. The page connects only through `afui.connect()`.
 
-Do not put history policy into AFUI. It retains and replays nothing. A Provider
-frontend may show every value from the current page load, replace one live
-snapshot, or display no history at all. If something must survive reload, store
-it in Provider-owned state and rebuild from the page's own URL. If a Provider
-uses a custom CSP, allow same-origin connections with `connect-src 'self'`.
+Choose the runtime primitive by meaning:
 
-Keep both directions moving. Queues are bounded and nothing is dropped, so a
-Provider that never reads eventually cannot write either, and one that pushes
-state on a timer to a session nobody has opened stalls on that timer and then
-delivers a backlog instead of the current state. Read for as long as the
-session is open, and send the latest value from Provider-owned state rather
-than trusting the queue to hold it.
+- `publish_state` for a current snapshot. It is latest-value, never waits for a
+  viewer, and is delivered before a new or reconnecting page becomes live.
+- `UiCall` for a surface action. Reply through `progress`, `finish`, or `fail`;
+  never add a transport request id to the action or reply type.
+- `publish_event` only when each occurrence matters. AFUI assigns the sequence
+  and keeps a bounded replay window.
+- `with_runtime_and_blobs` for bytes too large or unsuitable for JSON. Declare
+  the size and media-type policy; AFUI owns URLs, safe headers, release,
+  eviction, and cleanup.
+
+For a long-lived listener using `UiMountAccess`, mint the same capability with
+`issue_with_runtime` or `issue_with_runtime_and_blobs`. The returned runtime is
+owned by that one credential and closes when the credential ends. Use the
+capacity variants only when measured bounds require them.
+
+Three delivery facts decide how the page must be written, and none of them is
+visible from a page that happens to work:
+
+- Republishing an equal state still reaches the page, so a unit-like state
+  used purely as an invalidation is a supported shape.
+- Only the newest state is guaranteed to arrive; faster publication coalesces.
+  Publish what is true, never a delta.
+- State, events, and call results are not ordered against each other. Either
+  the state carries the data and the reply only ends the wait, or the reply
+  carries the data and the state only says that something changed. Never split
+  one change across both, and make every refresh idempotent so a later one
+  wins.
+
+An opening state is optional. A page whose first screen is server-rendered
+receives no state frame and takes `live` as its only opening signal.
+
+Connection state is AFUI's word, not a domain state: bind it with
+`afui.connection(element, words)` so the baseline dresses it and the page
+keeps the wording. The handler receives `live`, `reconnecting`, and `closed`;
+`connecting` is the state a page starts in and is never delivered.
+
+Read the kernel's primitive table before hand-writing what is in it; three
+lines look cheaper than a lookup right up until the copy stops tracking what it
+copied. `afui.status(element)` is the one this keeps happening to — a status
+line is `textContent` plus `data-state`, and writing those two by hand is how a
+page ends up with its own slightly different idea of what clearing means. Use
+`afui.inFlight(elements)` for a control that is not a native form element,
+where `disabled` alone does nothing and `aria-disabled` is the whole of it.
+
+Do not draw a header inside a frame. Every page here grew the same one — the
+program's name, what the session is on, a word about how it is going — and a
+framed session shows the first two twice. Ask with `afui.frame`: `onHead(true)`
+means hide yours and send up `title` and `status` instead. Never send identity;
+that is the listener's word, and a page putting its own name in a head it does
+not own is the one thing this channel refuses.
+
+A second screen inside a page — a record opened over a list, a file over a
+tree — is a place, not a panel. Declare it with `afui.place` so the system back
+gesture, Escape, the control you drew and the navigation control of a frame
+around your page are one way out with one result. A detail view drawn without
+one is a page where back leaves the page from under the person, which on the
+width that covers the list completely is the first gesture they reach for. Keep
+drawing your own control: `onFrame` is for dropping the second one when a frame
+already offers navigation, not for having none in a window or a direct link.
+
+Do not add a Provider WebSocket, SSE endpoint, sequence field, reconnection
+flag, overflow fallback, or fetch-based RPC beside this runtime. If durable
+domain state must survive the session itself, persist it through an explicit
+typed action; retained UI state is not a database.
+
+Provider integration tests use the `test-support` feature's `RuntimeClient`.
+Give it the issued access URL and typed domain values; it owns the real
+WebSocket, AFUI envelope, request identity, and acknowledgements. Do not write
+a second protocol client in a test. A synchronous process test uses
+`BlockingRuntimeClient`; both client forms expose `call_with_progress`.
 
 ## Build the Provider page for the person, not the event
 
@@ -87,11 +154,16 @@ Use the smallest page shape that matches the task:
 - Say what is saving, stale, disconnected, expired, or complete next to the
   thing affected. Never make color the only carrier of that state.
 
-The built-in frontend is real product UI, not a debugging fallback. It must
-honor `prefers-color-scheme`, expose a visible `:focus-visible` state, work at a
-coarse-pointer touch size, reflow without horizontal page scrolling, and keep
-status changes available to assistive technology without announcing every
-keystroke. Use native HTML controls and disclosure elements before inventing
+The built-in frontend is real product UI, not a debugging fallback. Link the
+baseline stylesheet AFUI serves (`{{ afui.base_style_path }}`) before your own
+and build on top of it: both themes, the focus ring, a working `hidden`, the
+in-flight look of a disabled control and the inset that clears a phone's edges
+are already there, and a page that hand-writes its own palette instead will
+drift from every other interface on the machine without anything noticing.
+Redeclare an `--afui-*` property to disagree with a value; never fork the
+floor. Beyond it the page must still work at a coarse-pointer touch size,
+reflow without horizontal page scrolling, and keep status changes available to
+assistive technology without announcing every keystroke. Use native HTML controls and disclosure elements before inventing
 custom behavior. A replacement may change presentation; the Provider's trusted
 runtime remains the only owner of behavior and decision routing.
 
@@ -99,21 +171,21 @@ These are Provider responsibilities, not a reason to grow AFUI into a component
 library. Similar-looking pages may share principles and still keep separate CSS,
 typed documents, templates, and runtimes when their human tasks differ.
 
-## Terminal outcomes stay separate from channel traffic
+## Terminal outcomes stay separate from runtime traffic
 
 - `Completed(T)` — a decision session completed. `T` is the person's decision,
   not a suggestion to weigh against your own plan.
 - `Closed` — the session ended: a closed window, "End" pressed on a served card,
   or `afui session close`. For a decision session this means no decision; for a
   watched/live surface it is the ordinary terminal outcome. It is not a
-  transient channel disconnect and does not imply consent.
+  transient runtime reconnect and does not imply consent.
 - `Expired` — the credential ran out before they acted. Reopening is legitimate
   here, but say plainly that the first one timed out. This can only happen to a
   managed URL; a window never expires, because the window is what bounds it.
 
-Any number of channel values may precede these, and none of them completes the
-session. Never read `Closed` or `Expired` as consent. If the step needed a human
-decision before, it still does.
+Any amount of runtime traffic may precede these, and none of it completes the
+session. Never read `Closed` or `Expired` as consent. If the step needed a
+human decision before, it still does.
 
 ## Finding sessions other processes are running
 
@@ -141,10 +213,11 @@ to hand out — `open` is the sanctioned way to reach one.
 
 ## Serving sessions to a person who is not at this machine
 
-`afui session serve` is `open` for someone holding a phone: one page, every live
-session on it, each reverse-proxied so that loopback stops being the obstacle.
-It is a third delivery of the sessions that already exist, not a place to put
-new ones — nothing registers with it and nothing is asked of a Provider.
+`afui session serve` is `open` for someone holding a phone: one AFUI-owned
+remote page, every live session on it, each reverse-proxied so that loopback
+stops being the obstacle. It is a view of sessions that already exist, not a
+place to put new ones — nothing registers with it and nothing is asked of a
+Provider.
 
 It is not a remote-access transport and must not be described as one. It binds a
 port; the person supplies WireGuard, Tailscale, an SSH tunnel, or a TLS reverse
@@ -176,15 +249,24 @@ The URL it prints carries the credential for everything running on that machine.
 Give it to the person and nowhere else: not into a file, not into a commit
 message, not into a chat transcript you do not control.
 
-That URL also stops working once nobody is attending the page — fifteen minutes,
-after a five-minute warning the page shows with a button. So a person reporting
+That URL warns after fifteen minutes without attention and stops working five
+minutes later. Direct `link` delivery uses this same AFUI-owned page and the
+same policy; it is not a second kind of expiry chosen by the Provider. The
+defaults come from the global AFUI `config.json` under
+`attention.idle_timeout_s` and `attention.grace_period_s`
+(`~/Library/Application Support/afui/config.json` on macOS,
+`$XDG_CONFIG_HOME/afui/config.json` on Linux (or
+`~/.config/afui/config.json` when `XDG_CONFIG_HOME` is unset), or
+`%APPDATA%\afui\config.json` on Windows). `AFUI_CONFIG_DIR` replaces that
+file's parent directory. `--idle-minutes` and `--grace-minutes` override them
+only for one `session serve` process. So a person reporting
 "the page went blank" or "the terminal card is gone" has usually walked away, not
 hit a bug: a lapsed card comes back with *Reopen*, and a lapsed page needs a new
-`serve` URL from you. Do not reach for `--idle-minutes 0` to make either
-complaint go away. It is the right answer only when the person says they want a
-view that outlives them leaving, and it is theirs to ask for, because what it
-turns off is the thing that stops their terminal being readable by whoever picks
-the device up.
+remote URL (rerun the direct delivery or `session serve`). Do not disable
+attention expiry merely to make either complaint go away. It is the right
+answer only when the person says they want a view that outlives them leaving,
+and it is theirs to ask for, because what it turns off is the thing that stops
+their terminal being readable by whoever picks the device up.
 
 A person who says a card wastes the screen wants the size control in its head —
 Short / Tall / Full, remembered per session. Do not suggest they reload, and do
@@ -201,7 +283,9 @@ an override is markup and CSS only and the trust gate is the whole guardrail.
 Never enable one on somebody's behalf. Trust is pinned
 to an exact content fingerprint: workspace code stays ignored until someone
 enables that fingerprint, and any later edit revokes it until it is enabled
-again.
+again. A session that is already running keeps serving the bytes that were
+trusted when it started — editing a file does not change what is on screen, and
+it does not sneak past the gate either.
 
 That revocation is the guardrail, not an obstacle. After you edit an override,
 do not re-enable it to make a check pass — surface the change and let the person

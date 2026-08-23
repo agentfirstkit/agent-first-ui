@@ -413,12 +413,21 @@ mod tests {
         }
     }
 
+    /// The way out of a machine with no browser on it is a recovery action,
+    /// not part of what went wrong — so it is on `hint()`, beside the message
+    /// rather than inside it, where a caller with a hint field of its own can
+    /// print it exactly once.
     #[test]
-    fn window_binary_not_found_names_the_env_override() {
-        let message = Error::WindowBinaryNotFound.to_string();
+    fn window_binary_not_found_names_the_env_override_in_its_hint() {
+        let error = Error::WindowBinaryNotFound;
+        let hint = error.hint().unwrap_or_default();
         assert!(
-            message.contains(BROWSER_BINARY_ENV),
-            "{message} does not mention {BROWSER_BINARY_ENV}"
+            hint.contains(BROWSER_BINARY_ENV),
+            "{hint} does not mention {BROWSER_BINARY_ENV}"
+        );
+        assert!(
+            !error.to_string().contains(BROWSER_BINARY_ENV),
+            "the recovery action must not also be in the message: {error}"
         );
     }
 

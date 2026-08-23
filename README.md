@@ -14,10 +14,9 @@ the agent either flattens it into text or invents a web server — a port, a tok
 a browser tab left open, and no reliable way to know when that interaction
 ended.
 
-AFUI is that missing step, and only that step: one person, one interface, one
-bounded lifetime. A Provider may use only the terminal outcome, or also attach
-a full-duplex channel for any number of non-terminal values while the session
-is open.
+AFUI is that missing step: one person, one interface, one bounded lifetime. A
+Provider may use only the terminal outcome, or attach the typed session runtime
+for retained state, calls, progress, ordered events, and managed byte bodies.
 
 ## What AFUI owns, and what stays yours
 
@@ -28,8 +27,8 @@ brings the mechanics nobody wants to write twice:
 - secure response headers, exact-origin and exact-host checks;
 - an isolated desktop window with non-persistent web data — never your browser,
   never your cookies;
-- an optional bounded channel carrying Provider-defined JSON in both
-  directions, under the same session credential;
+- one versioned live runtime with AFUI-owned correlation, reconnect, replay,
+  cancellation, bounds, and retained latest state;
 - cleanup, and a typed outcome: `Completed(T)`, `Closed`, or `Expired`.
 
 A session carries stable `provider_id`, `ui_kind`, and `session_id`, so several
@@ -46,11 +45,11 @@ returns their answer. A window bounds its own session — someone who leaves it
 open all afternoon is still using it — so a window credential does not expire.
 It ends when a handler completes it or the person closes the window.
 
-A **managed direct URL** is for when the person is not at this machine: call
-`serve`, hand out `access_url()`, and await `wait()`. Nobody is watching that
-credential, so this is the delivery that needs an expiry, and AFUI makes you
-name one — `UiExpiry::After` for a fixed lifetime, or `UiExpiry::Idle` for one
-that slides forward while the page is actually being used.
+A **link** is for when the person is not at this machine. AFUI keeps the
+Provider session on loopback and hands out a second, AFUI-owned page that
+frames exactly that session. That page supplies the attention heartbeat,
+visible warning, grace period, proxy isolation, and public credential; the
+Provider never chooses or implements its lifetime.
 
 A **served page** is for when the person is somewhere else entirely — the agent
 is working on your laptop and you are holding a phone. `afui session serve`
@@ -58,13 +57,14 @@ puts every session running on this machine onto one page you can open from
 another device, reverse-proxying each so that `127.0.0.1` — which on a phone is
 the phone — stops being the problem.
 
-Expiry belongs to the delivery rather than the session, because the same
-interface is worth fifteen minutes as a link and worth as long as you like as a
-window.
+Remote expiry belongs to the AFUI-owned view rather than the session. A window
+is bounded by the window, a registered session is bounded by its owner process,
+and both a direct link and a shared served page use the same attention policy.
 
 `UiDeliveryPlan` collapses those three ways into one plan instead of a Provider
 writing its own `match` over `window`/`link`/`session`. Use
-`resolve(explicit_mode)?.deliver(session, router)` when one call is enough. If
+`resolve_allowing_link(explicit_mode)?.deliver(session, router)` when one call
+is enough and the Provider offers LAN exposure. If
 the caller must publish a link URL before waiting for the person, call
 `start(session, router)`, read `link_url_secret()`, then call `wait()`. `resolve`
 also reads `AFUI_DELIVERY`, so an outer unattended interface can pass
@@ -75,7 +75,7 @@ inventing its own flag for it.
 
 Sessions and ports are orthogonal. Bind a `UiHost` once and `attach` as many
 sessions as you like: each is reached by its own credential, each outcome and
-live channel stays with its owner, and ending one leaves its neighbours serving. That
+live runtime stays with its owner, and ending one leaves its neighbours serving. That
 also survives the places a session has to live — a container with one mapped
 port, a machine behind a firewall, a single tunnel.
 
@@ -104,11 +104,16 @@ entirely.
 
 Not every interface worth listing is one this crate serves. `UiUpstream` names
 one that already exists somewhere else — a third-party web client behind its
-own listener and its own credential, say — and announces it as an ordinary
-session, so nothing reading the list can tell which kind it is
-holding. What AFUI takes on there is the listing and only the listing: a
-credential it did not mint is not one it can revoke, and ending an announcement
-withdraws the entry rather than the URL.
+own listener and its own credential, say. Hand it to
+`UiDeliveryPlan::start_upstream` and the same three deliveries apply: AFUI opens
+the local window, wraps exactly that upstream in its own Link page, or only
+registers it as a Session. The source owner still has one obligation AFUI
+cannot perform remotely: keep its private credential live while the delivery
+exists and revoke it when the delivery ends.
+
+An HTTPS upstream can be opened directly as `window`. `link` and `session`
+require a private HTTP upstream because AFUI's streaming proxy deliberately
+does not terminate TLS.
 
 ## Reaching them from your phone
 
@@ -125,12 +130,33 @@ heard of above its neighbour.
 
 ### When you walk away
 
-The page is the one delivery nothing bounds. A window ends when you close it; a
-phone goes into a pocket with your terminal still on it. So the listener runs a
+A remote page is the one delivery nothing physical bounds. A window ends when
+you close it; a phone goes into a pocket with an interface still on it. So every
+AFUI-owned remote page — a direct `link` or `afui session serve` — runs the same
 clock: fifteen minutes with nobody attending, then a five-minute warning during
 which everything still works and the page offers to keep itself open, and then
-it stops. `--idle-minutes 0` turns that off; `--grace-minutes 0` removes the
-warning.
+it stops.
+
+The defaults are global AFUI settings. Put this in the platform AFUI config
+file: `~/Library/Application Support/afui/config.json` on macOS,
+`$XDG_CONFIG_HOME/afui/config.json` on Linux (or
+`~/.config/afui/config.json` when `XDG_CONFIG_HOME` is unset), or
+`%APPDATA%\afui\config.json` on Windows. `AFUI_CONFIG_DIR` replaces the parent
+`afui` directory for an isolated runtime:
+
+```json
+{
+  "attention": {
+    "idle_timeout_s": 900,
+    "grace_period_s": 300
+  }
+}
+```
+
+`idle_timeout_s: 0` disables attention expiry and `grace_period_s: 0` removes
+the warning interval. `afui session serve --idle-minutes` and
+`--grace-minutes` override the global values for that one server process; a
+direct link always uses the global AFUI policy.
 
 Attending is stated rather than guessed. The page says so while it is visible,
 naming the sessions it is showing, and traffic through a frame says so too —
@@ -147,6 +173,15 @@ again at an address it has never had before. When the page itself lapses it
 stops answering for everything, frames included, and the way back is a new
 `session serve` URL from the machine doing the work.
 
+Its own URL says that rather than going blank. A request carrying the page's
+credential is answered `410 Gone` and a page that names all three of the things
+somebody arriving at a dead link needs: the address was right, the sessions
+outlived it and are still running over there, and a new URL is one
+`session serve` away. That explanation is owed to whoever held the page and to
+nobody else — every other request to a lapsed listener is the same 404 it was
+before, because a port that volunteered *an AFUI page expired here* would be
+answering the question that 404 exists to refuse.
+
 What this bounds is how long an unattended *view* lasts, not who may open one.
 Whoever holds the page's URL can reload it and mount every live session again.
 
@@ -162,9 +197,10 @@ Two things it will not do. It is **not a transport**: it binds a port, and
 crossing anything to reach that port is WireGuard, Tailscale, an SSH tunnel, or
 a TLS reverse proxy, which already exist and are better at it. And it does not
 hand its own credential to anything it frames: each Provider UI is reached by a
-separate short-lived credential of its own, on an origin that is not the page's,
-and requests are forwarded upstream through a header allowlist that has no line
-for a `Cookie`, an `Authorization`, an `Origin`, or a `Referer`.
+separate mount credential governed by the remote attention policy, on an origin
+that is not the page's, and requests are forwarded upstream through a header
+allowlist that has no line for a `Cookie`, an `Authorization`, an `Origin`, or a
+`Referer`.
 
 Cookies still work, because a Provider that identifies a visitor by one — a VNC
 takeover panel, say — would otherwise be unproxyable. They are simply held here
@@ -218,7 +254,7 @@ Three tiers, so a Provider pays for what it uses and nothing else:
 | Feature | What it adds | What it costs |
 | --- | --- | --- |
 | *(none)* | the frontend script guard, frontend discovery, the trust gate, the per-file overlay | file reading and hashing — no server |
-| `session` *(default)* | `UiSession`, optional full-duplex channels, `UiHost`, `UiMount`, `UiWindow`, credentials, security policy, the registry, `UiUpstream`, `UiFrontend::assets_router` | axum with WebSockets, tokio, tower |
+| `session` *(default)* | `UiSession`, `UiSessionRuntime`, managed blobs, `UiHost`, `UiMount`, `UiWindow`, credentials, security policy, the registry, `UiUpstream`, `UiFrontend::assets_router` | axum with WebSockets, tokio, tower |
 | `serve` | the reverse proxy and the shell above it | a streaming HTTP client |
 
 The featureless tier exists because keeping a frontend honest is not the same
@@ -248,7 +284,19 @@ has nowhere to send anything elsewhere.
 
 Trust is content-addressed rather than path-based: workspace code stays ignored
 until you enable its exact fingerprint, and any later edit revokes that trust
-until you look again. `AFUI_SAFE_MODE=1` ignores overrides entirely.
+until you look again. The files that were trusted are read once, when the
+fingerprint is checked, and a running session serves exactly those bytes — an
+edit made afterwards reaches nothing until the next start, where it faces the
+gate again. `AFUI_SAFE_MODE=1` ignores overrides entirely.
+
+**A replacement starts from a floor, not from nothing.** Every session serves
+one AFUI-owned stylesheet that a page links and an override cannot remove: the
+palette in both themes, the focus ring, a `hidden` that actually hides, what a
+control looks like while a call is in flight, and an inset that clears the
+edges of the phone a session was opened on. It is a floor and not a design
+system — no components, no layout, no grid — so a replacement can be one
+template and no CSS at all and still open as a page that belongs here, and
+retuning it is one declaration rather than a fork.
 
 A Provider reaches all of that through `UiFrontend`, which is the delivery half
 and only that: it resolves whether a trusted override exists for a
@@ -285,18 +333,26 @@ inside a template it does supply.
 ## Live values in both directions
 
 Completion and live I/O are separate. `Outcome<T>` still says how the session
-ended exactly once. `UiSession::with_channel` optionally adds a bounded stream
-in each direction for everything that happens before then: snapshots flowing
-to a surface, commands flowing back, progress, invalidations, or any other
-Provider-defined JSON shape.
+ended exactly once. `UiSession::with_runtime` adds everything that happens
+before then without asking each Provider to design transport semantics:
 
-AFUI deliberately adds no message envelope. It does not assign request ids,
-pair commands with responses, retain history, replay turns, or call the stream
-a conversation. The Provider defines both Rust types; the frontend decides
-whether it shows every value, only the latest one, or none. Each WebSocket frame
-at the relative `SESSION_CHANNEL_PATH` is exactly one encoded Provider value.
-Queues are bounded, one message is limited to 1 MiB, and only one surface
-connection is active at a time.
+- `publish_state` replaces the retained latest value without waiting for a
+  browser; every initial connection and reconnect receives it before becoming
+  live;
+- typed calls carry actions in and return progress, result, or caller-safe
+  error through `UiCall`; request identity never enters a Provider payload;
+- `publish_event` assigns AFUI-owned sequence numbers and keeps a bounded replay
+  window for facts where every occurrence matters;
+- reconnect resends unacknowledged calls under the same identity, so the
+  Provider sees one call rather than a retry protocol of its own;
+- `with_runtime_and_blobs` lets the Provider hand over bounded bytes while AFUI
+  owns unguessable URLs, media allowlists, response headers, release, eviction,
+  and cleanup.
+
+The wire is the explicit, versioned `afui-session-v1` envelope, implemented by
+AFUI on both sides. Provider types contain only domain data. The page calls
+`afui.connect()`; it never names a WebSocket path, injects a request id, or
+implements SSE recovery.
 
 ```rust,no_run
 use agent_first_ui::UiSession;
@@ -304,29 +360,39 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum SurfaceCommand {
+enum SurfaceAction {
     Inspect { target: String },
 }
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum SurfaceUpdate {
-    Snapshot { load_percent: u8 },
+enum SurfaceReply {
     Inspection { target: String, details: String },
 }
 
+#[derive(Serialize)]
+struct SurfaceState {
+    load_percent: u8,
+}
+
 # async fn example() -> agent_first_ui::Result<()> {
-let (session, channel) = UiSession::<()>::new("inspector", "live_status")?
-    .with_channel::<SurfaceCommand, SurfaceUpdate>()?;
+let (session, runtime) = UiSession::<()>::new("inspector", "live_status")?
+    .with_runtime::<SurfaceAction, SurfaceReply, SurfaceState>()?;
+runtime.publish_state(&SurfaceState { load_percent: 42 })?;
 
 tokio::spawn(async move {
-    while let Ok(Some(command)) = channel.recv().await {
-        let SurfaceCommand::Inspect { target } = command;
-        let _ = channel.send(&SurfaceUpdate::Inspection {
-            details: format!("inspected {target}"),
-            target,
-        }).await;
+    while let Some(call) = runtime.recv().await? {
+        match call.action() {
+            SurfaceAction::Inspect { target } => {
+                let target = target.clone();
+                call.finish(&SurfaceReply::Inspection {
+                    details: format!("inspected {target}"),
+                    target,
+                }).await?;
+            }
+        }
     }
+    Ok::<(), agent_first_ui::Error>(())
 });
 
 // Deliver `session` with the Provider's Router in the ordinary way.
@@ -335,10 +401,10 @@ tokio::spawn(async move {
 # }
 ```
 
-If a Provider replaces the default CSP, its page must permit same-origin
-connections (normally `connect-src 'self'`). The channel endpoint receives the
-same credential, exact-host/origin checks, revocation, proxying, and session
-shutdown as the Provider's other routes.
+Build the page policy with `UiPagePolicy::allow_runtime()`. The runtime receives
+the same credential, exact-host/origin checks, revocation, proxying, and
+session shutdown as every AFUI-owned route. A hand-written CSP is an escape
+hatch, but AFUI cannot prove that such a string permits the runtime.
 
 ## From Rust
 

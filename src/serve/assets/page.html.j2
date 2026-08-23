@@ -1,5 +1,6 @@
 {#-
-  The page that lists what is running on this machine.
+  The AFUI-owned remote page. It may list the machine's registered sessions or
+  carry exactly one session for a direct link.
 
   Every id comes from `document.elements` and every card class from
   `document.card`, so a replacement page cannot misspell one and a page that
@@ -18,6 +19,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>{{ document.title }}</title>
   <link rel="icon" href="__afui/app-icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="__afui/base.css">
   <link rel="stylesheet" href="shell.css">
   <!-- afui:trusted-runtime -->
 </head>
@@ -45,23 +47,44 @@
 
   <template id="{{ document.elements.card }}">
     <article class="{{ document.card.root }}">
+      {#- The head of a card is a bar with three parts, in the order every
+          window a person has used puts them: one slot for getting out of where
+          you are, then what you are looking at, then what can be done to the
+          card holding it.
+
+          A control drawn as a glyph carries its label as its name rather than
+          as its face — the glyph itself is `aria-hidden`, so what is announced
+          and what a pointer rests on is the word, not the picture. A
+          replacement that prefers words drops the glyph and prints
+          `action.label`; nothing here reads the face back. -#}
       <header class="card-head">
+        {%- for action in document.actions %}{% if action.slot == 'navigation' %}
+        <button type="button" class="act-icon act-nav" {{ document.action_attribute }}="{{ action.name }}" aria-label="{{ action.label }}" title="{{ action.label }}"{% if action.hidden %} hidden{% endif %}><span aria-hidden="true">{{ action.glyph }}</span></button>
+        {%- endif %}{% endfor %}
         <div class="who">
           <strong class="{{ document.card.provider }}"></strong>
           <span class="{{ document.card.kind }}"></span>
           <span class="{{ document.card.subject }}"></span>
         </div>
+        {#- What the interface inside the frame says about itself, which is the
+            one part of this bar the frame cannot know. It sits between the
+            title and the controls, the way a window's own status always has. -#}
+        <span class="{{ document.card.page_status }}" role="status" aria-live="polite"></span>
         <div class="acts">
           <span class="{{ document.card.action_status }}" role="status" aria-live="polite"></span>
           {#- The link is a link, so a long press offers the browser's own menu. -#}
-          <a class="{{ document.card.open }}" target="_blank" rel="noopener noreferrer" hidden>{{ document.open_label }}</a>
-          {%- for action in document.actions %}{% if not action.secondary %}
+          <a class="{{ document.card.open }} act-icon" target="_blank" rel="noopener noreferrer" aria-label="{{ document.open_label }}" title="{{ document.open_label }}" hidden><span aria-hidden="true">↗</span></a>
+          {%- for action in document.actions %}{% if action.slot == 'action' %}
+          {%- if action.glyph %}
+          <button type="button" class="act-icon" {{ document.action_attribute }}="{{ action.name }}" aria-label="{{ action.label }}" title="{{ action.label }}"{% if action.hidden %} hidden{% endif %}><span aria-hidden="true">{{ action.glyph }}</span></button>
+          {%- else %}
           <button type="button" {{ document.action_attribute }}="{{ action.name }}"{% if action.hidden %} hidden{% endif %}>{{ action.label }}</button>
+          {%- endif %}
           {%- endif %}{% endfor %}
           <details class="act-menu">
-            <summary>{{ document.more_label }}</summary>
+            <summary class="act-icon" role="button" aria-label="{{ document.more_label }}" title="{{ document.more_label }}"><span aria-hidden="true">⋮</span></summary>
             <div class="act-menu-items">
-              {%- for action in document.actions %}{% if action.secondary %}
+              {%- for action in document.actions %}{% if action.slot == 'menu' %}
               <button type="button" {{ document.action_attribute }}="{{ action.name }}"{% if action.hidden %} hidden{% endif %}>{{ action.label }}</button>
               {%- endif %}{% endfor %}
             </div>

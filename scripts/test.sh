@@ -40,10 +40,13 @@ run_static() {
   # page but binds no port. Nothing else in this gate compiles it.
   run_clippy --no-default-features --features page
   run_clippy
-  # The shell and its reverse proxy are behind a feature, so the default build
-  # never compiles them. A gate that only ran the default build would let the
-  # one part of this crate that talks to a network rot.
+  # The remote shell belongs to the default session tier because direct links
+  # use it. The `serve` flag still compiles the long-running CLI branch and its
+  # process-signal shutdown path.
   run_clippy --features serve
+  # What a consumer's own test suite compiles against. A tier nothing builds is
+  # a tier that compiles by accident.
+  run_clippy --features test-support
 }
 
 run_unit() {
@@ -53,7 +56,18 @@ run_unit() {
   afdata_run --quiet cargo test --doc
   afdata_run --quiet cargo test --doc --no-default-features --features page
   afdata_run --quiet cargo test --all-targets --features serve
+  afdata_run --quiet cargo test --all-targets --features test-support
   check_guard_tier_dependencies
+  run_page_kernel
+}
+
+# The page kernel is JavaScript, and what it *does* is only checkable by
+# running it. The Rust tests beside it cover what it is — one lexical binding,
+# no markup, the reserved routes this crate answers; this covers the request-id
+# correlation, the sequence gap, the stale autosave reply and the rest, in a
+# sandbox with only as much browser as each primitive needs.
+run_page_kernel() {
+  afdata_run --quiet node tests/page_kernel.mjs
 }
 
 # The guard tier's whole point is what it does *not* pull in.
@@ -91,6 +105,13 @@ run_smoke() {
     AFUI_CONFIG_DIR="$config_root" afdata_run --quiet \
       "$ROOT_PATH/target/debug/afui" frontend init reviewer case_review \
       --frontend-id custom_review
+    # A new frontend starts as something a person can read rather than an empty
+    # directory: what replacing the stylesheet takes on, and the floor that
+    # replacing it cannot lose.
+    grep -q "__afui/base.css" \
+      .afui/frontends/reviewer/case_review/style.css
+    grep -q -- "--afui-accent" \
+      .afui/frontends/reviewer/case_review/style.css
     AFUI_CONFIG_DIR="$config_root" afdata_run --quiet \
       "$ROOT_PATH/target/debug/afui" frontend check reviewer case_review
     AFUI_CONFIG_DIR="$config_root" afdata_run --quiet \
@@ -208,11 +229,10 @@ run_serve_smoke() {
 
 # The release build, checked the way a release ships it.
 #
-# `serve` is off by default on purpose (library consumers must not pay for a
-# reverse proxy), which means a release build that forgets `--features serve`
-# still produces a working-looking afui — one whose single remote-access verb
-# answers `feature_unavailable`. Nothing else in this gate would notice, and by
-# the time the Release workflow noticed it would be after `cargo publish`.
+# `serve` is off by default because only the long-running CLI verb waits on a
+# process signal. A release build that forgets it still produces a
+# working-looking afui whose remote-access verb answers `feature_unavailable`;
+# this gate catches that before publish.
 run_release_smoke() {
   afdata_run --quiet cargo build --release --features serve --bin afui
   afdata_run --quiet ./scripts/release-smoke.sh target/release

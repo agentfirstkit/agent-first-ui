@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::addressing::frame_address;
-use super::attention::{Attention, Phase, UiIdlePolicy};
+use super::attention::{Attention, Phase, UiAttentionPolicy};
 use super::proxy::{Proxied, Upstream};
 use crate::{Result, UiAccessToken, UiExpiry, UiSessionEntry};
 
@@ -53,7 +53,7 @@ impl Mounts {
     pub(super) fn reconcile(
         &mut self,
         entries: &[UiSessionEntry],
-        idle_policy: &UiIdlePolicy,
+        attention_policy: &UiAttentionPolicy,
         shell_authority: Option<&str>,
     ) -> Result<Vec<Value>> {
         let Mounts {
@@ -92,7 +92,7 @@ impl Mounts {
                     .get(&entry.session_id)
                     .and_then(|secret| by_secret.get_mut(secret))
                     .filter(|mount| !mount.token.is_revoked() && mount.proxied.upstream == upstream)
-                    .map(|mount| mount.attention.phase(idle_policy));
+                    .map(|mount| mount.attention.phase(attention_policy));
                 match usable {
                     Some(Phase::Dead) | None => {
                         if let Some(stale) = by_session.remove(&entry.session_id)
@@ -187,7 +187,7 @@ impl Mounts {
     pub(super) fn authorize(
         &mut self,
         secret: &str,
-        idle_policy: &UiIdlePolicy,
+        attention_policy: &UiAttentionPolicy,
     ) -> Option<Arc<Proxied>> {
         let mount = self.by_secret.get_mut(secret)?;
         if !mount.token.authorize(secret) {
@@ -195,7 +195,7 @@ impl Mounts {
         }
         // Still served while the warning runs: five minutes of a broken frame
         // is not a warning, it is the outage arriving early.
-        if mount.attention.phase(idle_policy) == Phase::Dead {
+        if mount.attention.phase(attention_policy) == Phase::Dead {
             return None;
         }
         mount.attention.attend();

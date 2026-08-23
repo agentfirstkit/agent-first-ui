@@ -31,7 +31,16 @@ use serde::Serialize;
 
 use crate::frontend::UiFrontend;
 use crate::frontend_script::{inspect_rendered_page, reject_frontend_script};
+use crate::reserved::{APP_ICON_PATH, BASE_STYLE_PATH, SESSION_END_PATH};
 use crate::{Error, Result};
+
+/// The reserved template global carrying AFUI's own routes.
+///
+/// Held in the same protected position as `document`: an extension or a
+/// frontend that could shadow it could point the page's icon, channel or end
+/// route somewhere else, which is exactly the kind of decision a replaceable
+/// template does not get to make.
+const AFUI_GLOBAL: &str = "afui";
 
 /// Namespace for assembling one Provider page. Carries no state of its own —
 /// [`UiPage::builder`] is what returns something to call.
@@ -48,6 +57,8 @@ impl UiPage {
             fallback: None,
             templates: Vec::new(),
             required_elements: Vec::new(),
+            required_attribute_values: Vec::new(),
+            required_attributes: Vec::new(),
             runtime_marker: None,
             runtime: None,
             extensions: Vec::new(),
@@ -65,6 +76,8 @@ pub struct UiPageBuilder<'a> {
     fallback: Option<String>,
     templates: Vec<(String, String, Option<String>)>,
     required_elements: Vec<String>,
+    required_attribute_values: Vec<(String, Vec<String>)>,
+    required_attributes: Vec<String>,
     runtime_marker: Option<String>,
     runtime: Option<String>,
     extensions: Vec<UiPageExtension<'a>>,
@@ -210,13 +223,20 @@ impl UiPageEnvironment<'_> {
     }
 
     /// Add a trusted global value.  `document` is supplied by [`UiPage`] at
-    /// render time and cannot be shadowed by an extension.
+    /// render time, `afui` carries AFUI's own reserved routes, and neither can
+    /// be shadowed by an extension.
     pub fn add_global(&mut self, name: impl Into<String>, value: impl UiPageValue) -> Result<()> {
         let name = name.into();
         if name == "document" {
             return Err(incomplete(
                 self.frontend,
                 "a UiPage extension may not register the reserved `document` global",
+            ));
+        }
+        if name == AFUI_GLOBAL {
+            return Err(incomplete(
+                self.frontend,
+                "a UiPage extension may not register the reserved `afui` global",
             ));
         }
         self.environment.add_global(name, value);
@@ -302,6 +322,44 @@ impl<'a> UiPageBuilder<'a> {
         self
     }
 
+    /// Register every override file under `directory` that this builder does
+    /// not already name.
+    ///
+    /// A frontend may break its page into partials the Provider has never
+    /// heard of, and `{% include %}` them — that is what makes a real
+    /// restructure possible rather than a reskin. Each one still has to be
+    /// registered, or the include fails to resolve.
+    ///
+    /// Registered as override-only, so a partial that disappears between
+    /// discovery and render fails the page rather than silently resolving to
+    /// some built-in template of the same name. Templates this builder already
+    /// registered are skipped: those are the contract, and they keep their own
+    /// fallbacks.
+    ///
+    /// `suffix` is the extension a template file carries; anything else under
+    /// the directory is ignored rather than registered as a template that
+    /// would never parse.
+    pub fn override_templates_under(mut self, directory: &str, suffix: &str) -> Result<Self> {
+        let mut registered: HashSet<&str> = self
+            .templates
+            .iter()
+            .map(|(_, frontend_path, _)| frontend_path.as_str())
+            .collect();
+        if let Some(entry) = &self.entry_lookup {
+            registered.insert(entry.as_str());
+        }
+        let discovered: Vec<String> = self
+            .frontend
+            .files_under(directory)?
+            .into_iter()
+            .filter(|name| name.ends_with(suffix) && !registered.contains(name.as_str()))
+            .collect();
+        for name in discovered {
+            self = self.override_template(name);
+        }
+        Ok(self)
+    }
+
     /// Every element id the Provider's own runtime binds to. A rendered page
     /// missing one is reported by name rather than opened as a page that
     /// silently does nothing.
@@ -347,6 +405,72 @@ impl<'a> UiPageBuilder<'a> {
         }
         self.required_elements = required;
         Ok(self)
+    }
+
+    /// Every value of one attribute the Provider's own runtime binds to.
+    ///
+    /// The element check above answers "is the thing my runtime writes into
+    /// there?". This answers the other half: "does the page actually declare
+    /// the choices my runtime knows how to act on?" — a decide page whose
+    /// template dropped its refuse control opens as a question nobody can
+    /// answer, and a page that wrote `approve-all` where the runtime expects
+    /// `approve` opens with a control bound to nothing.
+    ///
+    /// Matched by the same rules as an element id and for the same reason: the
+    /// whole attribute value, not a prefix, and only on an element a browser
+    /// would actually render — a declaration inside `<template>` or a comment
+    /// is inert, and a page whose only refuse control is inert is a page with
+    /// no refuse control.
+    ///
+    /// At least one carrier per value rather than exactly one: a runtime binds
+    /// every control it finds, so a long page with an approve button at the
+    /// top and another at the bottom is a page that works.
+    ///
+    /// AFUI still does not learn what any of these mean. It checks that the
+    /// template and the runtime agree on a vocabulary; the vocabulary, and
+    /// everything each word does, remain the Provider's.
+    #[must_use]
+    pub fn requires_attribute_values(
+        mut self,
+        attribute: impl Into<String>,
+        values: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.required_attribute_values.push((
+            attribute.into(),
+            values.into_iter().map(Into::into).collect(),
+        ));
+        self
+    }
+
+    /// Every attribute the Provider's own runtime looks for, by name alone.
+    ///
+    /// The sibling of [`Self::requires_attribute_values`] for a contract whose
+    /// vocabulary is the attribute names themselves rather than one
+    /// attribute's values — a page that marks several distinct regions, each
+    /// with its own `data-*` hook. Same discipline: an active element only, so
+    /// a hook that survives in a comment or inside `<template>` does not count
+    /// as one a runtime can find.
+    #[must_use]
+    pub fn requires_attributes(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.required_attributes
+            .extend(names.into_iter().map(Into::into));
+        self
+    }
+
+    /// The declarations a generated decision runtime binds, read back as the
+    /// page's contract.
+    ///
+    /// One list rather than two: a Provider that adds a decision to its
+    /// runtime cannot forget to add it here, and a page that declares one the
+    /// runtime never learned is caught before a window opens.
+    #[must_use]
+    pub fn requires_decisions(self, runtime: &crate::UiDecisionRuntime) -> Self {
+        let attribute = runtime.attribute().to_owned();
+        let values: Vec<String> = runtime.declarations().map(str::to_owned).collect();
+        self.requires_attribute_values(attribute, values)
     }
 
     /// Where the rendered page makes room for the Provider's runtime. Must
@@ -458,6 +582,11 @@ impl<'a> UiPageBuilder<'a> {
         environment.set_undefined_behavior(UndefinedBehavior::SemiStrict);
         environment.set_auto_escape_callback(|_| AutoEscape::Html);
         environment.remove_filter("safe");
+        // Registered after the extensions rather than before, so this wins
+        // outright even if a future registrar stopped refusing the name. Every
+        // path is relative to the session root the page was served from, which
+        // is what makes them resolve under the session's own credential.
+        environment.add_global(AFUI_GLOBAL, afui_paths());
 
         // 4: register every template, then render the entry.
         for (name, source) in sources {
@@ -508,18 +637,45 @@ impl<'a> UiPageBuilder<'a> {
             ));
         }
 
-        // 7: every element the Provider's own runtime binds to, by exact id
-        // — `id="tree"` matches, `id="tree-empty"` does not.
+        // 7: every hook the Provider's own runtime binds to — elements by
+        // exact id (`id="tree"` matches, `id="tree-empty"` does not),
+        // declarations by whole attribute value, and attribute names on their
+        // own. Same matching discipline for all three: an active element, never
+        // one inside a `<template>` or a comment.
+        //
+        // Collected rather than returned at the first one, because the person
+        // reading this is writing a page against a contract they cannot see
+        // from here. Stopping at the first miss turns "this page is missing
+        // seven hooks" into seven renders that each name one — and the fix for
+        // all seven is the same sitting.
+        let mut missing = Vec::new();
         for id in self.required_elements {
             if !has_element_id(&parsed, &id) {
-                return Err(incomplete(
-                    frontend,
-                    &format!(
-                        "the rendered page has no element with id `{id}`; a runtime bound to it \
-                         would open and do nothing"
-                    ),
-                ));
+                missing.push(format!("no element with id `{id}`"));
             }
+        }
+        for (attribute, values) in self.required_attribute_values {
+            for value in values {
+                if !has_attribute_value(&parsed, &attribute, &value) {
+                    missing.push(format!(
+                        "no active element declaring `{attribute}=\"{value}\"`"
+                    ));
+                }
+            }
+        }
+        for attribute in self.required_attributes {
+            if !has_attribute(&parsed, &attribute) {
+                missing.push(format!("no active element carrying `{attribute}`"));
+            }
+        }
+        if !missing.is_empty() {
+            return Err(incomplete(
+                frontend,
+                &format!(
+                    "a runtime bound to what is missing would open and do nothing — {}",
+                    missing.join("; ")
+                ),
+            ));
         }
 
         // 8: only now does the marker become the Provider's own script.
@@ -547,11 +703,74 @@ fn resolve_source(frontend: &UiFrontend, name: &str, fallback: Option<&str>) -> 
     }
 }
 
+/// What a template needs from AFUI to reference AFUI's own routes.
+///
+/// Templates need only the routes they may render directly. The live runtime
+/// is deliberately absent: Provider JavaScript reaches it through
+/// `afui.connect()` rather than naming AFUI's transport path.
+///
+/// These are the one kind of value that crosses into a template already
+/// escaped, and the reason is that there is nothing here to escape: each is a
+/// `&'static str` literal in this crate's own source, matching
+/// `[a-z0-9_./-]+`, with no input of any kind reaching it. Left to the HTML
+/// escaper the separators would render as `&#x2f;`, which every browser
+/// resolves identically but which no one reading view-source, or grepping a
+/// rendered page, would recognise as the route they wrote. The invariant this
+/// does not touch is the one that matters: no *document* field and no
+/// *frontend* byte becomes markup, ever.
+fn afui_paths() -> Value {
+    Value::from(
+        [
+            ("app_icon_path", APP_ICON_PATH),
+            ("base_style_path", BASE_STYLE_PATH),
+            ("end_path", SESSION_END_PATH),
+        ]
+        .into_iter()
+        .map(|(name, path)| (name, Value::from_safe_string(path.to_owned())))
+        .collect::<std::collections::BTreeMap<_, _>>(),
+    )
+}
+
 fn has_element_id(page: &Html, id: &str) -> bool {
     page.tree.nodes().any(|node| {
         node.value()
             .as_element()
             .is_some_and(|element| element.id() == Some(id))
+            && !node.ancestors().any(|ancestor| {
+                ancestor
+                    .value()
+                    .as_element()
+                    .is_some_and(|element| element.name() == "template")
+            })
+    })
+}
+
+/// Whether an element a browser would render carries exactly this attribute
+/// value. Inert copies — inside `<template>`, or in a comment the parser never
+/// turned into an element — do not count, for the same reason they do not
+/// count for an element id: a runtime binds what is on the page.
+fn has_attribute_value(page: &Html, attribute: &str, value: &str) -> bool {
+    page.tree.nodes().any(|node| {
+        node.value()
+            .as_element()
+            .and_then(|element| element.attr(attribute))
+            .is_some_and(|declared| declared == value)
+            && !node.ancestors().any(|ancestor| {
+                ancestor
+                    .value()
+                    .as_element()
+                    .is_some_and(|element| element.name() == "template")
+            })
+    })
+}
+
+/// Whether an element a browser would render carries this attribute at all,
+/// whatever its value.
+fn has_attribute(page: &Html, attribute: &str) -> bool {
+    page.tree.nodes().any(|node| {
+        node.value()
+            .as_element()
+            .is_some_and(|element| element.attr(attribute).is_some())
             && !node.ancestors().any(|ancestor| {
                 ancestor
                     .value()
@@ -694,6 +913,42 @@ mod tests {
         assert!(error.to_string().contains("`status`"), "{error}");
     }
 
+    /// Everything a page is missing is named in one failure, across all three
+    /// kinds of hook.
+    ///
+    /// Somebody writing a replacement page cannot read the contract from
+    /// where they are standing — they find it by rendering. Naming one miss
+    /// at a time turns a page that is missing five hooks into five renders,
+    /// each of which sends them back for a fix they could have made in the
+    /// same sitting as the others.
+    #[test]
+    fn every_missing_hook_is_named_in_one_failure() {
+        let frontend = builtin_frontend();
+        let error = UiPage::builder(&frontend)
+            .entry("page.html.j2")
+            .fallback("<main id=\"tree\"><!-- marker --></main>")
+            .requires_elements(&["tree", "status", "viewer"])
+            .requires_attribute_values("data-decision", ["approve", "refuse"])
+            .requires_attributes(["data-live"])
+            .runtime_marker("<!-- marker -->")
+            .runtime(None)
+            .render(&EmptyDocument {})
+            .unwrap_err();
+        assert!(matches!(error, Error::PageIncomplete { .. }), "{error}");
+        let reported = error.to_string();
+        for hook in [
+            "`status`",
+            "`viewer`",
+            "data-decision=\\\"approve\\\"",
+            "data-decision=\\\"refuse\\\"",
+            "`data-live`",
+        ] {
+            let hook = hook.replace("\\\"", "\"");
+            assert!(reported.contains(&hook), "`{hook}` missing from {reported}");
+        }
+        assert!(!reported.contains("`tree`"), "{reported}");
+    }
+
     /// A required id must match exactly — a page that only has a longer id
     /// sharing the same prefix has not satisfied the contract.
     #[test]
@@ -770,6 +1025,128 @@ mod tests {
             .render(&EmptyDocument {})
             .unwrap();
         assert!(page.contains("id=\"decision\""));
+    }
+
+    /// A page that dropped one of its decide controls opens as a question
+    /// nobody can answer, so it is refused and the missing declaration named.
+    #[test]
+    fn a_missing_declaration_is_named_in_the_error() {
+        let frontend = builtin_frontend();
+        let error = UiPage::builder(&frontend)
+            .entry("page.html.j2")
+            .fallback("<button data-decision=\"approve\">yes</button><!-- marker -->")
+            .requires_attribute_values("data-decision", ["approve", "refuse"])
+            .runtime_marker("<!-- marker -->")
+            .runtime(None)
+            .render(&EmptyDocument {})
+            .unwrap_err();
+        assert!(matches!(error, Error::PageIncomplete { .. }), "{error}");
+        assert!(error.to_string().contains("refuse"), "{error}");
+    }
+
+    /// The one failure this check exists to catch that a looser match would
+    /// let through: a declaration the runtime maps to nothing looks like a
+    /// control and does nothing.
+    #[test]
+    fn a_declaration_is_matched_whole_not_as_a_prefix() {
+        let frontend = builtin_frontend();
+        let error = UiPage::builder(&frontend)
+            .entry("page.html.j2")
+            .fallback("<button data-decision=\"approve-all\">yes</button><!-- marker -->")
+            .requires_attribute_values("data-decision", ["approve"])
+            .runtime_marker("<!-- marker -->")
+            .runtime(None)
+            .render(&EmptyDocument {})
+            .unwrap_err();
+        assert!(matches!(error, Error::PageIncomplete { .. }), "{error}");
+    }
+
+    /// Inert declarations do not count, for the same reason inert elements do
+    /// not: a runtime binds what a browser rendered.
+    #[test]
+    fn a_declaration_inside_an_inert_template_or_a_comment_does_not_count() {
+        let frontend = builtin_frontend();
+        for fallback in [
+            "<template><button data-decision=\"approve\"></button></template><!-- marker -->",
+            "<!-- <button data-decision=\"approve\"></button> --><!-- marker -->",
+        ] {
+            let error = UiPage::builder(&frontend)
+                .entry("page.html.j2")
+                .fallback(fallback)
+                .requires_attribute_values("data-decision", ["approve"])
+                .runtime_marker("<!-- marker -->")
+                .runtime(None)
+                .render(&EmptyDocument {})
+                .unwrap_err();
+            assert!(matches!(error, Error::PageIncomplete { .. }), "{error}");
+        }
+    }
+
+    /// A hook that only survives in a comment is a hook no runtime can find.
+    #[test]
+    fn a_required_attribute_must_be_on_an_element_a_browser_renders() {
+        let frontend = builtin_frontend();
+        let error = UiPage::builder(&frontend)
+            .entry("page.html.j2")
+            .fallback("<!-- <div data-snapshot></div> --><!-- marker -->")
+            .requires_attributes(["data-snapshot"])
+            .runtime_marker("<!-- marker -->")
+            .runtime(None)
+            .render(&EmptyDocument {})
+            .unwrap_err();
+        assert!(matches!(error, Error::PageIncomplete { .. }), "{error}");
+        assert!(error.to_string().contains("data-snapshot"), "{error}");
+
+        let page = UiPage::builder(&frontend)
+            .entry("page.html.j2")
+            .fallback("<div data-snapshot></div><!-- marker -->")
+            .requires_attributes(["data-snapshot"])
+            .runtime_marker("<!-- marker -->")
+            .runtime(None)
+            .render(&EmptyDocument {})
+            .unwrap();
+        assert!(page.contains("data-snapshot"));
+    }
+
+    /// A runtime binds every control it finds, so more than one carrier is a
+    /// page that works — an approve button at the top and another at the
+    /// bottom of a long page is not a contract violation.
+    #[test]
+    fn more_than_one_carrier_for_a_declaration_is_accepted() {
+        let frontend = builtin_frontend();
+        let page = UiPage::builder(&frontend)
+            .entry("page.html.j2")
+            .fallback(
+                "<button data-decision=\"approve\">yes</button>\
+                 <button data-decision=\"approve\">yes</button><!-- marker -->",
+            )
+            .requires_attribute_values("data-decision", ["approve"])
+            .runtime_marker("<!-- marker -->")
+            .runtime(None)
+            .render(&EmptyDocument {})
+            .unwrap();
+        assert!(page.contains("data-decision=\"approve\""));
+    }
+
+    /// One list: what the runtime binds is what the page must declare.
+    #[test]
+    fn a_decision_runtime_is_itself_the_page_contract() {
+        let frontend = builtin_frontend();
+        let runtime = crate::UiDecisionRuntime::new("data-decision")
+            .unwrap()
+            .with_decision("approve", "approve")
+            .unwrap()
+            .with_decision("refuse", "refuse")
+            .unwrap();
+        let error = UiPage::builder(&frontend)
+            .entry("page.html.j2")
+            .fallback("<button data-decision=\"approve\">yes</button><!-- marker -->")
+            .requires_decisions(&runtime)
+            .runtime_marker("<!-- marker -->")
+            .runtime(Some(format!("<script>{}</script>", runtime.source())))
+            .render(&EmptyDocument {})
+            .unwrap_err();
+        assert!(error.to_string().contains("refuse"), "{error}");
     }
 
     /// A marker written twice would load a runtime twice — refused before
@@ -870,6 +1247,46 @@ mod tests {
         );
     }
 
+    /// A template references AFUI's own routes through AFUI, so moving one is
+    /// a render that changes rather than six pages that quietly stop working.
+    #[test]
+    fn the_reserved_paths_reach_the_template_as_a_global() {
+        let frontend = builtin_frontend();
+        let page = UiPage::builder(&frontend)
+            .entry("page.html.j2")
+            .fallback(
+                "<link rel=\"icon\" href=\"{{ afui.app_icon_path }}\">\
+                 <link rel=\"stylesheet\" href=\"{{ afui.base_style_path }}\">\
+                 <p data-end=\"{{ afui.end_path }}\"></p>\
+                 <!-- marker -->",
+            )
+            .runtime_marker("<!-- marker -->")
+            .runtime(None)
+            .render(&EmptyDocument {})
+            .unwrap();
+        assert!(page.contains("href=\"__afui/app-icon.svg\""), "{page}");
+        assert!(page.contains("href=\"__afui/base.css\""), "{page}");
+        assert!(page.contains("data-end=\"__afui/end\""), "{page}");
+    }
+
+    /// `afui` is reserved in the same way `document` is: an extension that
+    /// could shadow it could point the page's icon or end route somewhere else,
+    /// which is not a decision a replaceable layer gets to make.
+    #[test]
+    fn a_page_extension_may_not_shadow_the_reserved_afui_global() {
+        let frontend = builtin_frontend();
+        let error = UiPage::builder(&frontend)
+            .entry("page.html.j2")
+            .fallback("<!-- marker -->")
+            .extend_environment(|environment| environment.add_global("afui", "mine".to_owned()))
+            .runtime_marker("<!-- marker -->")
+            .runtime(None)
+            .render(&EmptyDocument {})
+            .unwrap_err();
+        assert!(matches!(error, Error::PageIncomplete { .. }), "{error}");
+        assert!(error.to_string().contains("`afui`"), "{error}");
+    }
+
     #[test]
     fn a_page_extension_can_add_a_filter_but_not_restore_safe() {
         let frontend = builtin_frontend();
@@ -962,6 +1379,37 @@ mod tests {
         .unwrap();
         drop(guard);
         frontend
+    }
+
+    /// A frontend may add partials the Provider never heard of and include
+    /// them; what it may not do is shadow a template that is part of the
+    /// contract, because that one keeps its own fallback.
+    #[test]
+    fn open_ended_partials_are_registered_and_contract_templates_are_left_alone() {
+        let root = temp_root("partials");
+        let frontend = overridden_frontend(
+            &root,
+            "templates/extra.html.j2",
+            "<p id=\"status\">mine</p>",
+        );
+        fs::write(
+            root.join("frontends/reviewer/console/templates/notes.txt"),
+            "not a template",
+        )
+        .unwrap();
+        let page = UiPage::builder(&frontend)
+            .entry("templates/page.html.j2")
+            .fallback("{% include \"templates/extra.html.j2\" %}<!-- marker -->")
+            .template("templates/layout.html.j2", "<main></main>")
+            .override_templates_under("templates", ".j2")
+            .unwrap()
+            .requires_elements(&["status"])
+            .runtime_marker("<!-- marker -->")
+            .runtime(None)
+            .render(&EmptyDocument {})
+            .unwrap();
+        assert!(page.contains("mine"), "{page}");
+        let _ = fs::remove_dir_all(root);
     }
 
     /// A script hiding inside an override's entry template is refused before

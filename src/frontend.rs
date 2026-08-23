@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use agent_first_slug::{SlugValidationPolicy, validate_slug};
 use serde::{Deserialize, Serialize};
@@ -110,7 +111,7 @@ fn workspace_frontend_is_enabled(root: &Path, provider_id: &str, ui_kind: &str) 
     Ok(entry.fingerprint == frontend_fingerprint(root)?)
 }
 
-fn frontend_fingerprint(root: &Path) -> Result<String> {
+pub(crate) fn frontend_fingerprint(root: &Path) -> Result<String> {
     let mut files = BTreeMap::new();
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry.map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
@@ -227,12 +228,83 @@ const SCRIPT_EXTENSIONS: [&str; 5] = ["js", "mjs", "cjs", "wasm", "jsx"];
 /// make a person who wants to change one page responsible for shipping every
 /// other file the Provider ships — a full set of language packs, say — so a
 /// one-page customisation would silently delete i18n.
+/// Every trusted file, read once, at the moment trust was decided.
+///
+/// The fingerprint is computed over the whole directory at resolve; serving
+/// then used to `fs::read` the path again per request, so a long-running
+/// process kept serving templates, CSS and assets that had been edited *after*
+/// the check — while the documentation said any later edit revoked trust. It
+/// also meant `reject_frontend_symlinks` checked one object and the read opened
+/// another.
+///
+/// Holding the bytes settles both: what is served is exactly what was
+/// fingerprinted, and there is no second path lookup to race. A frontend is
+/// templates and small assets by design, and it is already read end-to-end to
+/// compute the fingerprint, so this costs one retained copy of something this
+/// process just hashed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrontendSnapshot {
+    files: BTreeMap<String, Arc<[u8]>>,
+}
+
+impl FrontendSnapshot {
+    fn read(root: &Path) -> Result<Self> {
+        let mut files = BTreeMap::new();
+        for entry in WalkDir::new(root).follow_links(false) {
+            let entry =
+                entry.map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
+            let relative = entry
+                .path()
+                .strip_prefix(root)
+                .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            // Said out loud, at resolve, rather than left as a file that
+            // silently is not part of the frontend: a fingerprint covers files,
+            // not the places they point at.
+            if entry.file_type().is_symlink() {
+                return Err(Error::FrontendFileName {
+                    name: relative,
+                    reason: "it is a symlink, and a trusted fingerprint covers files rather than the places they point at",
+                });
+            }
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            files.insert(
+                relative,
+                Arc::from(fs::read(entry.path()).map_err(Error::Io)?),
+            );
+        }
+        Ok(Self { files })
+    }
+
+    fn get(&self, relative: &str) -> Option<&Arc<[u8]>> {
+        self.files.get(relative)
+    }
+
+    fn under(&self, prefix: &str) -> Vec<String> {
+        let prefix = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix.trim_end_matches('/'))
+        };
+        self.files
+            .keys()
+            .filter(|name| name.starts_with(&prefix))
+            .cloned()
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UiFrontend {
     provider_id: String,
     ui_kind: String,
     ui_api_version: String,
     location: Option<FrontendLocation>,
+    /// The trusted bytes, captured when trust was decided.
+    snapshot: Option<FrontendSnapshot>,
 }
 
 impl UiFrontend {
@@ -270,11 +342,12 @@ impl UiFrontend {
         ui_api_version: &str,
         safe_mode: bool,
     ) -> Result<Self> {
-        let built_in = |location| Self {
+        let built_in = |location, snapshot| Self {
             provider_id: provider_id.to_owned(),
             ui_kind: ui_kind.to_owned(),
             ui_api_version: ui_api_version.to_owned(),
             location,
+            snapshot,
         };
         let location = discover_frontend(workspace_root, provider_id, ui_kind, safe_mode).map_err(
             |error| Error::FrontendUnreadable {
@@ -284,7 +357,7 @@ impl UiFrontend {
             },
         )?;
         let Some(location) = location else {
-            return Ok(built_in(None));
+            return Ok(built_in(None, None));
         };
         if location.manifest.ui_api_version != ui_api_version {
             return Err(Error::FrontendIncompatible {
@@ -295,7 +368,15 @@ impl UiFrontend {
                 implemented: ui_api_version.to_owned(),
             });
         }
-        Ok(built_in(Some(location)))
+        // Read here, while the fingerprint that authorized it is still the
+        // truth about this directory.
+        let snapshot =
+            FrontendSnapshot::read(&location.root).map_err(|error| Error::FrontendUnreadable {
+                provider_id: provider_id.to_owned(),
+                ui_kind: ui_kind.to_owned(),
+                message: error.to_string(),
+            })?;
+        Ok(built_in(Some(location), Some(snapshot)))
     }
 
     /// The Provider's own files, consulting no frontend at all.
@@ -311,6 +392,7 @@ impl UiFrontend {
             ui_kind: ui_kind.to_owned(),
             ui_api_version: ui_api_version.to_owned(),
             location: None,
+            snapshot: None,
         }
     }
 
@@ -358,21 +440,15 @@ impl UiFrontend {
     /// not "there is no override". The caller uses its built-in for that file
     /// and keeps reading the override for the rest.
     pub fn file(&self, relative: &str) -> Result<Option<Vec<u8>>> {
-        let Some(location) = &self.location else {
+        let Some(snapshot) = &self.snapshot else {
             return Ok(None);
         };
+        // Served from what was trusted, not from the path it came from: the
+        // directory may have changed since, and a changed directory is not this
+        // frontend.
         let relative = frontend_relative_path(relative)?;
-        let path = location.root.join(&relative);
-        reject_frontend_symlinks(&location.root, &relative)?;
-        match fs::read(&path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(Error::FrontendUnreadable {
-                provider_id: self.provider_id.clone(),
-                ui_kind: self.ui_kind.clone(),
-                message: format!("could not read {}: {error}", path.display()),
-            }),
-        }
+        let key = relative.to_string_lossy().replace('\\', "/");
+        Ok(snapshot.get(&key).map(|bytes| bytes.to_vec()))
     }
 
     /// The same overlay for a file the Provider reads as text.
@@ -421,49 +497,15 @@ impl UiFrontend {
     /// [`Self::file`], so a caller can safely feed the names back into
     /// [`Self::text`].
     pub fn files_under(&self, relative: &str) -> Result<Vec<String>> {
-        let Some(location) = &self.location else {
+        let Some(snapshot) = &self.snapshot else {
             return Ok(Vec::new());
         };
         let relative = frontend_relative_path(relative)?;
-        reject_frontend_symlinks(&location.root, &relative)?;
-        let directory = location.root.join(&relative);
-        if !directory.exists() {
-            return Ok(Vec::new());
-        }
-        if !directory.is_dir() {
-            return Err(Error::FrontendFileName {
-                name: relative.to_string_lossy().into_owned(),
-                reason: "it is not a directory",
-            });
-        }
-        let mut files = Vec::new();
-        for entry in WalkDir::new(&directory).follow_links(false) {
-            let entry = entry.map_err(|error| Error::FrontendUnreadable {
-                provider_id: self.provider_id.clone(),
-                ui_kind: self.ui_kind.clone(),
-                message: error.to_string(),
-            })?;
-            let path = entry.path();
-            let path_relative =
-                path.strip_prefix(&location.root)
-                    .map_err(|error| Error::FrontendUnreadable {
-                        provider_id: self.provider_id.clone(),
-                        ui_kind: self.ui_kind.clone(),
-                        message: error.to_string(),
-                    })?;
-            if entry.file_type().is_symlink() {
-                return Err(Error::FrontendFileName {
-                    name: path_relative.to_string_lossy().into_owned(),
-                    reason: "it is a symlink, and a trusted fingerprint covers files rather than the places they point at",
-                });
-            }
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let name = path_relative.to_string_lossy().replace('\\', "/");
-            frontend_relative_path(&name)?;
-            files.push(name);
-        }
+        // Names come from the snapshot, so a symlink or a file that appeared
+        // after trust was decided is not in this list at all — there is nothing
+        // to reject at read time because nothing outside the trusted set is
+        // reachable.
+        let mut files = snapshot.under(&relative.to_string_lossy().replace('\\', "/"));
         files.sort();
         Ok(files)
     }
@@ -604,34 +646,6 @@ fn frontend_relative_path(relative: &str) -> Result<PathBuf> {
         ));
     }
     Ok(path)
-}
-
-/// Refuse a symlink anywhere on the way to an override file.
-///
-/// The fingerprint a person trusted hashes the files that were inside the
-/// frontend. A symlink is a file whose bytes live somewhere else, so trusting
-/// the directory would trust whatever it points at afterwards.
-fn reject_frontend_symlinks(root: &Path, relative: &Path) -> Result<()> {
-    let mut current = root.to_path_buf();
-    reject_frontend_symlink(&current)?;
-    for component in relative.components() {
-        current.push(component);
-        reject_frontend_symlink(&current)?;
-    }
-    Ok(())
-}
-
-fn reject_frontend_symlink(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::FrontendFileName {
-            name: path.to_string_lossy().into_owned(),
-            reason: "it is a symlink, and a trusted fingerprint covers files rather than the \
-                     places they point at",
-        }),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(Error::Io(error)),
-    }
 }
 
 #[cfg(test)]
@@ -785,6 +799,38 @@ mod tests {
     }
 
     #[test]
+    fn what_is_served_is_what_was_fingerprinted() {
+        // A resolved frontend used to re-read each file from disk per request,
+        // so a long-running process served whatever the directory held *now* —
+        // while the README said any later edit revoked trust. It serves the
+        // bytes that were trusted.
+        let root = temp_root("snapshot");
+        let directory = global_frontend(&root, "afdemo", "demo", "1");
+        fs::write(directory.join("style.css"), "body{color:trusted}").unwrap();
+        let (_guard, frontend) = resolve(&root, "1");
+        let frontend = frontend.unwrap();
+        assert_eq!(
+            frontend.text("style.css").unwrap().as_deref(),
+            Some("body{color:trusted}")
+        );
+
+        fs::write(directory.join("style.css"), "body{color:edited-later}").unwrap();
+        assert_eq!(
+            frontend.text("style.css").unwrap().as_deref(),
+            Some("body{color:trusted}"),
+            "an edit after trust was decided must not reach a browser"
+        );
+
+        // And a file that did not exist when trust was decided is not part of
+        // this frontend at all.
+        fs::write(directory.join("late.css"), "body{}").unwrap();
+        assert_eq!(frontend.text("late.css").unwrap(), None);
+        assert!(frontend.file("late.css").unwrap().is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_symlinked_override_file_is_refused_because_the_fingerprint_did_not_cover_it() {
         let root = temp_root("symlink");
         let directory = global_frontend(&root, "afdemo", "demo", "1");
@@ -794,16 +840,18 @@ mod tests {
         std::os::unix::fs::symlink(&outside, directory.join("style.css")).unwrap();
         #[cfg(not(unix))]
         let _ = directory;
+        // Refused when trust is decided, not when the file is asked for: the
+        // fingerprint is over the whole directory, and a directory holding a
+        // link is not a directory that fingerprint honestly describes. The
+        // message names the file so it can be removed.
         let (_guard, frontend) = resolve(&root, "1");
-        let frontend = frontend.unwrap();
         #[cfg(unix)]
-        assert!(
-            frontend
-                .file("style.css")
-                .unwrap_err()
-                .to_string()
-                .contains("symlink")
-        );
+        {
+            let error = frontend.expect_err("a linked override must not resolve");
+            let message = error.to_string();
+            assert!(message.contains("symlink"), "{message}");
+            assert!(message.contains("style.css"), "{message}");
+        }
         #[cfg(not(unix))]
         let _ = frontend;
         let _ = fs::remove_dir_all(root);

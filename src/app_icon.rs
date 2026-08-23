@@ -9,12 +9,6 @@ use crate::{Error, Result};
 /// by that frontend's trusted fingerprint.
 pub const APP_ICON_ASSET_PATH: &str = "assets/app-icon.svg";
 
-/// Where a hosted session exposes its resolved application icon.
-///
-/// Written without a leading slash because a page and the window launcher
-/// append it to the session's credential URL, which already ends in `/`.
-pub const APP_ICON_PATH: &str = "__afui/app-icon.svg";
-
 const MAX_APP_ICON_BYTES: usize = 256 * 1024;
 
 /// One Provider-owned SVG application icon, after its frontend overlay has

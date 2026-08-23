@@ -1,6 +1,6 @@
 [package]
 name = "agent-first-ui"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "Let your AI agent hand you a real interface when a step needs a person — a window opens, values can stay live in both directions, and the session ends with one typed outcome."
 license = "MIT"
@@ -40,11 +40,15 @@ default = ["session"]
 # `assets/` route a frontend's static files are served from. This is what a
 # Provider needs, and what the `afui` binary is built from.
 session = [
+    "cli",
     "dep:agent-first-data",
     "dep:axum",
     "dep:getrandom",
     "dep:hex",
+    "dep:hyper",
+    "dep:hyper-util",
     "dep:libc",
+    "dep:minijinja",
     "dep:subtle",
     "dep:tempfile",
     "dep:tokio",
@@ -57,19 +61,41 @@ session = [
     "tokio/sync",
     "tokio/time",
 ]
+# Declaring the delivery flag on a command line and reading it back.
+#
+# Its own tier below `session` because a Provider's CLI surface does not
+# change when its UI is compiled out: the same binary that can be built
+# without a window still has to declare the same flags, so an agent reading
+# `--help` sees one contract rather than one per build. Costs afdata's CLI
+# types and nothing else — no server, no browser, no registry.
+cli = ["dep:agent-first-data"]
+
 # The template environment policy, render, rendered-markup guard, and
 # element/runtime-marker contract check every Provider page goes through —
 # see `src/page.rs`. Independent of `session`: assembling a page this way
 # never binds a port or mints a credential.
 page = ["dep:minijinja"]
-# The third delivery: a page that serves this machine's live sessions to a
-# browser somewhere else, and the streaming reverse proxy underneath it.
+# What a Provider's own tests need in order to test *through* AFUI: a frontend
+# on disk and trusted, a browser that does not open, an attention policy, a
+# registry to wait on, and a client for AFUI's real session runtime. Not in the
+# default set and never in a release binary — a consumer adds it under
+# `[dev-dependencies]`.
 #
-# Off by default because a Provider consuming this crate as a library does not
-# proxy anything: it opens a window or hands out one URL.
-# Only `afui session serve` needs this, so only a build of the binary that
-# wants that verb pays for it. It serves sessions, so it implies `session`.
-serve = ["session", "dep:hyper", "dep:hyper-util", "dep:minijinja", "tokio/signal"]
+# It exists because the alternative was each consumer reimplementing AFUI's
+# trust fingerprint or its WebSocket envelope. Both agree with AFUI right up
+# until AFUI changes, then fail a domain test for a reason that test is not
+# about.
+test-support = [
+    "session",
+    "dep:futures-util",
+    "dep:tokio-tungstenite",
+]
+# The `afui session serve` CLI verb. The shell and streaming proxy themselves
+# belong to `session`: direct `link` delivery uses that same remote-view path,
+# so keeping a second implementation behind this flag would split lifecycle
+# semantics again. This flag adds only the process signal the long-running CLI
+# verb waits on.
+serve = ["session", "tokio/signal"]
 
 # Cargo discovers src/bin/afui.rs without being told. The release pipeline does
 # not: it reads this table to learn what a release ships, deriving the archive
@@ -88,15 +114,16 @@ required-features = ["session"]
 [dependencies]
 # The CLI's argument parsing, event stream and skill installer. Only the binary
 # uses it, and the binary is a `session` build.
-agent-first-data = { version = "0.33.0", default-features = false, features = ["cli", "skill-admin"], optional = true }
+agent-first-data = { version = "0.34.0", default-features = false, features = ["cli", "skill-admin"], optional = true }
 # A `provider_id` and a `ui_kind` are path segments in a frontend directory
 # before they are anything else, so the grammar is checked in the guard tier.
-agent-first-slug = { version = "0.6.2", default-features = false }
+agent-first-slug = { version = "0.7.1", default-features = false }
 axum = { version = "0.8", features = ["ws"], optional = true }
 blake3 = "1"
 dirs = "6"
 getrandom = { version = "0.4", optional = true }
 hex = { version = "0.4", optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }
 # The reverse proxy speaks HTTP itself rather than through a pooling client:
 # one connection per proxied request is what keeps a Server-Sent Events stream
 # from sharing a connection with anything else, and `Incoming` hands the body
@@ -120,6 +147,11 @@ tempfile = { version = "3", optional = true }
 # routes, which `Router::layer` (post-routing) cannot do.
 tower = { version = "0.5", optional = true }
 tokio = { version = "1", optional = true }
+# A Provider's integration test should drive AFUI's real runtime without
+# carrying its own WebSocket framing or a private copy of the AFUI envelope.
+# Kept behind `test-support`, so this client stack never reaches a release
+# binary.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
 walkdir = "2"
 
 # One question std cannot ask: does the process that announced this session
@@ -134,8 +166,9 @@ libc = { version = "0.2", optional = true }
 # `SinkExt`/`StreamExt` on a WebSocket stream. Nothing in the library polls one.
 futures-util = { version = "0.3", default-features = false }
 # The lifetime tests drive a real request against a served session; the library
-# itself never reads or writes a socket directly.
-tokio = { version = "1", features = ["io-util"] }
+# itself never reads or writes a socket directly. `test-util` is what lets a
+# keep-alive test assert a cadence measured in minutes without waiting them.
+tokio = { version = "1", features = ["io-util", "test-util"] }
 # Proving the proxy streams needs a body that is deliberately not finished yet,
 # which is a channel behind an Axum response.
 tokio-stream = "0.1"

@@ -103,6 +103,10 @@ struct CardClasses {
     /// Additive in UI API v1: older frontends may omit it, in which case the
     /// runtime uses the required card notice for action feedback.
     action_status: &'static str,
+    /// Where the interface inside the frame gets to say how it is going. A
+    /// template that omits it is a card whose head says everything but that,
+    /// which is why it is not required: the interface keeps its own head then.
+    page_status: &'static str,
 }
 
 const CARD_CLASSES: CardClasses = CardClasses {
@@ -114,6 +118,7 @@ const CARD_CLASSES: CardClasses = CardClasses {
     frame: "frame",
     open: "act-open",
     action_status: "card-action-status",
+    page_status: "card-page-status",
 };
 
 /// One control, declared rather than wired.
@@ -124,44 +129,76 @@ const CARD_CLASSES: CardClasses = CardClasses {
 #[derive(Serialize)]
 struct Action {
     name: &'static str,
+    /// What this control is called. On one drawn as a glyph it is the whole of
+    /// the accessible name, so it says what pressing does rather than naming a
+    /// picture.
     label: &'static str,
+    /// The character a head with room for one more control and not one more
+    /// word draws it as, or empty for a control that keeps its word. Presentation
+    /// only: it is the `name` above that decides what pressing one does.
+    glyph: &'static str,
     /// Starts hidden because it only means something in one state — a warning
-    /// running, or a view that has lapsed.
+    /// running, a view that has lapsed, or a page that has said it is somewhere
+    /// to come back from.
     hidden: bool,
-    /// Layout guidance only. The action name remains the complete semantics.
-    secondary: bool,
+    /// Where in the head this control belongs: `navigation` is the one slot
+    /// ahead of the title, `action` is the row after it, `menu` is behind the
+    /// overflow control. Layout guidance only. The action name remains the
+    /// complete semantics.
+    slot: &'static str,
 }
 
-const ACTIONS: [Action; 6] = [
+const ACTIONS: [Action; 7] = [
+    // The one control that belongs to the interface inside the frame rather
+    // than to the card around it. Hidden until that interface says it is
+    // somewhere with a way back, and pressing it says so to that interface and
+    // to nothing else — this page never moves anybody's history but its own.
+    Action {
+        name: "back",
+        label: "Back",
+        glyph: "←",
+        hidden: true,
+        slot: "navigation",
+    },
+    // A glyph rather than the word it used to carry: the card's own height is
+    // where a person reads its size off, so the word is worth more as this
+    // control's name — which the runtime keeps current — than as its face.
     Action {
         name: "size",
-        label: "Tall",
+        label: "Card size",
+        glyph: "↕",
         hidden: false,
-        secondary: true,
+        slot: "action",
     },
+    // Answers to a warning, and rare. A word, because a person who has never
+    // seen this control before is being asked to decide something about it.
     Action {
         name: "renew",
         label: "Keep open",
+        glyph: "",
         hidden: true,
-        secondary: false,
+        slot: "action",
     },
     Action {
         name: "reopen",
         label: "Reopen",
+        glyph: "",
         hidden: true,
-        secondary: false,
+        slot: "action",
     },
     Action {
         name: "fold",
         label: "Fold",
+        glyph: "",
         hidden: false,
-        secondary: true,
+        slot: "menu",
     },
     Action {
         name: "drop",
         label: "Hide",
+        glyph: "",
         hidden: false,
-        secondary: true,
+        slot: "menu",
     },
     // Ends the session itself, not merely this view of it — the same
     // reserved route `afui session close` and a closed window both reach.
@@ -171,8 +208,9 @@ const ACTIONS: [Action; 6] = [
     Action {
         name: "end",
         label: "End session",
+        glyph: "",
         hidden: false,
-        secondary: true,
+        slot: "menu",
     },
 ];
 
@@ -188,19 +226,19 @@ struct ShellDocument {
     renew_label: &'static str,
     elements: ElementIds,
     card: CardClasses,
-    actions: [Action; 6],
+    actions: [Action; 7],
     action_attribute: &'static str,
 }
 
 fn shell_document() -> ShellDocument {
     ShellDocument {
         ui_api_version: UI_API_VERSION,
-        title: "Agent-First UI sessions",
-        heading: "Sessions on this machine",
-        slot_heading: "Open sessions",
+        title: "Agent-First UI",
+        heading: "Agent-First UI",
+        slot_heading: "Open interfaces",
         empty_label: "Nothing is open.",
-        open_label: "Open",
-        more_label: "More",
+        open_label: "Open in a new tab",
+        more_label: "More actions",
         renew_label: "Keep open",
         elements: ELEMENT_IDS,
         card: CARD_CLASSES,
@@ -399,23 +437,60 @@ mod tests {
     fn the_built_in_shell_has_human_theme_status_and_action_semantics() {
         let ui = ShellUi::resolve(std::path::Path::new("/nonexistent")).unwrap();
         let style = String::from_utf8_lossy(ui.stylesheet());
-        assert!(style.contains("color-scheme: light dark"), "{style}");
+        // Both themes come from the baseline this page links first, which is
+        // the same one the sessions it frames are served. A card and the
+        // interface inside it are the one place where two palettes would be
+        // visible side by side.
         assert!(
-            style.contains("@media (prefers-color-scheme: dark)"),
-            "{style}"
+            ui.page().contains("href=\"__afui/base.css\""),
+            "{}",
+            ui.page()
+        );
+        assert!(
+            crate::page_style::BASE_STYLE.contains("color-scheme: light dark"),
+            "the baseline carries the theme"
         );
         assert!(style.contains(".card-notice[data-state=\"dead\"]"));
         assert!(style.contains("@media (pointer: coarse)"));
-        assert!(ui.page().contains(">More</summary>"), "{}", ui.page());
         assert!(ui.page().contains("card-action-status"), "{}", ui.page());
+        // The head takes the one thing it cannot know, so an interface that
+        // trusts it with all three stops drawing a second head underneath.
+        assert!(ui.page().contains("card-page-status"), "{}", ui.page());
+        // Removing a card and ending the session behind it stay words, behind
+        // the overflow control: they are the two nobody should reach for by
+        // recognising a picture.
         assert!(ui.page().contains(">Hide</button>"), "{}", ui.page());
         assert!(ui.page().contains(">End session</button>"), "{}", ui.page());
+        // A control drawn as a glyph still has to say what it is. The name is
+        // the label, on the control itself, with the picture hidden from
+        // anything reading the page out — a bar of unnamed glyphs is a bar
+        // nobody can use without pressing things to find out.
+        for named in [
+            "aria-label=\"More actions\"",
+            "aria-label=\"Back\"",
+            "aria-label=\"Card size\"",
+            "aria-label=\"Open in a new tab\"",
+        ] {
+            assert!(
+                ui.page().contains(named),
+                "{named} is missing: {}",
+                ui.page()
+            );
+        }
+        for glyph in ["←", "↕", "↗", "⋮"] {
+            assert!(
+                ui.page()
+                    .contains(&format!("aria-hidden=\"true\">{glyph}<")),
+                "the glyph {glyph} must be hidden from a reader that has the name: {}",
+                ui.page()
+            );
+        }
         assert!(style.contains(".card:has(.act-menu[open])"), "{style}");
         assert!(
             super::super::shell::SHELL_JS.contains("Ending session…"),
             "network actions need immediate feedback"
         );
-        assert!(ui.page().contains("Open sessions"), "{}", ui.page());
+        assert!(ui.page().contains("Open interfaces"), "{}", ui.page());
     }
 
     /// Every size the runtime can put on a card is one the stylesheet has a

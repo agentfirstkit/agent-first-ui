@@ -19,11 +19,31 @@
  * left alone.
  *
  * How tall a card is, is the person's. What is inside a frame is on an origin
- * this page cannot read, so the page cannot measure it and the frame cannot
- * tell it — not without a protocol this listener would have to trust, which is
- * the one thing it refuses to have. Rather than guess a height for a program it
- * has never heard of, it offers three and remembers which was picked. That is
- * the only thing here worth remembering, so it is the only thing stored.
+ * this page cannot read, so the page cannot measure it, and it will not take a
+ * height from the frame either: a program that could name its own size could
+ * take the window. Rather than guess a height for a program it has never heard
+ * of, it offers three and remembers which was picked. That is the only thing
+ * here worth remembering, so it is the only thing stored.
+ *
+ * A framed interface may say three things, and they are the three a window
+ * frame has always shown: that it is somewhere with a way back, what it is
+ * showing, and how that is going. None is a capability. An interface can
+ * already draw its own way back inside itself; what saying so buys is that this
+ * head draws the one the person's window already puts in that corner, and
+ * pressing it is sent back to that same frame and nowhere else — this page
+ * moves nobody's history but its own. A title and a status line are text,
+ * capped and flattened, from the same program whose subject is already in this
+ * head.
+ *
+ * Identity is the one thing never taken. Whose program this is and what the
+ * session is on come from the listener, so a card cannot be made to introduce
+ * itself as something else — which is exactly what makes the rest safe to
+ * take, and what makes it worth taking: an interface that trusts this head
+ * with the other three stops drawing a second head of its own, and on a phone
+ * that is a row of the screen back.
+ *
+ * What is refused is everything that would move this page: a size, a position,
+ * a control's name, another card.
  *
  * Folding and removing are this page's, not the session's. Removing a card
  * removes it from this person's view; the session is still running, still
@@ -148,7 +168,6 @@
     card.dataset.session = session.session_id;
     card.querySelector('.provider').textContent = session.provider_id;
     card.querySelector('.kind').textContent = session.ui_kind;
-    card.querySelector('.subject').textContent = session.subject || '';
     card.addEventListener('click', event => {
       const control = event.target instanceof HTMLElement
         ? event.target.closest('[data-act]')
@@ -157,6 +176,7 @@
       const act = control.dataset.act;
       const entry = shown.get(session.session_id);
       if (!entry || entry.busy) return;
+      if (act === 'back') askFrameBack(entry);
       if (act === 'fold') fold(card, control);
       if (act === 'drop') drop(session.session_id);
       if (act === 'renew') renewCard(entry);
@@ -166,18 +186,121 @@
       closeActionMenu(control);
     });
     setSize(card, storedSizes()[sizeKeyFor(session)] || 'tall');
-    return {
+    const entry = {
       card,
       holder: card.querySelector('.frame'),
       notice: card.querySelector('.card-notice'),
       actionStatus:
         card.querySelector('.card-action-status') || card.querySelector('.card-notice'),
       open: card.querySelector('.act-open'),
+      back: card.querySelector('[data-act="back"]'),
+      subjectNode: card.querySelector('.subject'),
+      pageStatus: card.querySelector('.card-page-status'),
+      /** The session's own word for what this is, which is this page's to show. */
+      subject: session.subject || '',
+      /** What the interface inside the frame says it is showing, if it says. */
+      placeTitle: '',
       frame: null,
       path: null,
       busy: false,
     };
+    showSubject(entry);
+    return entry;
   }
+
+  /* One line, from whichever of the two has something to say.
+   *
+   * The session's subject is what this is; a framed interface that has gone
+   * somewhere inside itself says where, and that is the more specific answer to
+   * the same question — so it stands in front, and stepping back out restores
+   * the other. Written in one place so the two cannot end up disagreeing. */
+  function showSubject(entry) {
+    if (!entry.subjectNode) return;
+    entry.subjectNode.textContent = entry.placeTitle || entry.subject;
+  }
+
+  /* Every connection word AFUI's own baseline has a colour for. A framed
+   * interface may name one for the line it sends, and gets the same dressing
+   * its own page would; anything else is a word this page does not know and
+   * leaves undressed rather than guessing. */
+  const CONNECTION_WORDS = ['connecting', 'live', 'reconnecting', 'closed'];
+
+  /* What a framed interface may put in this page's own head.
+   *
+   * Text, on one line, at a length this head can hold. Control characters go
+   * because a head is not a place where a newline means anything, and the cap
+   * is the point: a line long enough to push this card's own controls off the
+   * bar would be an interface deciding what a person can reach. */
+  function framedText(value) {
+    if (typeof value !== 'string') return '';
+    const flat = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').replace(/\s+/g, ' ').trim();
+    const characters = Array.from(flat);
+    return characters.length > 64 ? `${characters.slice(0, 63).join('')}…` : flat;
+  }
+
+  /** The card whose frame sent this, or none — the only identity a sandboxed
+   * frame has. Its origin is `null` by design, so comparing origins would
+   * compare nothing at all. */
+  function cardOfFrame(source) {
+    if (!source) return null;
+    for (const entry of shown.values()) {
+      if (entry.frame && entry.frame.contentWindow === source) return entry;
+    }
+    return null;
+  }
+
+  /* Only what this message actually carries. The interface inside a frame says
+   * each of these when it changes and not otherwise, so a message about the
+   * connection must not blank out where the person is. */
+  function noteFrameHead(entry, message) {
+    if ('back' in message && entry.back) entry.back.hidden = message.back !== true;
+    if ('title' in message) {
+      entry.placeTitle = framedText(message.title);
+      showSubject(entry);
+    }
+    if ('status' in message && entry.pageStatus) {
+      entry.pageStatus.textContent = framedText(message.status);
+      const word = typeof message.state === 'string' ? message.state : '';
+      if (CONNECTION_WORDS.includes(word)) entry.pageStatus.dataset.afuiConnection = word;
+      else delete entry.pageStatus.dataset.afuiConnection;
+    }
+  }
+
+  /* A frame that is gone, or pointed somewhere new, has said none of it. */
+  function forgetFrameHead(entry) {
+    noteFrameHead(entry, {back: false, title: null, status: null});
+  }
+
+  /* Pressing the one control that belongs to what is inside the frame. It is a
+   * request, sent to that frame alone: what it does with it is that
+   * interface's, and this page has no way to check and no business checking. */
+  function askFrameBack(entry) {
+    const frame = entry.frame && entry.frame.contentWindow;
+    if (!frame) return;
+    // '*' because a frame isolated by sandbox has no origin to name, and there
+    // is nothing in this message to keep from it — it is the frame's own word,
+    // handed back.
+    frame.postMessage({afui: 1, type: 'back'}, '*');
+  }
+
+  window.addEventListener('message', event => {
+    const entry = cardOfFrame(event.source);
+    if (!entry) return;
+    const message = event.data;
+    if (!message || message.afui !== 1 || message.type !== 'head') return;
+    noteFrameHead(entry, message);
+    // Answered every time, so an interface can drop what this head already
+    // draws as soon as it is drawn — and never has to assume it is.
+    event.source.postMessage(
+      {
+        afui: 1,
+        type: 'frame',
+        head: Boolean(entry.subjectNode && entry.pageStatus),
+        navigation: Boolean(entry.back),
+      },
+      '*',
+    );
+  });
 
   function closeActionMenu(control) {
     const menu = control.closest('details');
@@ -209,10 +332,15 @@
     const chosen = SIZES.includes(size) ? size : 'tall';
     card.dataset.size = chosen;
     const button = card.querySelector('[data-act="size"]');
-    // The control is labelled with the size the card is, not with the one
-    // pressing it would produce: a person reads it far more often than they
-    // press it.
-    if (button) button.textContent = SIZE_LABELS[chosen];
+    // The control is named for the size the card is, not for the one pressing
+    // it would produce. It goes to the name rather than onto the face because
+    // the card's own height is what a person reads its size off — the word is
+    // for whoever is not reading heights, and for a pointer resting on it.
+    if (button) {
+      const named = `${SIZE_LABELS[chosen]} card`;
+      button.setAttribute('aria-label', named);
+      button.title = named;
+    }
   }
 
   function fold(card, button) {
@@ -313,6 +441,7 @@
       entry.frame = address ? frameFor(address, labelOf(session)) : null;
       if (entry.frame) entry.holder.append(entry.frame);
       entry.path = address;
+      forgetFrameHead(entry);
     }
     annotate(entry, session);
   }
@@ -460,7 +589,7 @@
     pageNotice.hidden = false;
     pageNotice.dataset.state = 'dead';
     pageNoticeText.textContent =
-      'This page expired. Ask for a new session serve URL on the machine doing the work.';
+      'This page expired. Ask for a new AFUI link on the machine doing the work.';
     pageRenew.hidden = true;
     stateNode.textContent = 'expired';
     stateLine.classList.add('stale');
@@ -471,8 +600,11 @@
     try {
       const response = await fetch(`${base}sessions`, {headers: {Accept: 'application/json'}});
       // Not "not answering": this listener answered, and what it said is that
-      // this page is over.
-      if (response.status === 404) {
+      // this page is over. `410` and not `404`, because this request carries
+      // the page's own credential — a listener that still recognises it and has
+      // finished with it is the one case that can be told apart from an address
+      // that was never here, and the reload of this same URL reads it too.
+      if (response.status === 410) {
         expire();
         return;
       }

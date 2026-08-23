@@ -104,6 +104,10 @@ pub(crate) struct RegistryHandle {
     path: Option<PathBuf>,
 }
 
+pub(crate) fn unpublished() -> RegistryHandle {
+    RegistryHandle { path: None }
+}
+
 impl Drop for RegistryHandle {
     fn drop(&mut self) {
         if let Some(path) = &self.path {

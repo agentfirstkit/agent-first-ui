@@ -189,9 +189,13 @@ Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-
 |---|---|
 | `--listen` | Address to bind. Loopback by default; widen it only behind a tunnel or VPN you trust |
 | `--advertise-host` | Authority to put in the URL when the bound address is not one anybody can open |
-| `--idle-minutes` | Stop answering this long after nobody is attending the page: no visible tab, no traffic through a session. `0` never stops |
-| `--grace-minutes` | How long the page warns first, still fully working, with a button that renews it. `0` lapses without warning |
+| `--idle-minutes` | Stop answering this long after nobody is attending the page: no visible tab, no traffic through a session. Overrides AFUI's global `attention.idle_timeout_s`; `0` never stops |
+| `--grace-minutes` | How long the page warns first, still fully working, with a button that renews it. Overrides AFUI's global `attention.grace_period_s`; `0` lapses without warning |
 | `--session-origin-host` | Give every session an origin of its own, `s-<credential>.<HOST>`, so a framed UI keeps browser storage. Needs `*.<HOST>` to resolve here, and a wildcard certificate behind TLS; `localhost` needs neither, because browsers resolve `*.localhost` to this machine. Also the host the page itself is served on |
+
+When neither override is supplied, AFUI reads `attention.idle_timeout_s` (default `900`) and `attention.grace_period_s` (default `300`) from the global AFUI `config.json`: `~/Library/Application Support/afui/config.json` on macOS, `$XDG_CONFIG_HOME/afui/config.json` on Linux (or `~/.config/afui/config.json` when `XDG_CONFIG_HOME` is unset), or `%APPDATA%\afui\config.json` on Windows. `AFUI_CONFIG_DIR` replaces that file's parent directory. The same policy controls direct `link` delivery.
+
+The serving progress event reports the resolved values as `idle_timeout_s` and `grace_period_s`; `idle_timeout_s` is `null` when expiry is disabled.
 
 ### `afui skill install`
 
@@ -283,4 +287,4 @@ Every structural failure emits one strict JSON `kind:"error"` event on stderr, l
 
 Two exit-1 codes describe the tool itself rather than the call: `cli_invocation_invalid` means the program misread its own resolved invocation — an unknown action id, or an argument id the selected combination cannot produce — and `output_setup_failed` means an output sink (`--stdout-file`, `--stderr-file`, stream redirection) could not be established. Both are defects to report, not inputs to correct; retrying the same command cannot help.
 
-Domain failures (exit 1) carry their own stable `error.code` instead, drawn from whatever this tool defines rather than from the `cli_*` set. No error message quotes a raw value it was given — an error event is routinely logged, and the input may hold secrets.
+Domain failures (exit 1) carry their own stable `error.code` instead, drawn from whatever this tool defines rather than from the `cli_*` set. Error events are routinely logged, so a message never quotes a value that came from an argument able to carry a credential — a header, a cookie, a token, a password, a proxy URL, an environment value, a form field. Such an error names the argument and the shape that was wrong, and stops there. A value that cannot be a secret — a path, a dot-path, a session name — is quoted, because an error that cannot say which one it means is not worth logging either.

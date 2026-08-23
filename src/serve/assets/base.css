@@ -1,0 +1,178 @@
+/* The floor every AFUI page stands on, served at AFUI's own reserved route.
+ *
+ * Two kinds of rule live here and nothing else:
+ *
+ *   1. rules AFUI's own behaviour decides — the runtime marks a control
+ *      `aria-disabled` while a call is in flight, and hides an element with
+ *      `hidden`, so what those look like is AFUI's answer to give;
+ *   2. rules that are wrong rather than plain when they are missing — a
+ *      focus ring, a `[hidden]` that actually hides, a page whose content
+ *      clears the notch on the phone this session was opened on.
+ *
+ * Everything above that floor belongs to the page. There are no components
+ * here: no button variants, no grid, no utility classes. The one vocabulary
+ * that names states rather than elements is the runtime's own connection
+ * state, for the same reason as (1); a Provider's word on `data-state` is
+ * styled nowhere here, because it is not this file's word to interpret.
+ * A Provider's own stylesheet loads after this one and outranks it at equal
+ * specificity, and the selectors below are deliberately weak — most are
+ * wrapped in `:where()` — so overriding never requires a specificity fight.
+ *
+ * Every value below is a custom property on `:root`, so a page that wants a
+ * different palette redeclares the ones it disagrees with in its own
+ * stylesheet and inherits the rest.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  /* Surfaces, from the page backdrop to the most raised panel on it. */
+  --afui-page: #f6f7f8;
+  --afui-panel: #ffffff;
+  --afui-panel-strong: #f3f5f7;
+
+  /* Text: the one being read, and the one saying something about it. */
+  --afui-ink: #1c2329;
+  --afui-muted: #626d77;
+
+  --afui-line: #d8dde2;
+
+  --afui-accent: #08745f;
+  --afui-accent-ink: #ffffff;
+
+  /* Where the keyboard is. Never remove the ring — replace it. */
+  --afui-focus: #1769d2;
+
+  /* Three things a page says about a value rather than about itself: this
+   * needs attention, this went wrong, this is settled. Each is an ink and a
+   * wash meant to be used together. */
+  --afui-warn-ink: #775000;
+  --afui-warn-bg: #fff6d9;
+  --afui-danger-ink: #a33a47;
+  --afui-danger-bg: #fff0f2;
+  --afui-ok-ink: #0b5c2e;
+  --afui-ok-bg: #e8f5ec;
+
+  --afui-shadow: 0 8px 24px rgba(26, 34, 41, .08);
+  --afui-radius: 6px;
+
+  --afui-font: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, ui-sans-serif, sans-serif;
+  --afui-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  /* How far the page's own content sits from the edge of the viewport. The
+   * page sets this one value; the safe-area maximum below is applied for it,
+   * so no page has to remember that a phone's edges are not all reachable. */
+  --afui-page-padding: 0px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --afui-page: #0b0d12;
+    --afui-panel: #141821;
+    --afui-panel-strong: #171c26;
+    --afui-ink: #e8ebf2;
+    --afui-muted: #99a2b5;
+    --afui-line: #2b3240;
+    --afui-accent: #71e6c2;
+    --afui-accent-ink: #0b0d12;
+    --afui-focus: #8ab4ff;
+    --afui-warn-ink: #f1cb75;
+    --afui-warn-bg: #241f14;
+    --afui-danger-ink: #e9a0a8;
+    --afui-danger-bg: #21161a;
+    --afui-ok-ink: #7fd7a0;
+    --afui-ok-bg: #16241b;
+    --afui-shadow: none;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  /* The page asks for one inset; each edge takes the larger of that and the
+   * area the hardware actually leaves reachable. A session delivered as a
+   * link or a served page is opened on a phone as often as not, and a notch
+   * eats the first line of a heading exactly once before someone notices. */
+  padding-top: max(var(--afui-page-padding), env(safe-area-inset-top));
+  padding-right: max(var(--afui-page-padding), env(safe-area-inset-right));
+  padding-bottom: max(var(--afui-page-padding), env(safe-area-inset-bottom));
+  padding-left: max(var(--afui-page-padding), env(safe-area-inset-left));
+  background: var(--afui-page);
+  color: var(--afui-ink);
+  font: 15px/1.5 var(--afui-font);
+  /* A phone in landscape must not silently enlarge the text a layout was
+   * measured with. */
+  -webkit-text-size-adjust: 100%;
+}
+
+/* Form controls do not inherit the page's typeface anywhere. */
+:where(button, input, select, textarea) {
+  font: inherit;
+  color: inherit;
+}
+
+/* The browser's own `[hidden]` rule loses to any author `display`, so an
+ * element a runtime believes it removed can still be laid out — pushing the
+ * rest of the page down while nothing on screen explains why. This is the one
+ * declaration here that has to win outright. */
+[hidden] {
+  display: none !important;
+}
+
+/* Keyboard focus, on everything that takes it. `:where()` keeps this at zero
+ * specificity: a page restyles the ring by writing the same selector. */
+:where(a, button, summary, input, select, textarea, [tabindex], [role="button"]):focus-visible {
+  outline: 3px solid var(--afui-focus);
+  outline-offset: 2px;
+}
+
+/* What a control looks like while the runtime has it in flight, or while the
+ * page has taken it out of service. `aria-disabled` is included because the
+ * runtime sets both, and a control that is not a `<button>` takes only that
+ * one. */
+:where(button, input, select, textarea):disabled,
+:where([aria-disabled="true"]) {
+  opacity: .55;
+  cursor: default;
+}
+
+/* Whether the page is still hearing from its session. `afui.connection()`
+ * writes the runtime's own word here, and these two are the ones that mean
+ * what is on screen may already be wrong — a fact AFUI is the only one who
+ * has, so saying how it looks is the same kind of rule as the one above.
+ * `live` and `connecting` get no colour: being connected is the ordinary
+ * case, and a page that painted it green would be decorating a non-event.
+ *
+ * The attribute is written twice on purpose, and these are the only rules
+ * here that reach for specificity at all. Every element this lands on is a
+ * status line the page already gave a colour, and a single `.status { color }`
+ * at one class would quietly outrank one attribute — leaving the ordinary
+ * colour on a page that has stopped being current, which is the whole failure
+ * this rule exists to prevent. Two attributes still lose to a page that names
+ * the state itself, so disagreeing stays one selector rather than an
+ * `!important` nobody can get back out from under. */
+[data-afui-connection="reconnecting"][data-afui-connection] {
+  color: var(--afui-warn-ink);
+}
+
+[data-afui-connection="closed"][data-afui-connection] {
+  color: var(--afui-danger-ink);
+}
+
+/* Nothing on a page AFUI serves is decorative enough to be worth overriding
+ * this. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -43,15 +43,6 @@ fn stream_output() -> OutputSpec {
 /// Loopback, because reaching this from another device is a decision.
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 
-/// How long an unattended page keeps working, and how long it warns first.
-///
-/// Expiring by default is the safe direction: the page is the one delivery
-/// nobody is bounded by, so left alone it should stop showing a person's
-/// terminal rather than keep showing it to whoever picks the phone up. Opting
-/// out is one flag, and an attended page never reaches either number.
-const DEFAULT_IDLE_MINUTES: i64 = 15;
-const DEFAULT_GRACE_MINUTES: i64 = 5;
-
 /// The skill this binary installs. `assets` is empty because the skill is a
 /// single file: it points agents at `afui frontend --help` rather than shipping
 /// a reference tree that would have to be kept in step with the CLI.
@@ -148,6 +139,17 @@ fn cli_spec() -> Result<BuiltCliSpec, CliSpecError> {
                      Binds a port and stops there: getting to that port is an SSH tunnel, \
                      WireGuard, Tailscale, or a TLS reverse proxy, none of which this is.",
                 )
+                .reference_note(
+                    "When neither override is supplied, AFUI reads `attention.idle_timeout_s` \
+                     (default `900`) and `attention.grace_period_s` (default `300`) from the \
+                     global AFUI `config.json`: `~/Library/Application Support/afui/config.json` \
+                     on macOS, `$XDG_CONFIG_HOME/afui/config.json` on Linux (or \
+                     `~/.config/afui/config.json` when `XDG_CONFIG_HOME` is unset), or \
+                     `%APPDATA%\\afui\\config.json` on Windows. `AFUI_CONFIG_DIR` replaces that \
+                     file's parent directory. The same policy controls direct `link` delivery.\n\n\
+                     The serving progress event reports the resolved values as `idle_timeout_s` \
+                     and `grace_period_s`; `idle_timeout_s` is `null` when expiry is disabled.",
+                )
                 .arg(
                     ArgSpec::option("--listen", "ADDRESS")
                         .default(DEFAULT_LISTEN)
@@ -160,22 +162,16 @@ fn cli_spec() -> Result<BuiltCliSpec, CliSpecError> {
                     "Authority to put in the URL when the bound address is not one \
                          anybody can open",
                 ))
-                .arg(
-                    ArgSpec::option_i64("--idle-minutes", "MINUTES")
-                        .default_i64(DEFAULT_IDLE_MINUTES)
-                        .about(
-                            "Stop answering this long after nobody is attending the page: no \
-                             visible tab, no traffic through a session. `0` never stops",
-                        ),
-                )
-                .arg(
-                    ArgSpec::option_i64("--grace-minutes", "MINUTES")
-                        .default_i64(DEFAULT_GRACE_MINUTES)
-                        .about(
-                            "How long the page warns first, still fully working, with a button \
-                             that renews it. `0` lapses without warning",
-                        ),
-                )
+                .arg(ArgSpec::option_i64("--idle-minutes", "MINUTES").about(
+                    "Stop answering this long after nobody is attending the page: no \
+                             visible tab, no traffic through a session. Overrides AFUI's global \
+                             `attention.idle_timeout_s`; `0` never stops",
+                ))
+                .arg(ArgSpec::option_i64("--grace-minutes", "MINUTES").about(
+                    "How long the page warns first, still fully working, with a button \
+                             that renews it. Overrides AFUI's global `attention.grace_period_s`; \
+                             `0` lapses without warning",
+                ))
                 .arg(ArgSpec::option("--session-origin-host", "HOST").about(
                     "Give every session an origin of its own, `s-<credential>.<HOST>`, so a \
                      framed UI keeps browser storage. Needs `*.<HOST>` to resolve here, and a \
@@ -332,6 +328,52 @@ fn main() -> ExitCode {
     }
 }
 
+/// The name a Provider looks a frontend's stylesheet up under. One name across
+/// the kit, because a person authoring a frontend should not have to learn a
+/// different one per Provider.
+const STYLESHEET_NAME: &str = "style.css";
+
+/// What a new frontend starts as, rather than an empty directory whose first
+/// render always fails.
+///
+/// It says the two things this directory cannot tell you by looking at it:
+/// which parts of the page's appearance a replacement is taking on, and which
+/// parts it cannot lose. There are no rules in it, because a rule here would
+/// be AFUI having an opinion about a page it has never seen.
+const STYLESHEET_STARTER: &str = "\
+/* This file replaces the Provider's own stylesheet, in full, as soon as this
+ * frontend is trusted (`afui frontend enable`). Anything the page looked like
+ * because of a rule the Provider wrote is now yours to write.
+ *
+ * What a replacement never loses is the floor: AFUI serves `__afui/base.css`
+ * itself, under the page's own session, and this file cannot remove it. The
+ * palette, the reset, the focus ring, `[hidden]`, the in-flight look of a
+ * disabled control and the inset that clears a phone's edges are already
+ * there. Retune any of it by redeclaring the property:
+ *
+ *     :root {
+ *       --afui-accent: #7a3cff;
+ *       --afui-page-padding: 1.5rem;
+ *     }
+ *
+ * Surfaces      --afui-page  --afui-panel  --afui-panel-strong
+ * Text          --afui-ink  --afui-muted
+ * Lines         --afui-line
+ * Emphasis      --afui-accent  --afui-accent-ink  --afui-focus
+ * Meaning       --afui-warn-ink/-bg  --afui-danger-ink/-bg  --afui-ok-ink/-bg
+ * Shape         --afui-radius  --afui-shadow  --afui-font  --afui-mono
+ * Layout        --afui-page-padding
+ *
+ * Every one of them has a light and a dark value already; redeclaring one
+ * outside a `prefers-color-scheme` block sets it for both themes.
+ *
+ * The templates go in `templates/`, under the names the Provider looks them
+ * up by. You do not have to guess which elements the page must carry: render
+ * it once and the failure names every hook that is missing, all of them
+ * together.
+ */
+";
+
 fn run_init(invocation: &ResolvedInvocation) -> ExitCode {
     run_domain(invocation, || {
         let context = context(invocation)?;
@@ -356,12 +398,16 @@ fn run_init(invocation: &ResolvedInvocation) -> ExitCode {
             ui_api_version,
         };
         write_json(&context.root.join("frontend.json"), &manifest)?;
+        let stylesheet = context.root.join(STYLESHEET_NAME);
+        fs::write(&stylesheet, STYLESHEET_STARTER).map_err(io_error)?;
         Ok(json!({
             "code": "frontend_init",
+            "base_style_path": agent_first_ui::BASE_STYLE_PATH,
             "frontend_id": manifest.frontend_id,
             "frontend_root": context.root,
             "provider_id": context.provider_id,
             "scope": context.scope_name,
+            "stylesheet": stylesheet,
             "ui_api_version": manifest.ui_api_version,
             "ui_kind": context.ui_kind,
         }))
@@ -674,16 +720,29 @@ fn flag(invocation: &ResolvedInvocation, id: &str) -> bool {
 /// for `0`, and telling them `-1` is an error while `0` is not would be a
 /// distinction with nothing behind it.
 #[cfg(feature = "serve")]
-fn idle_policy(invocation: &ResolvedInvocation) -> agent_first_ui::UiIdlePolicy {
-    let minutes = |id: &str, fallback: i64| -> std::time::Duration {
-        let value = invocation
-            .optional(id)
-            .and_then(CliValue::as_i64)
-            .unwrap_or(fallback);
-        std::time::Duration::from_secs(u64::try_from(value.max(0)).unwrap_or(0) * 60)
+fn attention_policy_override(
+    invocation: &ResolvedInvocation,
+) -> Result<Option<agent_first_ui::UiAttentionPolicy>, String> {
+    let minutes = |id: &str| -> Option<std::time::Duration> {
+        let value = invocation.optional(id).and_then(CliValue::as_i64)?;
+        Some(std::time::Duration::from_secs(
+            u64::try_from(value.max(0)).unwrap_or(0) * 60,
+        ))
     };
-    agent_first_ui::UiIdlePolicy::after(minutes("idle_minutes", DEFAULT_IDLE_MINUTES))
-        .with_grace(minutes("grace_minutes", DEFAULT_GRACE_MINUTES))
+    let idle = minutes("idle_minutes");
+    let grace = minutes("grace_minutes");
+    if idle.is_none() && grace.is_none() {
+        return Ok(None);
+    }
+    let mut policy =
+        agent_first_ui::UiAttentionPolicy::load_global().map_err(|error| error.to_string())?;
+    if let Some(idle) = idle {
+        policy = policy.with_idle_timeout(idle);
+    }
+    if let Some(grace) = grace {
+        policy = policy.with_grace_period(grace);
+    }
+    Ok(Some(policy))
 }
 
 /// List the sessions Providers currently have open.
@@ -852,9 +911,10 @@ async fn post_session_end(access_url_secret: &str) -> Result<u16, String> {
 
 /// Serve the sessions running here to a browser that is not here.
 ///
-/// This is a third delivery of the same sessions, not a second product: the
-/// page shows what `session list` shows, reverse-proxies each one so a device
-/// that is not this machine can reach it, and stops when this call does.
+/// This is the registry-backed form of AFUI's remote view, not a second
+/// product: the page shows what `session list` shows, reverse-proxies each one
+/// so a device that is not this machine can reach it, and stops when this call
+/// does.
 ///
 /// It is not a transport, and says so. The listener binds a port on this
 /// machine; crossing anything to get to that port is WireGuard, Tailscale, an
@@ -893,9 +953,23 @@ fn run_session_serve(invocation: &ResolvedInvocation) -> ExitCode {
     let mut emitter = CliEmitter::from_output_to(output_to, format).with_strict_protocol();
     let advertise_host = optional(invocation, "advertise_host");
     let session_origin_host = optional(invocation, "session_origin_host");
-    let idle_policy = idle_policy(invocation);
+    let attention_policy = match attention_policy_override(invocation) {
+        Ok(policy) => policy,
+        Err(message) => {
+            return emit_error(
+                "session_serve_attention_invalid",
+                &message,
+                format,
+                output_to,
+                1,
+            );
+        }
+    };
     let outcome = runtime.block_on(async {
-        let mut server = agent_first_ui::SessionServer::new(address).with_idle_policy(idle_policy);
+        let mut server = agent_first_ui::SessionServer::new(address);
+        if let Some(policy) = attention_policy {
+            server = server.with_attention_policy(policy);
+        }
         if let Some(host) = advertise_host {
             server = server.with_advertised_host(host);
         }
@@ -903,6 +977,7 @@ fn run_session_serve(invocation: &ResolvedInvocation) -> ExitCode {
             server = server.with_session_origin_host(host);
         }
         let served = server.bind().await.map_err(|error| error.to_string())?;
+        let attention_policy = served.attention_policy();
         let bound = served.local_addr().to_string();
         // The URL carries the credential, and the person it is for is holding a
         // phone rather than sitting at this machine — there is no window to
@@ -923,8 +998,10 @@ fn run_session_serve(invocation: &ResolvedInvocation) -> ExitCode {
                     // Said at handoff, because it is the one thing about this
                     // URL a person cannot discover by looking at it: how long
                     // it lasts once they stop looking.
-                    "idle_ms": idle_policy.idle().map(|idle| idle.as_millis()),
-                    "grace_ms": idle_policy.grace().as_millis(),
+                    "idle_timeout_s": attention_policy
+                        .idle_timeout()
+                        .map(|idle| idle.as_secs()),
+                    "grace_period_s": attention_policy.grace_period().as_secs(),
                 }))
                 .build(),
             )

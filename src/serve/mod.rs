@@ -1,11 +1,11 @@
-//! A third delivery: hand the sessions on this machine to a browser elsewhere.
+//! One AFUI-owned remote view, whether it carries one direct session or the
+//! sessions registered on this machine.
 //!
-//! A window and a direct URL are two ways of giving the same session to a
-//! person. This is the third, and it exists for one situation: the person is
-//! holding a phone and the agent is working on their laptop. Nothing here is a
-//! new kind of session — [`crate::list_sessions`] is still the only source, the
-//! Provider is still the only thing that understands its own page, and no new
-//! field is asked of anybody.
+//! A direct `link` supplies exactly the session its delivery just started;
+//! `afui session serve` follows [`crate::list_sessions`]. Both enter the same
+//! shell, proxy, attention clock, warning grace, and credential boundary. This
+//! is not a new kind of session: the Provider is still the only thing that
+//! understands its own page, and the remote layer asks no domain field of it.
 //!
 //! Two things follow from the person not being at this machine.
 //!
@@ -17,9 +17,10 @@
 //! **Loopback is not authentication either.** The listener mints one credential
 //! at startup and requires it for the page and its data. That credential is
 //! deliberately absent from everything a Provider UI touches: a proxied UI is
-//! reached by its own separate short-lived credential, is framed so that it
-//! cannot read the page it is in, and the requests it makes are forwarded
-//! upstream through a header allowlist that has no room for one.
+//! reached by its own mount credential governed by the remote attention
+//! policy, is framed so that it cannot read the page it is in, and the requests
+//! it makes are forwarded upstream through a header allowlist that has no room
+//! for the page credential.
 //!
 //! There are two ways to frame it, and they differ in where the isolation comes
 //! from. By default every session is a path on the one origin this listener
@@ -61,8 +62,8 @@ use addressing::{
     ORIGIN_LABEL_PREFIX, PROXY_SEGMENT, advertised_authority, hostname_of, mount_secret_of,
     requested_authority, session_origin_base,
 };
-pub use attention::UiIdlePolicy;
-use attention::{Attention, Phase};
+pub use attention::UiAttentionPolicy;
+use attention::{AttentionClock, Phase};
 use mounts::Mounts;
 use proxy::{Framing, Proxied};
 
@@ -76,13 +77,48 @@ use proxy::{Framing, Proxied};
 const NOT_FOUND_HTML: &str =
     "<!doctype html><meta charset=\"utf-8\"><title>Not Found</title><h1>Not Found</h1>";
 
+/// What this page's own credential renders after the page has lapsed.
+///
+/// Only somebody holding that credential ever sees it, which is what makes
+/// saying this much safe: they held the page, so being told it is over reveals
+/// nothing they did not already have. Everyone else keeps the 404 above,
+/// including anyone who arrives at this port without a credential — a listener
+/// that announced "an AFUI page expired here" to a passing scan would be
+/// answering the question the 404 exists to refuse.
+///
+/// Three facts, because arriving at a dead URL raises three questions and a
+/// bare 404 answers none of them: the address was right, the work is still
+/// there, and getting back to it is one command on the other machine.
+const GONE_HTML: &str = "<!doctype html><meta charset=\"utf-8\"><title>Page Expired</title>\
+     <h1>This page expired</h1>\
+     <p>Nobody was attending it, so it stopped answering and its credential was \
+     revoked. The address was correct — this is not a mistyped link, and \
+     reloading will not bring it back.</p>\
+     <p>The sessions themselves are untouched. They are still running on the \
+     machine that published them, and still listed there by \
+     <code>afui session list</code>.</p>\
+     <p>To reach them again, run <code>afui session serve</code> on that machine. \
+     It prints a new URL; this one will never work again.</p>";
+
 /// Serve the live sessions on this machine to a browser that is not on it.
 pub struct SessionServer {
     listen: SocketAddr,
     advertised_host: Option<String>,
     session_origin_host: Option<String>,
-    idle_policy: UiIdlePolicy,
+    attention_policy: Option<UiAttentionPolicy>,
     workspace_root: Option<PathBuf>,
+    source: SessionSource,
+}
+
+/// Which sessions this page is allowed to expose.
+///
+/// The long-running CLI page follows the cross-process registry. A direct link
+/// is deliberately narrower: it receives exactly the one session the caller
+/// just created, so handing out that link never reveals an unrelated session
+/// running on the same machine.
+enum SessionSource {
+    Registry,
+    Fixed(Vec<UiSessionEntry>),
 }
 
 /// Where a framed session is reached, which is the only thing that differs
@@ -110,6 +146,17 @@ pub struct ServedSessions {
     local_addr: SocketAddr,
 }
 
+/// A direct remote page that is already answering requests.
+///
+/// Kept crate-private because Providers interact with it through
+/// [`crate::ActiveUiDelivery`]. That is where a lapsed page becomes the typed
+/// terminal outcome for the one session it carries.
+pub(crate) struct ActiveRemoteView {
+    access_url: String,
+    state: Arc<ServeState>,
+    server_task: tokio::task::JoinHandle<Result<()>>,
+}
+
 impl SessionServer {
     #[must_use]
     pub fn new(listen: SocketAddr) -> Self {
@@ -117,8 +164,9 @@ impl SessionServer {
             listen,
             advertised_host: None,
             session_origin_host: None,
-            idle_policy: UiIdlePolicy::default(),
+            attention_policy: None,
             workspace_root: None,
+            source: SessionSource::Registry,
         }
     }
 
@@ -139,8 +187,14 @@ impl SessionServer {
     /// attending what is on it, and splitting the two would ask them to keep a
     /// terminal alive twice.
     #[must_use]
-    pub fn with_idle_policy(mut self, policy: UiIdlePolicy) -> Self {
-        self.idle_policy = policy;
+    pub fn with_attention_policy(mut self, policy: UiAttentionPolicy) -> Self {
+        self.attention_policy = Some(policy);
+        self
+    }
+
+    /// Restrict this listener to sessions supplied by its owning delivery.
+    pub(crate) fn with_fixed_sessions(mut self, sessions: Vec<UiSessionEntry>) -> Self {
+        self.source = SessionSource::Fixed(sessions);
         self
     }
 
@@ -183,6 +237,18 @@ impl SessionServer {
 
     /// Bind the listener and mint the credential the person will use.
     pub async fn bind(self) -> Result<ServedSessions> {
+        let attention_policy = match self.attention_policy {
+            Some(policy) => policy,
+            None => UiAttentionPolicy::load_global()?,
+        };
+        // Resolve the page before binding. An unusable trusted override should
+        // cost the caller an error, not leave a port allocated for a page that
+        // can never be served.
+        let workspace_root = match self.workspace_root {
+            Some(root) => root,
+            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+        let shell = frontend::ShellUi::resolve(&workspace_root)?;
         let listener = TcpListener::bind(self.listen).await.map_err(Error::Io)?;
         let local_addr = listener.local_addr().map_err(Error::Io)?;
         let addressing = match &self.session_origin_host {
@@ -211,29 +277,23 @@ impl SessionServer {
             });
         }
         // The credential itself never expires; what expires is the page's
-        // attention (§`UiIdlePolicy`), and that is a decision this listener
+        // attention (§`UiAttentionPolicy`), and that is a decision this listener
         // makes rather than one the token's own clock could make for it. A
         // token that slid forward on every authorized request would be renewed
         // by the page polling — which is the page asking a question, not a
         // person being there.
-        // Before the listener answers anything: a page that cannot be rendered
-        // should cost the person an error, not a bound port serving nothing.
-        let workspace_root = match self.workspace_root {
-            Some(root) => root,
-            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        };
-        let shell = frontend::ShellUi::resolve(&workspace_root)?;
         let token = UiAccessToken::issue(UiExpiry::Never)?;
         let access_url = format!("http://{authority}/{}/", token.secret().expose_secret());
         Ok(ServedSessions {
             listener,
             state: Arc::new(ServeState {
                 token,
-                idle_policy: self.idle_policy,
-                attention: Mutex::new(Attention::new()),
+                attention_policy,
+                attention: AttentionClock::new(),
                 shell,
                 mounts: Mutex::new(Mounts::default()),
                 addressing,
+                source: self.source,
             }),
             access_url,
             local_addr,
@@ -252,6 +312,12 @@ impl ServedSessions {
     #[must_use]
     pub fn access_url(&self) -> &str {
         &self.access_url
+    }
+
+    /// The attention policy this listener loaded or was explicitly given.
+    #[must_use]
+    pub fn attention_policy(&self) -> UiAttentionPolicy {
+        self.state.attention_policy
     }
 
     /// The workspace frontend serving this page, or `None` for AFUI's own.
@@ -279,6 +345,47 @@ impl ServedSessions {
             () = shutdown => Ok(()),
         }
     }
+
+    /// Start answering in the background for one direct delivery.
+    pub(crate) fn start(self) -> ActiveRemoteView {
+        let access_url = self.access_url.clone();
+        let state = Arc::clone(&self.state);
+        let server_task = tokio::spawn(self.run(std::future::pending::<()>()));
+        ActiveRemoteView {
+            access_url,
+            state,
+            server_task,
+        }
+    }
+}
+
+impl ActiveRemoteView {
+    pub(crate) fn access_url(&self) -> &str {
+        &self.access_url
+    }
+
+    pub(crate) fn attention_policy(&self) -> UiAttentionPolicy {
+        self.state.attention_policy
+    }
+
+    /// Wait until the shared attention clock lapses or the listener fails.
+    pub(crate) async fn wait_until_expired(&mut self) -> Result<()> {
+        tokio::select! {
+            () = self.state.attention.wait_until_dead(&self.state.attention_policy) => Ok(()),
+            result = &mut self.server_task => match result {
+                Ok(result) => result,
+                Err(error) => Err(Error::Io(std::io::Error::other(format!(
+                    "remote UI listener task failed: {error}"
+                )))),
+            },
+        }
+    }
+}
+
+impl Drop for ActiveRemoteView {
+    fn drop(&mut self) {
+        self.server_task.abort();
+    }
 }
 
 /// Everything one running listener holds.
@@ -286,11 +393,11 @@ struct ServeState {
     /// What the person proves to reach the page and its data. Never forwarded,
     /// never rendered, never in a URL a Provider UI can see.
     token: UiAccessToken,
-    idle_policy: UiIdlePolicy,
+    attention_policy: UiAttentionPolicy,
     /// The page's own clock. Its ending is final: this URL stops answering, and
     /// the way back is a new `session serve` URL from the machine, which is
     /// exactly the property that makes it a deadman rather than a nuisance.
-    attention: Mutex<Attention>,
+    attention: AttentionClock,
     /// The page this listener serves, resolved once before the port was bound.
     /// A replacement AFUI cannot use is an error at `bind`, never a listener
     /// quietly serving the built-in page to somebody expecting theirs.
@@ -300,6 +407,7 @@ struct ServeState {
     /// own address means: in one shape everything answers on it, in the other
     /// it answers for the page and nothing else.
     addressing: Addressing,
+    source: SessionSource,
 }
 
 impl ServeState {
@@ -315,9 +423,13 @@ impl ServeState {
     /// the authority the browser really used — port, or a TLS terminator's lack
     /// of one, included.
     async fn sessions(&self, shell_authority: Option<&str>) -> Result<Vec<Value>> {
-        let entries = tokio::task::spawn_blocking(crate::list_sessions)
-            .await
-            .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))??;
+        let entries =
+            match &self.source {
+                SessionSource::Registry => tokio::task::spawn_blocking(crate::list_sessions)
+                    .await
+                    .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))??,
+                SessionSource::Fixed(entries) => entries.clone(),
+            };
         self.mount_live_sessions(&entries, shell_authority)
     }
 
@@ -335,19 +447,14 @@ impl ServeState {
     ) -> Result<Vec<Value>> {
         self.mounts.lock().map_err(|_| poisoned())?.reconcile(
             entries,
-            &self.idle_policy,
+            &self.attention_policy,
             shell_authority,
         )
     }
 
     /// The page's own clock, advanced.
     fn shell_phase(&self) -> Phase {
-        match self.attention.lock() {
-            Ok(mut attention) => attention.phase(&self.idle_policy),
-            // A poisoned clock cannot be read, and refusing to serve is the
-            // wrong failure: the page is what a person is holding.
-            Err(_) => Phase::Live,
-        }
+        self.attention.phase(&self.attention_policy)
     }
 
     /// Somebody is at the page, and looking at these sessions.
@@ -357,9 +464,7 @@ impl ServeState {
     /// than revived — coming back is [`Self::reopen`], an act a person performs
     /// on one card, not something a heartbeat does to everything it can reach.
     fn attend(&self, session_ids: &[String]) {
-        if let Ok(mut attention) = self.attention.lock() {
-            attention.attend();
-        }
+        self.attention.attend();
         if let Ok(mut mounts) = self.mounts.lock() {
             mounts.attend(session_ids);
         }
@@ -378,8 +483,8 @@ impl ServeState {
             Ok(mut mounts) => mounts.revive(session_id),
             Err(_) => false,
         };
-        if removed && let Ok(mut attention) = self.attention.lock() {
-            attention.attend();
+        if removed {
+            self.attention.attend();
         }
         removed
     }
@@ -395,10 +500,8 @@ impl ServeState {
             .mounts
             .lock()
             .ok()?
-            .authorize(secret, &self.idle_policy)?;
-        if let Ok(mut attention) = self.attention.lock() {
-            attention.attend();
-        }
+            .authorize(secret, &self.attention_policy)?;
+        self.attention.attend();
         Some(proxied)
     }
 }
@@ -408,28 +511,38 @@ impl ServeState {
 /// A wrong credential is a 404 in every direction, for the same reason the
 /// session host answers that way: there is nothing there to authenticate
 /// against, and saying otherwise would confirm that this port hosts something.
+///
+/// The page's own lapse ends everything this listener answers, frames included.
+/// A page that stopped answering while the terminal it framed kept going would
+/// leave the part that shows a person's work as the one part that outlived them
+/// walking away. What the lapse changes is only what the *page's* credential is
+/// answered with — a `410` that says so, rather than a 404 indistinguishable
+/// from a typo. Everything else about a dead listener is unchanged.
 async fn dispatch(State(state): State<Arc<ServeState>>, request: Request) -> Response<Body> {
-    // The page's own lapse ends everything this listener answers, frames
-    // included. A page that stopped answering while the terminal it framed kept
-    // going would leave the part that shows a person's work as the one part
-    // that outlived them walking away.
-    if state.shell_phase() == Phase::Dead {
-        return not_found();
-    }
+    let lapsed = state.shell_phase() == Phase::Dead;
     match &state.addressing {
-        Addressing::Path => on_one_origin(&state, request).await,
-        Addressing::PerSession { base_host } => across_origins(&state, base_host, request).await,
+        Addressing::Path => on_one_origin(&state, lapsed, request).await,
+        Addressing::PerSession { base_host } => {
+            across_origins(&state, base_host, lapsed, request).await
+        }
     }
 }
 
 /// The page and every session it frames, on the one authority this listener
 /// answers for. What tells them apart is the first path segment.
-async fn on_one_origin(state: &Arc<ServeState>, request: Request) -> Response<Body> {
+async fn on_one_origin(state: &Arc<ServeState>, lapsed: bool, request: Request) -> Response<Body> {
     let path = request.uri().path().to_owned();
     let Some((head, remainder)) = split_first_segment(&path) else {
         return not_found();
     };
     if head == PROXY_SEGMENT {
+        // A frame is not where a person is told anything. It holds a Provider's
+        // UI, on an origin the page cannot read, and explaining AFUI's lifetime
+        // inside one would put this listener's words where a Provider's belong.
+        // The page around it says what happened.
+        if lapsed {
+            return not_found();
+        }
         let Some((secret, rest)) = split_first_segment(&remainder) else {
             return not_found();
         };
@@ -450,6 +563,9 @@ async fn on_one_origin(state: &Arc<ServeState>, request: Request) -> Response<Bo
     if !state.token.authorize(&head) {
         return not_found();
     }
+    if lapsed {
+        return gone();
+    }
     shell::respond(state, &remainder, &path, None, request).await
 }
 
@@ -464,6 +580,7 @@ async fn on_one_origin(state: &Arc<ServeState>, request: Request) -> Response<Bo
 async fn across_origins(
     state: &Arc<ServeState>,
     base_host: &str,
+    lapsed: bool,
     request: Request,
 ) -> Response<Body> {
     let Some(authority) = requested_authority(&request) else {
@@ -475,6 +592,10 @@ async fn across_origins(
         && let Some(label) = label.strip_prefix(ORIGIN_LABEL_PREFIX)
         && hostname_of(shell_authority) == base_host
     {
+        // As on the one-origin shape: a frame goes quiet, the page explains.
+        if lapsed {
+            return not_found();
+        }
         let Some(secret) = mount_secret_of(label) else {
             return not_found();
         };
@@ -500,11 +621,31 @@ async fn across_origins(
     if !state.token.authorize(&head) {
         return not_found();
     }
+    if lapsed {
+        return gone();
+    }
     shell::respond(state, &remainder, &path, Some(&authority), request).await
 }
 
 fn not_found() -> Response<Body> {
     let mut response = (StatusCode::NOT_FOUND, Html(NOT_FOUND_HTML)).into_response();
+    UiSecurityPolicy::isolated().apply_headers(response.headers_mut());
+    response
+}
+
+/// The page's own credential, after the page is over.
+///
+/// `410` rather than `404` because the two say different things and a person
+/// acts on the difference: gone is the address that was right and is finished,
+/// which is exactly the fact a lapsed page has to convey. The page's script
+/// reads the same status, so what a still-open tab reports and what a reload
+/// finds cannot drift apart.
+///
+/// Carries no stylesheet. Every route that could serve one belongs to a shell
+/// that is no longer answering, and a page whose whole content is three
+/// sentences does not need one badly enough to reopen a route for it.
+fn gone() -> Response<Body> {
+    let mut response = (StatusCode::GONE, Html(GONE_HTML)).into_response();
     UiSecurityPolicy::isolated().apply_headers(response.headers_mut());
     response
 }
@@ -534,17 +675,18 @@ mod tests {
     }
 
     fn state() -> Result<ServeState> {
-        state_with(UiIdlePolicy::never())
+        state_with(UiAttentionPolicy::never())
     }
 
-    fn state_with(idle_policy: UiIdlePolicy) -> Result<ServeState> {
+    fn state_with(attention_policy: UiAttentionPolicy) -> Result<ServeState> {
         Ok(ServeState {
             token: UiAccessToken::issue(UiExpiry::Never)?,
-            idle_policy,
-            attention: Mutex::new(Attention::new()),
+            attention_policy,
+            attention: AttentionClock::new(),
             shell: frontend::ShellUi::resolve(std::path::Path::new("/nonexistent"))?,
             mounts: Mutex::new(Mounts::default()),
             addressing: Addressing::Path,
+            source: SessionSource::Registry,
         })
     }
 
@@ -603,7 +745,11 @@ mod tests {
     const GRACE: Duration = Duration::from_millis(300);
 
     fn lapsing() -> Result<ServeState> {
-        state_with(UiIdlePolicy::after(IDLE).with_grace(GRACE))
+        state_with(
+            UiAttentionPolicy::default()
+                .with_idle_timeout(IDLE)
+                .with_grace_period(GRACE),
+        )
     }
 
     #[test]
@@ -784,7 +930,7 @@ mod tests {
         lapsing.attend(&[]);
         assert_eq!(lapsing.shell_phase(), Phase::Dead);
 
-        let forever = state_with(UiIdlePolicy::after(Duration::ZERO)).unwrap();
+        let forever = state_with(UiAttentionPolicy::never()).unwrap();
         let live = [entry("one", "http://127.0.0.1:9/aabbccdd/")];
         let secret = proxy_secret(&forever.mount_live_sessions(&live, None).unwrap()[0]);
         std::thread::sleep(IDLE + GRACE);
@@ -798,7 +944,12 @@ mod tests {
 
     #[test]
     fn a_grace_of_nothing_lapses_without_a_warning() {
-        let state = state_with(UiIdlePolicy::after(IDLE).with_grace(Duration::ZERO)).unwrap();
+        let state = state_with(
+            UiAttentionPolicy::default()
+                .with_idle_timeout(IDLE)
+                .with_grace_period(Duration::ZERO),
+        )
+        .unwrap();
         std::thread::sleep(IDLE);
         assert_eq!(state.shell_phase(), Phase::Dead);
     }

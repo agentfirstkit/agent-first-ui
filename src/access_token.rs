@@ -11,6 +11,11 @@ use crate::{Error, Result};
 
 const TOKEN_BYTES: usize = 32;
 
+/// How many characters a credential is, once hex-encoded — which is the form
+/// it appears in inside an access URL, and therefore the only form a caller
+/// picking one back out of a URL ever sees.
+pub(crate) const SECRET_HEX_DIGITS: usize = TOKEN_BYTES * 2;
+
 /// When a UI credential stops being usable.
 ///
 /// This is a property of *delivery*, not of the session. A window the person

@@ -1,10 +1,16 @@
 //! Small, domain-agnostic primitives for handing a web UI to a person.
 //!
-//! AFUI owns delivery, lifetime, and optional bounded channel transport.
-//! Providers own their Axum router, both channel value types, domain
-//! validation, presentation, and the meaning of a completed result.
+//! AFUI owns delivery, lifetime, and the live session protocol. Providers own
+//! their domain payload types, validation, presentation, and the meaning of a
+//! completed result.
 
 mod app_icon;
+/// Which of the three ways a session reaches a person. The word list is a
+/// parse over three strings and one environment variable, so it costs nothing
+/// to keep available in a build with no session at all — a Provider whose
+/// human UI is a compiled-out option still has a `--mode` flag. The executor
+/// underneath it needs a server, and stays behind `session`.
+mod delivery;
 mod error;
 mod frontend;
 mod frontend_script;
@@ -15,6 +21,17 @@ mod frontend_script;
 /// [`delivery::UiDeliveryPlan::deliver`]'s `link` branch is only one caller
 /// among any that need a LAN-reachable address for a reason of their own.
 mod lan;
+/// The floor a Provider's page stands on: the appearance AFUI's own runtime
+/// decides, and the handful of rules that are wrong rather than plain when a
+/// page forgets them. A stylesheet is a string, so it costs a build with no
+/// server nothing to carry — and the tier that only renders a page still has
+/// to be able to hand it out.
+mod page_style;
+/// The routes AFUI answers under every session's credential, as one list
+/// in the tier with no server in it: the dispatch that answers them, the page
+/// that references them, and a Provider that routes around them all read the
+/// same constants.
+mod reserved;
 
 /// Handing a UI to a person costs a server; keeping one honest does not.
 ///
@@ -25,30 +42,64 @@ mod lan;
 /// crate without them.
 #[cfg(feature = "session")]
 mod access_token;
-#[cfg(feature = "session")]
-mod channel;
-#[cfg(feature = "session")]
-mod delivery;
-#[cfg(feature = "session")]
-mod host;
+/// Declaring the delivery flag, reading it back, and getting the readiness
+/// facts into an event. The half of handing over a UI that happens on the
+/// command line, and the one every Provider had written for itself.
+#[cfg(feature = "cli")]
+pub mod cli;
 /// Assembling a frontend's templates into a page: the escaping policy, the
 /// render, the rendered-markup guard, and the element/runtime-marker
 /// contract check. Orthogonal to `session` — it renders and checks a page,
 /// it does not bind a port, so a build with a frontend but no server still
 /// gets it.
+/// Generating a Provider's decide-page runtime: the rules every decide page
+/// in this kit needs and every one of them was writing again. Behind `page`
+/// because it produces source a page splices in, and needs no server to do it.
+#[cfg(feature = "page")]
+mod decision;
+#[cfg(feature = "session")]
+mod host;
+/// Keeping a credential someone else issued from lapsing: the cadence, and the
+/// shape of the credential itself. The call that renews it stays the
+/// Provider's, because the endpoint it renews against is the Provider's.
+#[cfg(feature = "session")]
+mod lease;
 #[cfg(feature = "page")]
 mod page;
+/// The building material a Provider's page runtime is made of. Behind `page`
+/// because it produces source a page splices in, and needs no server to do it.
+#[cfg(feature = "page")]
+mod page_runtime;
 #[cfg(feature = "session")]
 mod registry;
+/// The one versioned state/action/event protocol every first-party AFUI page
+/// uses. Domain payloads remain Provider-owned; transport semantics do not.
+#[cfg(feature = "session")]
+mod runtime;
 #[cfg(feature = "session")]
 mod security;
-/// Serving this machine's sessions to a browser that is not on it costs a
-/// streaming HTTP client that no Provider consuming this crate as a library has
-/// any use for, so it is opt-in.
-#[cfg(feature = "serve")]
+/// The AFUI-owned remote page and streaming proxy used by direct `link`
+/// delivery and by `afui session serve`.
+#[cfg(feature = "session")]
 mod serve;
+/// The routes every Provider page serves, and the one bounded response shape a
+/// page's own bytes travel back in. Behind `session` because both are routers
+/// and responses; neither decides anything about what a page contains.
+#[cfg(feature = "session")]
+mod serving;
 #[cfg(feature = "session")]
 mod session;
+/// One rendered page, handed to a person, waited on: the nine composition
+/// steps every Provider here wrote for itself. Deliberately the last layer —
+/// everything it does is reachable directly, and a page that does not fit this
+/// shape should use the pieces instead of bending to it.
+#[cfg(feature = "session")]
+mod surface;
+/// What a Provider's own tests need to arrange the world AFUI reads from.
+/// Behind its own feature, out of the default set, so nothing here reaches a
+/// release binary.
+#[cfg(feature = "test-support")]
+pub mod test_support;
 #[cfg(feature = "session")]
 mod upstream;
 #[cfg(feature = "session")]
@@ -62,8 +113,9 @@ mod window;
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-pub use app_icon::{APP_ICON_ASSET_PATH, APP_ICON_PATH, UiAppIcon};
-pub use error::{Error, Result};
+pub use app_icon::{APP_ICON_ASSET_PATH, UiAppIcon};
+pub use delivery::{DELIVERY_ENV, UiDeliveryMode};
+pub use error::{Error, Result, UiErrorKind};
 pub use frontend::{
     CONFIG_DIR_ENV, FrontendLocation, FrontendManifest, FrontendScope, SAFE_MODE_ENV,
     SAFE_MODE_HINT, UiFrontend, discover_frontend, frontend_root, global_afui_root, load_frontend,
@@ -71,35 +123,50 @@ pub use frontend::{
 };
 pub use frontend_script::{reject_frontend_script, reject_rendered_script};
 pub use lan::primary_lan_ipv4;
+pub use page_style::page_base_style_source;
+pub use reserved::{APP_ICON_PATH, BASE_STYLE_PATH, SESSION_END_PATH};
 
 #[cfg(feature = "session")]
 pub use access_token::{UiAccessToken, UiExpiry};
+#[cfg(feature = "page")]
+pub use decision::{DECISION_PENDING_DATASET_KEY, UiDecisionRuntime};
 #[cfg(feature = "session")]
-pub use channel::{
-    DEFAULT_UI_SESSION_CHANNEL_CAPACITY, MAX_UI_SESSION_CHANNEL_MESSAGE_BYTES, UiSessionChannel,
-};
+pub use delivery::{ActiveUiDelivery, ActiveUiUpstreamDelivery, UiDeliveryFacts, UiDeliveryPlan};
 #[cfg(feature = "session")]
-pub use delivery::{ActiveUiDelivery, DELIVERY_ENV, UiDeliveryMode, UiDeliveryPlan};
+pub use host::{UiHost, UiMount, UiMountAccess, UiMountCredential};
 #[cfg(feature = "session")]
-pub use host::{SESSION_CHANNEL_PATH, SESSION_END_PATH, UiHost, UiMount};
+pub use lease::{UiCredentialLease, is_ui_credential};
 #[cfg(feature = "page")]
 pub use page::{
     UiPage, UiPageBuilder, UiPageEnvironment, UiPageFilterResult, UiPageSerializedValue,
     UiPageValue,
 };
+#[cfg(feature = "page")]
+pub use page_runtime::page_kernel_source;
 #[cfg(feature = "session")]
 pub use registry::{
     NO_REGISTRY_ENV, UiSessionEntry, find_session, list_sessions, sessions_directory,
 };
 #[cfg(feature = "session")]
-pub use security::{OriginDecision, UiCspNonce, UiSecurityPolicy};
-#[cfg(feature = "serve")]
-pub use serve::{ServedSessions, SessionServer, UiIdlePolicy};
+pub use runtime::{
+    DEFAULT_UI_RUNTIME_CALL_CAPACITY, DEFAULT_UI_RUNTIME_EVENT_CAPACITY,
+    MAX_UI_RUNTIME_MESSAGE_BYTES, UiBlobRef, UiCall, UiCallError, UiSessionRuntime,
+};
+#[cfg(feature = "session")]
+pub use security::{OriginDecision, UiCspNonce, UiPagePolicy, UiPageScript, UiSecurityPolicy};
+#[cfg(feature = "session")]
+pub use serve::{ServedSessions, SessionServer, UiAttentionPolicy};
+#[cfg(feature = "session")]
+pub use serving::{
+    PAGE_ASSETS_PREFIX, PAGE_STYLESHEET_PATH, UiBlobPolicy, page_asset_routes, page_routes,
+};
 #[cfg(feature = "session")]
 pub use session::{
     ActiveUiSession, Outcome, UiCompletion, UiSession, UiSessionId, UiSessionMetadata,
     UiUrlDelivery,
 };
+#[cfg(feature = "session")]
+pub use surface::{ActiveUiSurface, UiSurface, surface_page};
 #[cfg(feature = "session")]
 pub use upstream::{AnnouncedUiUpstream, UiUpstream};
 #[cfg(feature = "session")]

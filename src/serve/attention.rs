@@ -1,126 +1,139 @@
-//! How long a page nobody is looking at keeps working.
+//! One lifecycle for every AFUI-owned remote page.
 //!
-//! A window ends when the person closes it; a served page ends when they walk
-//! away, and walking away leaves no trace. So this is the clock that notices,
-//! and the two-step ending that keeps noticing from being destructive: a
-//! warning first, while everything still works, and only then the end.
-//!
-//! Deliberately free of anything else in this module. It is arithmetic over one
-//! instant, it is where the surprising decisions about that arithmetic live,
-//! and it is tested without a socket.
+//! A local window ends when the person closes it. A remote page has no such
+//! physical bound: a phone can lock, a tab can disappear into the background,
+//! and neither event closes the underlying session. AFUI therefore owns one
+//! attention clock for both direct `link` delivery and `afui session serve`.
+//! The clock warns first, while the page remains fully usable, and only then
+//! makes that remote view unavailable.
 
+use std::fs;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// How long an unattended page keeps working before it says so.
-const DEFAULT_IDLE: Duration = Duration::from_secs(15 * 60);
+use serde::Deserialize;
+use tokio::sync::Notify;
 
-/// How long the warning lasts. Still fully usable — a warning that has already
-/// broken the thing it is warning about is not a warning.
-const DEFAULT_GRACE: Duration = Duration::from_secs(5 * 60);
+use crate::{Error, Result, global_afui_root};
 
-/// When an unattended page stops working, and how much warning it gets first.
-///
-/// A remote view is the one delivery nobody is bounded by. A window ends when
-/// the person closes it; this ends when they walk away, and walking away leaves
-/// no trace — a phone goes in a pocket, a tab goes to the back of a browser, a
-/// laptop sleeps. So the listener runs a clock, and the page's job is to say
-/// "someone is still here" while someone still is.
-///
-/// The warning matters as much as the expiry. A credential that lapses silently
-/// takes the frame with it, and a frame rebuilt underneath a person is a form
-/// they were filling in, gone. So the end has two steps: `idle` of nobody
-/// attending, then `grace` in which everything still works and the page says
-/// out loud that it is about to stop.
-///
-/// # What this bounds, and what it does not
-///
-/// This bounds how long an **unattended page** keeps showing what it shows. It
-/// is not an access control: whoever holds the listener's URL can reload it and
-/// mount every live session again. What genuinely dies is the *view* — and, for
-/// a lapsed session, its proxy credential, which is what a leaked frame address
-/// was.
-///
-/// It also cannot see inside a frame. A Provider UI that polls on a timer is
-/// traffic, and traffic is the only evidence there is that someone is using it,
-/// so such a page holds its own credential open for as long as the browser
-/// keeps running it. On a phone that ends when the screen locks, which is the
-/// case this exists for.
-///
-/// The same fact has a less friendly shape on a desktop with several cards
-/// open at once. A self-refreshing panel — a status poll, a log tail — keeps
-/// generating frame traffic on its own, and every one of those requests
-/// renews not only its own card but the *page's* shared clock too
-/// (`ServeState::mount`), because a request through any frame is the only
-/// evidence this listener has that somebody is at the page at all. So one
-/// busy card suspends the idle protection for the whole page — including a
-/// quiet neighbour, whose own view still lapses on its own schedule, but
-/// whose page stays reachable and its lapsed card reopenable regardless, for
-/// as long as the busy card keeps talking. A clock kept per session instead
-/// was considered and rejected: it would end the page a person is actually
-/// reading because a neighbouring card happened to be quiet at that moment,
-/// which is the worse failure. What still bounds the whole thing is the
-/// listener's own process lifetime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UiIdlePolicy {
-    idle: Option<Duration>,
-    grace: Duration,
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(5 * 60);
+
+/// The global settings file read by AFUI-owned remote pages.
+const CONFIG_FILE: &str = "config.json";
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Config {
+    attention: AttentionConfig,
 }
 
-impl Default for UiIdlePolicy {
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AttentionConfig {
+    idle_timeout_s: u64,
+    grace_period_s: u64,
+}
+
+impl Default for AttentionConfig {
     fn default() -> Self {
         Self {
-            idle: Some(DEFAULT_IDLE),
-            grace: DEFAULT_GRACE,
+            idle_timeout_s: DEFAULT_IDLE_TIMEOUT.as_secs(),
+            grace_period_s: DEFAULT_GRACE_PERIOD.as_secs(),
         }
     }
 }
 
-impl UiIdlePolicy {
-    /// Nothing lapses. The listener's own lifetime is the only bound.
+/// When an unattended AFUI page lapses, and how long it warns first.
+///
+/// This policy belongs to the delivery layer rather than to any Provider. A
+/// direct link and a shared session page therefore read the same global AFUI
+/// configuration and run the same state machine. What happens after the view
+/// lapses remains delivery-specific: a direct link returns
+/// [`crate::Outcome::Expired`], while a shared page only revokes that browser
+/// view and leaves its registered sessions running.
+///
+/// By default a page warns after 15 minutes without attention and lapses after
+/// a further 5 minutes. The global override is `config.json` under
+/// [`crate::global_afui_root`] (or `AFUI_CONFIG_DIR` in an isolated runtime):
+///
+/// ```json
+/// {
+///   "attention": {
+///     "idle_timeout_s": 900,
+///     "grace_period_s": 300
+///   }
+/// }
+/// ```
+///
+/// `idle_timeout_s: 0` disables attention expiry. `grace_period_s: 0` keeps
+/// expiry but removes the warning interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiAttentionPolicy {
+    idle_timeout: Option<Duration>,
+    grace_period: Duration,
+}
+
+impl Default for UiAttentionPolicy {
+    fn default() -> Self {
+        Self {
+            idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
+            grace_period: DEFAULT_GRACE_PERIOD,
+        }
+    }
+}
+
+impl UiAttentionPolicy {
+    /// Read the global AFUI policy, or return the built-in policy when the file
+    /// does not exist.
+    pub fn load_global() -> Result<Self> {
+        let path = global_afui_root()?.join(CONFIG_FILE);
+        if !path.is_file() {
+            return Ok(Self::default());
+        }
+        let bytes = fs::read(&path).map_err(Error::Io)?;
+        let config: Config = serde_json::from_slice(&bytes)
+            .map_err(|source| Error::AttentionConfigInvalid { path, source })?;
+        Ok(Self::default()
+            .with_idle_timeout(Duration::from_secs(config.attention.idle_timeout_s))
+            .with_grace_period(Duration::from_secs(config.attention.grace_period_s)))
+    }
+
+    /// Nothing lapses. The process or session lifetime is the only bound.
     #[must_use]
     pub fn never() -> Self {
         Self {
-            idle: None,
-            grace: Duration::ZERO,
+            idle_timeout: None,
+            grace_period: Duration::ZERO,
         }
     }
 
-    /// Lapse after this long unattended, with the default warning.
-    ///
-    /// A zero duration is [`Self::never`] rather than an error: the caller of
-    /// this is a CLI flag, and "0 means no limit" is the spelling a person
-    /// reaches for.
+    /// Replace the unattended interval. Zero disables attention expiry.
     #[must_use]
-    pub fn after(idle: Duration) -> Self {
-        if idle.is_zero() {
-            return Self::never();
-        }
-        Self {
-            idle: Some(idle),
-            grace: DEFAULT_GRACE,
-        }
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = (!idle_timeout.is_zero()).then_some(idle_timeout);
+        self
     }
 
-    /// How long the warning lasts. Zero means the lapse is the first anyone
-    /// hears of it.
+    /// Replace the warning interval. Zero lapses without a warning.
     #[must_use]
-    pub fn with_grace(mut self, grace: Duration) -> Self {
-        self.grace = grace;
+    pub fn with_grace_period(mut self, grace_period: Duration) -> Self {
+        self.grace_period = grace_period;
         self
     }
 
     #[must_use]
-    pub fn idle(&self) -> Option<Duration> {
-        self.idle
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        self.idle_timeout
     }
 
     #[must_use]
-    pub fn grace(&self) -> Duration {
-        self.grace
+    pub fn grace_period(&self) -> Duration {
+        self.grace_period
     }
 }
 
-/// Where one clock stands.
+/// Where one attention clock stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Phase {
     Live,
@@ -128,8 +141,7 @@ pub(super) enum Phase {
     Expiring {
         remaining: Duration,
     },
-    /// Over. For a session that means its proxy credential is revoked and will
-    /// not be minted again unasked; for the page it means the URL is done.
+    /// Over. A remote credential is revoked and is never silently revived.
     Dead,
 }
 
@@ -144,16 +156,11 @@ impl Phase {
 }
 
 /// One clock: the last time somebody was here, and how far that has run out.
-///
-/// Advanced lazily by [`Self::phase`] rather than by a timer, because there is
-/// nothing to do at the moment a credential lapses except answer the next
-/// request differently — and something is always asking, since the page polls.
 #[derive(Debug)]
 pub(super) struct Attention {
     last_attended: Instant,
-    /// Sticky, so that coming back has to be an explicit act rather than the
-    /// next request arriving. Nothing else here is remembered — both deadlines
-    /// are arithmetic on the field above.
+    /// Sticky, so returning requires an explicit action rather than the next
+    /// background request silently resurrecting a lapsed view.
     dead: bool,
 }
 
@@ -165,37 +172,156 @@ impl Attention {
         }
     }
 
-    /// Somebody is here. Renews, and cancels any warning in progress.
     pub(super) fn attend(&mut self) {
-        if self.dead {
-            return;
+        if !self.dead {
+            self.last_attended = Instant::now();
         }
-        self.last_attended = Instant::now();
     }
 
-    /// Advance the clock and say where it stands.
-    ///
-    /// Both deadlines are measured from the last time somebody was here, not
-    /// from when this was last asked. A phone asleep for an hour would
-    /// otherwise wake up to a fresh five-minute warning — the clock would only
-    /// ever run while something was watching it, which is precisely backwards
-    /// for a thing whose whole job is to notice that nothing is.
-    pub(super) fn phase(&mut self, policy: &UiIdlePolicy) -> Phase {
+    pub(super) fn phase(&mut self, policy: &UiAttentionPolicy) -> Phase {
         if self.dead {
             return Phase::Dead;
         }
-        let Some(idle) = policy.idle else {
+        let Some(idle_timeout) = policy.idle_timeout else {
             return Phase::Live;
         };
-        let Some(past_idle) = self.last_attended.elapsed().checked_sub(idle) else {
+        let Some(past_idle) = self.last_attended.elapsed().checked_sub(idle_timeout) else {
             return Phase::Live;
         };
-        if past_idle >= policy.grace {
+        if past_idle >= policy.grace_period {
             self.dead = true;
             return Phase::Dead;
         }
         Phase::Expiring {
-            remaining: policy.grace - past_idle,
+            remaining: policy.grace_period - past_idle,
         }
+    }
+
+    fn remaining_until_dead(&mut self, policy: &UiAttentionPolicy) -> Option<Duration> {
+        if self.dead {
+            return Some(Duration::ZERO);
+        }
+        let idle_timeout = policy.idle_timeout?;
+        let lifetime = idle_timeout.saturating_add(policy.grace_period);
+        let remaining = lifetime.saturating_sub(self.last_attended.elapsed());
+        if remaining.is_zero() {
+            self.dead = true;
+        }
+        Some(remaining)
+    }
+}
+
+/// A clock shared by request handlers and the direct-link waiter.
+///
+/// The served page advances the phase lazily on requests. Direct link delivery
+/// also needs an outcome when nobody ever opens the URL, so this wrapper adds a
+/// wake-up signal and an async deadline without introducing another clock.
+pub(super) struct AttentionClock {
+    attention: Mutex<Attention>,
+    changed: Notify,
+}
+
+impl AttentionClock {
+    pub(super) fn new() -> Self {
+        Self {
+            attention: Mutex::new(Attention::new()),
+            changed: Notify::new(),
+        }
+    }
+
+    pub(super) fn phase(&self, policy: &UiAttentionPolicy) -> Phase {
+        self.attention
+            .lock()
+            .map(|mut attention| attention.phase(policy))
+            .unwrap_or(Phase::Live)
+    }
+
+    pub(super) fn attend(&self) {
+        if let Ok(mut attention) = self.attention.lock() {
+            attention.attend();
+            self.changed.notify_waiters();
+        }
+    }
+
+    pub(super) async fn wait_until_dead(&self, policy: &UiAttentionPolicy) {
+        loop {
+            // Register before reading the deadline so attention arriving in
+            // between cannot be lost and leave this sleeping on an old one.
+            let changed = self.changed.notified();
+            let remaining = self
+                .attention
+                .lock()
+                .ok()
+                .and_then(|mut attention| attention.remaining_until_dead(policy));
+            match remaining {
+                None => std::future::pending::<()>().await,
+                Some(remaining) if remaining.is_zero() => return,
+                Some(remaining) => {
+                    tokio::select! {
+                        () = tokio::time::sleep(remaining) => {}
+                        () = changed => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::Write;
+
+    use crate::{CONFIG_DIR_ENV, ENV_LOCK};
+
+    #[test]
+    fn default_policy_has_one_warning_after_one_idle_interval() {
+        let policy = UiAttentionPolicy::default();
+        assert_eq!(policy.idle_timeout(), Some(Duration::from_secs(900)));
+        assert_eq!(policy.grace_period(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn global_config_replaces_both_intervals_and_zero_disables_expiry() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(CONFIG_FILE);
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(br#"{"attention":{"idle_timeout_s":42,"grace_period_s":7}}"#)
+            .unwrap();
+        // SAFETY: every AFUI unit test that mutates this variable uses ENV_LOCK.
+        unsafe { std::env::set_var(CONFIG_DIR_ENV, root.path()) };
+        let configured = UiAttentionPolicy::load_global().unwrap();
+        assert_eq!(configured.idle_timeout(), Some(Duration::from_secs(42)));
+        assert_eq!(configured.grace_period(), Duration::from_secs(7));
+
+        fs::write(
+            &path,
+            br#"{"attention":{"idle_timeout_s":0,"grace_period_s":9}}"#,
+        )
+        .unwrap();
+        let unlimited = UiAttentionPolicy::load_global().unwrap();
+        assert_eq!(unlimited.idle_timeout(), None);
+        assert_eq!(unlimited.grace_period(), Duration::from_secs(9));
+        // SAFETY: every AFUI unit test that mutates this variable uses ENV_LOCK.
+        unsafe { std::env::remove_var(CONFIG_DIR_ENV) };
+    }
+
+    #[test]
+    fn unknown_attention_config_fields_are_rejected() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join(CONFIG_FILE),
+            br#"{"attention":{"idle_timeout_s":42,"grace_period_s":7,"typo":1}}"#,
+        )
+        .unwrap();
+        // SAFETY: every AFUI unit test that mutates this variable uses ENV_LOCK.
+        unsafe { std::env::set_var(CONFIG_DIR_ENV, root.path()) };
+        let error = UiAttentionPolicy::load_global().unwrap_err().to_string();
+        assert!(error.contains("typo"), "{error}");
+        // SAFETY: every AFUI unit test that mutates this variable uses ENV_LOCK.
+        unsafe { std::env::remove_var(CONFIG_DIR_ENV) };
     }
 }

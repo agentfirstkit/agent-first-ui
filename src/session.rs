@@ -7,13 +7,14 @@ use axum::Router;
 use getrandom::fill;
 use tokio::sync::{Mutex, Notify};
 
-use crate::channel::{UiSessionChannelCloser, UiSessionChannelMount};
 use crate::frontend::validate_identifier;
 use crate::host::{SessionRegistration, UiHost, UiMount};
 use crate::registry::{self, RegistryHandle};
+use crate::runtime::{UiSessionRuntimeCloser, UiSessionRuntimeMount};
 use crate::{
-    DEFAULT_UI_SESSION_CHANNEL_CAPACITY, Error, Result, UiAccessToken, UiAppIcon, UiExpiry,
-    UiSecurityPolicy, UiSessionChannel, UiWindow, UiWindowConfig,
+    DEFAULT_UI_RUNTIME_CALL_CAPACITY, DEFAULT_UI_RUNTIME_EVENT_CAPACITY, Error, Result,
+    UiAccessToken, UiAppIcon, UiBlobPolicy, UiExpiry, UiSecurityPolicy, UiSessionEntry,
+    UiSessionRuntime, UiWindow, UiWindowConfig,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -31,6 +32,25 @@ pub enum Outcome<T> {
     Completed(T),
     Closed,
     Expired,
+}
+
+impl<T> Outcome<T> {
+    /// The one word for how this ended: `completed`, `closed`, or `expired`.
+    ///
+    /// A Provider almost always has a richer word of its own for the completed
+    /// case — what the person actually decided — and should use it. What this
+    /// is for is the other two, which carry no domain meaning at all and which
+    /// every Provider was otherwise spelling for itself: whether a person
+    /// closing a window reads back as `closed`, `window_closed`, or
+    /// `cancelled` is not a decision anyone benefits from making twice.
+    #[must_use]
+    pub fn ending(&self) -> &'static str {
+        match self {
+            Self::Completed(_) => "completed",
+            Self::Closed => "closed",
+            Self::Expired => "expired",
+        }
+    }
 }
 
 /// How a managed URL is exposed, and when its credential stops working.
@@ -75,8 +95,19 @@ impl UiUrlDelivery {
     }
 }
 
+/// A session's one terminal outcome, and whether it has been handed over yet.
+///
+/// Terminal means terminal: once a slot leaves `Pending` it never returns, so a
+/// `UiCompletion` retained past the end of a session cannot complete it again.
+/// The outcome is taken out exactly once, by the waiter that owns the session.
+enum TerminalSlot<T> {
+    Pending,
+    Settled(Outcome<T>),
+    Taken,
+}
+
 struct CompletionState<T> {
-    outcome: Mutex<Option<Outcome<T>>>,
+    outcome: Mutex<TerminalSlot<T>>,
     notify: Notify,
 }
 
@@ -92,11 +123,13 @@ pub struct UiSession<T> {
     app_icon: Option<UiAppIcon>,
     subject: Option<String>,
     waits_for_decision: bool,
-    channel: Option<UiSessionChannelMount>,
+    runtime: Option<UiSessionRuntimeMount>,
 }
 
 pub struct ActiveUiSession<T> {
     metadata: UiSessionMetadata,
+    subject: Option<String>,
+    waits_for_decision: bool,
     access_url: String,
     access_token: UiAccessToken,
     completion: UiCompletion<T>,
@@ -113,9 +146,8 @@ pub struct ActiveUiSession<T> {
     /// must then outlive it. A session mounted on a caller-owned host holds
     /// nothing here — the caller decides when that host stops.
     _owned_host: Option<Arc<UiHost>>,
-    /// Ends the optional full-duplex channel with the session, including when
-    /// the active handle is dropped without anyone waiting on it.
-    channel_closer: Option<UiSessionChannelCloser>,
+    /// Ends the AFUI-owned runtime with the session.
+    runtime_closer: Option<UiSessionRuntimeCloser>,
 }
 
 impl<T> Clone for UiCompletion<T> {
@@ -134,20 +166,43 @@ impl<T> UiCompletion<T> {
 
     async fn finish(&self, outcome: Outcome<T>) -> bool {
         let mut stored = self.state.outcome.lock().await;
-        if stored.is_some() {
+        if !matches!(*stored, TerminalSlot::Pending) {
             return false;
         }
-        *stored = Some(outcome);
+        *stored = TerminalSlot::Settled(outcome);
         drop(stored);
         self.state.notify.notify_waiters();
         true
     }
 
+    /// Offer `outcome` as the session's ending, and return the one that won.
+    ///
+    /// The close, expiry and window-close branches used to build an outcome and
+    /// return it directly, so a `Completed(T)` that became ready in the same
+    /// moment could lose to `Closed` or `Expired` on nothing more than which
+    /// arm `select!` happened to pick — and a caller would be told the person
+    /// closed the window when they had in fact just answered. Every ending goes
+    /// through the same slot now, and whoever got there first is the answer.
+    async fn settle(&self, outcome: Outcome<T>) -> Outcome<T> {
+        self.finish(outcome).await;
+        self.wait().await
+    }
+
+    /// Take the terminal outcome. Called once, by the waiter that owns the
+    /// session — `wait` and `wait_with_window` both consume `self`.
     async fn wait(&self) -> Outcome<T> {
         loop {
             let notified = self.state.notify.notified();
-            if let Some(outcome) = self.state.outcome.lock().await.take() {
-                return outcome;
+            {
+                let mut stored = self.state.outcome.lock().await;
+                if let TerminalSlot::Settled(_) = *stored {
+                    let TerminalSlot::Settled(outcome) =
+                        std::mem::replace(&mut *stored, TerminalSlot::Taken)
+                    else {
+                        unreachable!("checked immediately above while holding the lock")
+                    };
+                    return outcome;
+                }
             }
             notified.await;
         }
@@ -171,7 +226,7 @@ where
             },
             completion: UiCompletion {
                 state: Arc::new(CompletionState {
-                    outcome: Mutex::new(None),
+                    outcome: Mutex::new(TerminalSlot::Pending),
                     notify: Notify::new(),
                 }),
             },
@@ -183,7 +238,7 @@ where
             // `awaiting_person` for the session that has nothing to hand back
             // yet is still, unmistakably, waiting on a person.
             waits_for_decision: TypeId::of::<T>() != TypeId::of::<()>(),
-            channel: None,
+            runtime: None,
         })
     }
 
@@ -244,32 +299,68 @@ where
         self.completion.clone()
     }
 
-    /// Attach one bounded, full-duplex channel to this session.
+    /// Attach AFUI's typed, reconnecting session runtime.
     ///
-    /// The returned handle belongs to the process controlling the session.
-    /// The surface connects to [`crate::SESSION_CHANNEL_PATH`] relative to its
-    /// own session URL. `FromSurface` and `ToSurface` are encoded directly as
-    /// JSON WebSocket messages; AFUI assigns them no domain meaning and retains
-    /// no history.
-    pub fn with_channel<FromSurface, ToSurface>(
+    /// State is latest-value and retained, calls are correlated by AFUI, and
+    /// ordered events have bounded replay. Provider payload types contain none
+    /// of those transport fields.
+    pub fn with_runtime<Action, Reply, SurfaceState>(
         self,
-    ) -> Result<(Self, UiSessionChannel<FromSurface, ToSurface>)> {
-        self.with_channel_capacity(DEFAULT_UI_SESSION_CHANNEL_CAPACITY)
+    ) -> Result<(Self, UiSessionRuntime<Action, Reply, SurfaceState>)> {
+        self.with_runtime_capacity(
+            DEFAULT_UI_RUNTIME_CALL_CAPACITY,
+            DEFAULT_UI_RUNTIME_EVENT_CAPACITY,
+        )
     }
 
-    /// Attach a full-duplex channel with an explicit bound in each direction.
-    ///
-    /// A send waits when that many messages are already queued. Capacity zero
-    /// is invalid, and attaching a second channel to one session is refused.
-    pub fn with_channel_capacity<FromSurface, ToSurface>(
+    /// Attach the AFUI runtime with explicit unacknowledged-call and event-replay
+    /// bounds.
+    pub fn with_runtime_capacity<Action, Reply, SurfaceState>(
+        self,
+        call_capacity: usize,
+        event_capacity: usize,
+    ) -> Result<(Self, UiSessionRuntime<Action, Reply, SurfaceState>)> {
+        self.attach_runtime(call_capacity, event_capacity, None)
+    }
+
+    /// Attach the runtime with AFUI-managed, policy-bounded byte bodies.
+    pub fn with_runtime_and_blobs<Action, Reply, SurfaceState>(
+        self,
+        blob_policy: UiBlobPolicy,
+    ) -> Result<(Self, UiSessionRuntime<Action, Reply, SurfaceState>)> {
+        self.with_runtime_capacity_and_blobs(
+            DEFAULT_UI_RUNTIME_CALL_CAPACITY,
+            DEFAULT_UI_RUNTIME_EVENT_CAPACITY,
+            blob_policy,
+        )
+    }
+
+    /// Attach a blob-enabled runtime with explicit call and event bounds.
+    pub fn with_runtime_capacity_and_blobs<Action, Reply, SurfaceState>(
+        self,
+        call_capacity: usize,
+        event_capacity: usize,
+        blob_policy: UiBlobPolicy,
+    ) -> Result<(Self, UiSessionRuntime<Action, Reply, SurfaceState>)> {
+        self.attach_runtime(call_capacity, event_capacity, Some(blob_policy))
+    }
+
+    fn attach_runtime<Action, Reply, SurfaceState>(
         mut self,
-        capacity: usize,
-    ) -> Result<(Self, UiSessionChannel<FromSurface, ToSurface>)> {
-        if self.channel.is_some() {
-            return Err(Error::SessionChannelAlreadyAttached);
+        call_capacity: usize,
+        event_capacity: usize,
+        blob_policy: Option<UiBlobPolicy>,
+    ) -> Result<(Self, UiSessionRuntime<Action, Reply, SurfaceState>)> {
+        if self.runtime.is_some() {
+            return Err(Error::SessionRuntimeAlreadyAttached);
         }
-        let (controller, mount) = UiSessionChannel::bounded(capacity)?;
-        self.channel = Some(mount);
+        let (controller, mount) = match blob_policy {
+            Some(policy) => {
+                UiSessionRuntime::bounded_with_blob_policy(call_capacity, event_capacity, policy)?
+            }
+            None => UiSessionRuntime::bounded(call_capacity, event_capacity)?,
+        };
+        self.runtime = Some(mount);
         Ok((self, controller))
     }
 
@@ -313,8 +404,8 @@ impl UiMount {
     /// Mount a session and return the handle its caller waits on.
     ///
     /// Every session on a mount is reached by its own credential, so a person
-    /// can have several open at once and each channel and terminal outcome stay
-    /// bound to the call that owns it.
+    /// can have several open at once and each runtime and terminal outcome stay
+    /// bound to the session that owns it.
     ///
     /// The session announces itself to the cross-process registry here, whether
     /// AFUI owns the listener or the caller does — a session `afui session
@@ -328,33 +419,46 @@ impl UiMount {
     where
         T: Send + 'static,
     {
+        // A runtime the page cannot reach is a session that opens, connects to
+        // nothing, and reports no error. Both halves of that mistake are known
+        // here for the first time, so this is where it is caught. Only for a
+        // policy AFUI assembled: a hand-written one would have to be parsed to
+        // answer, and AFUI does not guess at a caller-owned string.
+        if session.runtime.is_some() && session.security_policy.page_allows_runtime() == Some(false)
+        {
+            return Err(Error::SessionRuntimeUnreachable);
+        }
         let access_token = UiAccessToken::issue(expiry)?;
-        let (access_url, registration, close, channel_closer) = self.register(
+        let registered = self.register(
             &access_token,
             session.security_policy.clone(),
             session.app_icon.clone(),
-            session.channel,
+            session.runtime,
             router,
         )?;
         // Announce automatically rather than on request. The `afui` CLI can
         // only schedule what it can see, and a feature that depends on every
         // Provider remembering to opt in is a feature that silently has holes.
+        let subject = session.subject;
+        let waits_for_decision = session.waits_for_decision;
         let announcement = registry::publish(
             &session.metadata,
-            session.subject,
-            session.waits_for_decision,
-            &access_url,
+            subject.clone(),
+            waits_for_decision,
+            &registered.access_url,
         );
         Ok(ActiveUiSession {
             metadata: session.metadata,
-            access_url,
+            subject,
+            waits_for_decision,
+            access_url: registered.access_url,
             access_token,
             completion: session.completion,
-            close,
-            _registration: registration,
+            close: registered.close,
+            _registration: registered.registration,
             _announcement: announcement,
             _owned_host: None,
-            channel_closer,
+            runtime_closer: registered.runtime_closer,
         })
     }
 }
@@ -395,6 +499,22 @@ where
         &self.access_token
     }
 
+    /// Describe this live session to an AFUI-owned remote page without reading
+    /// the cross-process registry. Direct links must still work when registry
+    /// publication is disabled, and must expose only the session they own.
+    pub(crate) fn remote_entry(&self) -> UiSessionEntry {
+        UiSessionEntry {
+            session_id: self.metadata.session_id.as_str().to_owned(),
+            provider_id: self.metadata.provider_id.clone(),
+            ui_kind: self.metadata.ui_kind.clone(),
+            subject: self.subject.clone(),
+            waits_for_decision: self.waits_for_decision,
+            access_url_secret: self.access_url.clone(),
+            announced_at_epoch_ms: 0,
+            owner_pid: std::process::id(),
+        }
+    }
+
     /// A handle that finishes this session.
     ///
     /// Usually the Provider takes this from [`UiSession::completion`] before
@@ -412,10 +532,12 @@ where
             // The reserved end route this session answers under its own
             // credential — a person acting through the served shell's "End"
             // control, `afui session close`, or a raw request against the
-            // URL itself. Never a `Completed(T)`: this branch has no `T` to
-            // manufacture one from, only the literal `Outcome::Closed` below.
-            () = self.close.notified() => Outcome::Closed,
-            () = expiry_elapsed(&self.access_token) => Outcome::Expired,
+            // URL itself. It offers `Closed` rather than returning it: if the
+            // handler answered in the same moment, that answer is the outcome.
+            () = self.close.notified() => self.completion.settle(Outcome::Closed).await,
+            () = expiry_elapsed(&self.access_token) => {
+                self.completion.settle(Outcome::Expired).await
+            }
         };
         self.end();
         Ok(outcome)
@@ -429,12 +551,14 @@ where
     pub(crate) async fn wait_with_window(mut self, mut window: UiWindow) -> Result<Outcome<T>> {
         let outcome = tokio::select! {
             outcome = self.completion.wait() => outcome,
-            () = self.close.notified() => Outcome::Closed,
+            () = self.close.notified() => self.completion.settle(Outcome::Closed).await,
             closed = window.wait_closed() => {
                 closed?;
-                Outcome::Closed
+                self.completion.settle(Outcome::Closed).await
             },
-            () = expiry_elapsed(&self.access_token) => Outcome::Expired,
+            () = expiry_elapsed(&self.access_token) => {
+                self.completion.settle(Outcome::Expired).await
+            }
         };
         drop(window);
         self.end();
@@ -448,8 +572,8 @@ where
     /// handle drops.
     fn end(&mut self) {
         self.access_token.revoke();
-        if let Some(channel) = &self.channel_closer {
-            channel.close();
+        if let Some(runtime) = &self.runtime_closer {
+            runtime.close();
         }
     }
 }
@@ -458,8 +582,8 @@ impl<T> Drop for ActiveUiSession<T> {
     fn drop(&mut self) {
         // `_registration` removes the session from its host right after this.
         self.access_token.revoke();
-        if let Some(channel) = &self.channel_closer {
-            channel.close();
+        if let Some(runtime) = &self.runtime_closer {
+            runtime.close();
         }
     }
 }
@@ -512,6 +636,45 @@ mod tests {
         let completion = session.completion();
         assert!(completion.complete(42).await);
         assert_eq!(session.completion.wait().await, Outcome::Completed(42));
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_arrives_with_the_close_is_still_the_answer() {
+        // Close, expiry and window-close used to build an outcome inside their
+        // own `select!` arm, so an answer that became ready in the same moment
+        // could be reported as `Closed` on nothing but which arm was polled
+        // first — telling a caller the person walked away when they had just
+        // decided. Every ending goes through one slot now.
+        let session = UiSession::<u32>::new("reviewer", "case_review").unwrap();
+        let completion = session.completion();
+        assert!(completion.complete(7).await);
+
+        assert_eq!(
+            session.completion.settle(Outcome::Closed).await,
+            Outcome::Completed(7),
+            "a completed answer outranks a close that arrives after it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_has_exactly_one_ending() {
+        let session = UiSession::<u32>::new("reviewer", "case_review").unwrap();
+        let completion = session.completion();
+
+        // Whoever reaches the slot first wins, and says so.
+        assert_eq!(
+            session.completion.settle(Outcome::Closed).await,
+            Outcome::Closed
+        );
+
+        // A handle held past the end cannot reopen the question. This used to
+        // return `true`, because waiting took the outcome out and left the slot
+        // looking untouched.
+        assert!(
+            !completion.complete(9).await,
+            "a retained completion must not be able to answer a finished session"
+        );
+        assert!(!completion.complete(10).await);
     }
 
     #[tokio::test]
@@ -613,6 +776,33 @@ mod tests {
             "{response}"
         );
         assert!(response.contains("<circle"), "{response}");
+    }
+
+    /// A session that brought no router at all still serves the floor its
+    /// page stands on. That is the whole point of the route: a frontend
+    /// override replaces the Provider's stylesheet, and what a replacement
+    /// cannot take away is what a replacement is allowed to omit.
+    #[tokio::test]
+    async fn a_session_serves_the_baseline_stylesheet_whatever_the_provider_routed() {
+        let session = UiSession::<()>::new("reviewer", "case_review").unwrap();
+        let active = session
+            .serve(Router::new(), UiUrlDelivery::new(UiExpiry::Never))
+            .await
+            .unwrap();
+        let response = http_get(&format!(
+            "{}{}",
+            active.access_url(),
+            crate::BASE_STYLE_PATH
+        ))
+        .await
+        .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.contains("content-type: text/css; charset=utf-8"),
+            "{response}"
+        );
+        assert!(response.contains("--afui-focus"), "{response}");
     }
 
     /// Minimal HTTP GET so the test does not add a client dependency.

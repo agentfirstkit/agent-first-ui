@@ -29,18 +29,23 @@ A session that **waits for a decision** returns a typed value: `Outcome<T>` wher
 `Completed(T)` is the person's answer. A session someone **watches** has `T = ()`
 and never completes — it ends `Closed`.
 
-That difference is not cosmetic. It decides your expiry:
+That difference is not cosmetic. It decides the terminal outcome, but it does
+not give a Provider a second remote-lifetime policy:
 
 - **A window bounds itself.** The person can see it; leaving it open all
   afternoon is still using it. Window delivery never expires, and
   `Outcome::Expired` cannot occur.
-- **A URL has nobody watching it**, so it must say when it stops working.
-  `UiExpiry::After` for a fixed lifetime, `UiExpiry::Idle` for one that slides
-  forward while the page is actually being used.
+- **An AFUI-owned remote page has no physical bound.** Direct `link` delivery
+  and `afui session serve` therefore share AFUI's attention heartbeat, warning,
+  grace period, and global configuration. A Provider supplies no timeout.
+- **A registered session is not a remote page.** Its owner process bounds it;
+  each later AFUI view applies the remote policy without expiring the session
+  underneath.
 
-Getting this backwards is the most common mistake: a fixed session-level timeout
-kills a terminal someone is reading and leaves a shared link alive longer than
-you meant.
+Getting this backwards is the common failure: putting a timeout on the session
+itself kills work a person may still be using through another view, while
+putting separate clocks on direct and shared pages gives the same AFUI URL two
+different promises.
 
 ### Say so when a `T = ()` session still waits on a person
 
@@ -58,65 +63,121 @@ The rule this implies: **a session that does not wait for anyone should use
 gets automatically counted as waiting — harmlessly, since that direction is
 always safe, but not what you meant.
 
-## A live channel is orthogonal to the terminal outcome
+## The live runtime is orthogonal to the terminal outcome
 
 Some interfaces are not one request followed by one answer. A surface may show
 live measurements while accepting inspection commands, or receive progress
-while letting a person refine the work in progress. That still has one bounded
-session lifetime and one terminal `Outcome<T>`; the intermediate traffic is a
-different concern.
+while a person refines work in progress. That still has one bounded session
+lifetime and one terminal `Outcome<T>`; intermediate traffic uses
+`UiSessionRuntime<Action, Reply, SurfaceState>`.
 
-Attach it with `UiSession::with_channel::<FromSurface, ToSurface>()`. The
-returned `UiSessionChannel` is the controller side. The surface opens a
-WebSocket at `agent_first_ui::SESSION_CHANNEL_PATH` relative to its session URL.
-Every frame is directly one JSON-encoded value of the Provider's type:
+Attach it with `UiSession::with_runtime`. The returned runtime is the Provider
+side; the trusted page calls `afui.connect()`. AFUI owns the only transport
+protocol between them: the versioned envelope, request identity, latest-state
+replacement, event sequence and replay, reconnect, call deduplication,
+cancellation, bounds, and shutdown. Provider payload types contain none of
+those fields.
 
-- AFUI does not wrap messages, assign request ids, or infer request/response
-  pairs;
-- AFUI does not retain, replay, or present history;
-- either direction may send independently, so streaming and commands do not
-  have to pretend to be a conversation;
-- each direction is bounded (32 queued values by default), and senders wait for
-  space rather than growing memory without limit;
-- one encoded value may be at most
-  `MAX_UI_SESSION_CHANNEL_MESSAGE_BYTES` (1 MiB); serve larger artifacts from a
-  Provider route and use the channel to name or invalidate them;
-- only one surface connection is active at a time. A connection may be replaced
-  after it closes, but AFUI never fans one controller stream out to several
-  surfaces.
+### Current state: replace, never queue
 
-The endpoint is in AFUI's reserved namespace and inherits the session
-credential, exact-host/origin checks, revocation, reverse-proxy support, and
-shutdown. If you replace `UiSecurityPolicy`'s default CSP, allow the surface to
-connect back to itself, normally with `connect-src 'self'`.
+Use `publish_state` for the complete value a newly connected page should see.
+AFUI retains exactly the newest state, assigns its revision, and sends it before
+the connection becomes live. Publishing never waits for a viewer, so a timer
+continues running when the page is unopened or temporarily disconnected. A
+reconnect needs no Provider-owned `resumed` flag and no overflow fallback.
+Concurrent publications are linearized with their revisions, so an older
+revision cannot race back into the retained slot after a newer one.
 
-### Backpressure is the whole flow-control story
+Three properties of that retention decide how a page has to be written, and a
+page that guesses wrongly at any of them fails in a way nothing here would
+catch:
 
-The bound is not a hint, and AFUI never drops a value to stay under it. Two
-consequences are worth designing for before they surprise you:
+- **Republishing an equal value still reaches the page.** Nothing compares one
+  state to the last; the revision advances and the frame is sent. So a
+  Provider whose page only needs to know *that* something changed may publish
+  one unit-like state as an invalidation and let the page pull what it needs.
+  That is a supported shape, not an abuse of one.
+- **Only the newest publication is guaranteed to arrive.** Publishing faster
+  than a socket drains coalesces, exactly as it does for a page that has not
+  connected yet. A state carrying a delta — "three rows were appended" — is
+  therefore wrong, and wrong only under load, which is the worst schedule to
+  find out on. Publish what is true, not what changed.
+- **An opening state is optional.** A runtime nobody has published to sends no
+  state frame at all, and the page still becomes live. If your first screen is
+  rendered by the server, that is already your shape, and `live` is your only
+  opening signal.
 
-- **A send with nobody listening eventually waits.** A session can be delivered
-  and stay unopened — a `link` nobody clicked, a card nobody expanded — while
-  the Provider keeps pushing. After the queue fills, `send` waits until a
-  surface drains it or the session ends. A loop that pushes state on a timer
-  therefore stops on its own timer, and the surface that finally connects
-  receives the backlog, oldest first, rather than the current state. If the
-  newest value is the only one that matters, keep it in Provider-owned state
-  and send from there.
-- **Not reading blocks writing.** One connection carries both directions, so a
-  surface-to-Provider queue left full stops that connection reading *and*
-  writing. Call `recv` for as long as the session is open, even in a Provider
-  that only pushes and treats surface values as noise.
+### Nothing is ordered against anything else
 
-Neither is a bug to route around with a bigger capacity: they are what a
-bounded queue means. `with_channel_capacity` sets how much slack a burst gets,
-not whether the slow side is allowed to be slow.
+Retained state, ordered events and a call's result are three separate channels
+sharing one socket, and AFUI orders none of them against the others. A call
+that changes what the state shows may have its result arrive before the new
+state or after it. An event's sequence orders it among *events*, and says
+nothing about anything else.
 
-Presentation remains the frontend's decision. One frontend may display every
-value received during this page load; another may replace one status block in
-place. Neither choice changes the transport and neither history belongs to
-AFUI. Persist or replay anything that must survive a reload in Provider-owned
-state and reconstruct the page from its own URL.
+This is not a gap waiting to be closed. Ordering them means holding a
+publication behind a reply, and `publish_state` never waiting for a viewer is
+worth more than an ordering that a reconnect would break anyway.
+
+So there are exactly two shapes for *the page did something, and now what it
+shows is different*:
+
+- **The state carries the data.** The reply says only that the work finished,
+  or why it did not — enough to stop the spinner. What the person sees comes
+  from the next state.
+- **The state says only that something changed.** The data arrives in the
+  reply, or in a call the page makes when it hears a state.
+
+The third shape — half the new data in the reply, half in the state — is the
+one that needs the ordering that does not exist. It works until the two frames
+arrive the other way round, and then shows a mixture of two moments with
+nothing logged. Pick one channel for the data and let the other one only say
+*when*, and make the refresh idempotent so that a later one simply wins.
+
+### Surface actions: one typed call handle
+
+`recv` yields a `UiCall<Action, Reply>`. Read the action with `call.action()` and
+answer only through the handle:
+
+- `progress(&reply)` sends a non-terminal update;
+- `finish(&reply)` completes successfully;
+- `fail(UiCallError)` completes with a caller-safe code, message, optional
+  hint, and retryability;
+- `cancelled()` lets long work stop when the page cancels it or the session ends.
+
+The page's `runtime.call(payload, {onProgress, signal})` returns one promise.
+AFUI assigns the request id, resends an unacknowledged call after a wire drop,
+and replays an already completed result rather than handing the action to the
+Provider twice. The action is captured as one JSON value when `call` begins;
+later page mutation cannot change what a reconnect resends. Never add
+`request_id`, reconnect tokens, or acknowledgements to `Action` or `Reply`.
+
+### Ordered events: only when every occurrence matters
+
+Use `publish_event` for an occurrence rather than a snapshot. AFUI assigns the
+sequence and retains a bounded replay window. A reconnect receives missed
+events or an `onEventReset` range when the cursor fell outside that window.
+An old cursor presented to a newly empty runtime resets to `0/0`, so the next
+event starts at one instead of being mistaken for an already-seen event.
+Most screens want `publish_state`; choosing events merely because the source is
+a stream recreates a backlog where only the newest screen matters.
+
+### Managed byte bodies
+
+Use `with_runtime_and_blobs` when a reply needs bytes that do not belong in
+JSON. Declare a `UiBlobPolicy` with the maximum body size and admitted media
+types. `store_blob` returns `UiBlobRef`; the page uses `blobUrl`, `fetchBlob`,
+and `releaseBlob`. AFUI owns the unguessable session-relative URL, `no-store`,
+`nosniff`, inline disposition, bounded retention/eviction, and cleanup when the
+session ends. Do not invent a private download route for per-call UI bytes.
+
+The default runtime admits 32 unacknowledged calls in total, ordered-event
+replay holds 128 events, and every encoded frame is limited to 1 MiB. A full
+call bound produces a caller-safe, retryable `ui_runtime_busy` result instead
+of blocking the session transport. Use the explicit-capacity methods when
+those bounds are part of the interface's measured shape. Build the page policy
+with `allow_runtime()`; a runtime attached to an AFUI-assembled policy that
+forbids same-origin connections is rejected before the page opens.
 
 ## Delivery: `window`, `link`, or `session`
 
@@ -126,23 +187,22 @@ three through one plan:
 | Mode | Delivered as | Expires |
 | --- | --- | --- |
 | `window` | an isolated window this machine opens | never — the window is the bound |
-| `link` | a URL another device can open directly, with no `afui` binary involved in getting it there | must be declared with `with_link_expiry`; there is no default |
-| `session` | registered only, reached later through `afui session open` or `afui session serve` | never — the view is bounded by the outer shell's idle policy instead |
+| `link` | an AFUI page that proxies exactly this loopback session | the global AFUI attention policy: 15 minutes idle plus 5 minutes warning by default |
+| `session` | registered only, reached later through `afui session open` or `afui session serve` | the session never expires; each remote view uses the same AFUI attention policy |
 
 ```rust
-let outcome = UiDeliveryPlan::resolve(explicit_mode)?
-    // Omit this call entirely to not offer `link` at all.
-    .with_link_expiry(UiExpiry::After(Duration::from_secs(900)))
+// `resolve` for a Provider that stays local; `resolve_allowing_link` for one
+// that offers the LAN page as well.
+let outcome = UiDeliveryPlan::resolve_allowing_link(explicit_mode)?
     .deliver(session, router)
     .await?;
 ```
 
-When the caller must announce a direct URL before it blocks, split the same
-plan at its handoff point:
+When the caller must announce the AFUI-owned Link URL before it blocks, split
+the same plan at its handoff point:
 
 ```rust
-let active = UiDeliveryPlan::resolve(explicit_mode)?
-    .with_link_expiry(UiExpiry::After(Duration::from_secs(900)))
+let active = UiDeliveryPlan::resolve_allowing_link(explicit_mode)?
     .start(session, router)
     .await?;
 
@@ -166,14 +226,55 @@ a default there is indistinguishable from someone having typed `--mode
 window`, so `AFUI_DELIVERY` would never be reached and an unattended run would
 always pop a window nobody is there to see.
 
-`link` is opt-in per Provider, not per call: if you never call
-`with_link_expiry`, `deliver` refuses a resolved `link` mode with a clear
-reason instead of inventing an expiry for it, and your own `--mode` flag
-should not list `link` as a legal value either — an absent capability is
-better than one that fails every time it is reached. Do not give it a default
-expiry if you do offer it: different Providers have needed no TTL, a fixed
-timeout, and a sliding idle window for the same delivery, and one session-level
-default cannot express more than one of those.
+`link` is opt-in per Provider: build the plan with `resolve` and a resolved
+`link` — from either source — is refused **there**, naming the modes that are
+on offer, and your own `--mode` flag should not list `link` as a legal value
+either. The refusal lands at `resolve` rather than at `deliver` on purpose: a
+Provider normally announces its resolved delivery before it blocks, and a
+refusal that arrives after that announcement produces a readiness report that
+was false when it was written.
+
+The opt-in is only permission to bind a LAN listener. Lifetime is not part of
+it: `attention_policy()` is report-only, and the intervals come from AFUI's
+global `config.json` under `attention.idle_timeout_s` and
+`attention.grace_period_s`.
+
+### Reporting a ready delivery
+
+Everything a readiness report needs is one call, on either kind of active
+delivery:
+
+```rust
+let facts = active.facts();
+```
+
+| Field | Meaning |
+| --- | --- |
+| `mode` | the resolved delivery, spelled the way a person types it |
+| `session_id` | stable identity, shared with this delivery's registry entry |
+| `link_url_secret` | the bearer URL; present for `link` and nothing else |
+| `idle_timeout_s` | how long this delivery may sit unattended; absent when nothing lapses |
+| `grace_period_s` | how long the warning runs; present exactly when there is an attention clock |
+
+`UiDeliveryFacts` is facts and nothing else — no sentence to print, no notion
+of which field matters more, no opinion on whether a field belongs in your
+output at all. Those are yours. The names follow the conventions a structured
+output layer reads (`_s` for seconds, `_secret` for a bearer capability), so
+splicing the whole structure into an event gets correct handling by default;
+a Provider that deliberately publishes the URL renames that one field itself.
+
+`UiDeliveryPlan::mode()` reads the same resolved word before anything is
+served, for a Provider that has to name the delivery earlier still. Do not
+resolve `AFUI_DELIVERY` a second time to learn it: two reads of one decision
+are two chances to disagree. `UiDeliveryMode::description()` is one factual
+sentence per delivery, for a Provider that wants one and does not want to
+write its own three-armed match over the same three facts.
+
+`Outcome::ending()` is the counterpart at the other end: `completed`,
+`closed`, or `expired`. The completed case usually deserves a richer word of
+your own — what the person actually decided — but the other two carry no
+domain meaning, and every Provider spelling them for itself is how one tool's
+`closed` becomes another's `cancelled`.
 
 ### `link` puts a person's data on the network unencrypted
 
@@ -183,6 +284,46 @@ authentication beyond the credential already in the URL. Use it only on a
 network you trust, and treat that URL the way you would treat a password —
 give it to the person it is for, and nowhere else: not into a file, not into a
 commit message, not into a chat transcript you do not control.
+
+### When the page is not this crate's to serve
+
+A Provider that already answers on a listener it bound itself hands AFUI no
+`Router`. Name that private source with `UiUpstream` and give it to the same
+plan:
+
+```rust
+let active = UiDeliveryPlan::resolve_allowing_link(explicit_mode)?
+    .start_upstream(
+        UiUpstream::new("inspector", "console", upstream_url_secret)?
+            .with_subject("running service"),
+    )
+    .await?;
+
+if let Some(url) = active.link_url_secret() {
+    publish_secret_link(url)?;
+}
+
+let outcome = active.wait().await?;
+```
+
+The meanings do not change for an upstream. `window` opens its private URL
+locally. `link` starts an AFUI-owned LAN listener and fixed-session shell; the
+upstream URL remains private behind the proxy, so its own listener may stay on
+loopback. `session` only registers it and has no AFUI expiry. The Provider may
+race `active.wait()` against its own shutdown signal; cancelling the wait drops
+the announcement.
+
+AFUI cannot mint or revoke a credential on a listener it does not own. The
+upstream contract is therefore narrow: its owner keeps that private URL usable
+for as long as the `ActiveUiUpstreamDelivery` exists and revokes it afterwards.
+An internal crash-cleanup lease is fine; exposing that lease as the Link or
+Session lifetime is not. The person-facing remote lifetime remains AFUI's
+attention policy alone.
+
+`window` may open an HTTP or HTTPS upstream directly. `link` and `session`
+require a private HTTP upstream: both may pass the page through AFUI's
+streaming proxy, which intentionally does not act as a TLS client or trust
+arbitrary upstream certificates.
 
 ## Ending a session from outside it
 
@@ -198,15 +339,14 @@ do worse from inside a Provider's own page (a terminal's `exit`, for one), so
 refusing to let them end it from outside would be a boundary that only looks
 like one.
 
-**The whole `__afui/` prefix is reserved**, including
-`agent_first_ui::SESSION_END_PATH` and
-`agent_first_ui::SESSION_CHANNEL_PATH`. Do not route on any name under it,
-proxy through it, or otherwise give it a second meaning in your own Router —
-this crate's dispatch answers for the whole prefix before your router is ever
-reached, so a route of your own under it is simply unreachable, not a conflict
-you would notice at runtime. Reserving the prefix rather than only today's
-routes lets AFUI add another later without silently colliding with something
-you already routed there.
+**The whole `__afui/` prefix is reserved.** `SESSION_END_PATH` is the one public
+external-control path; live-runtime paths are deliberately not public API.
+Do not route on any name under the prefix, proxy through it, or otherwise give
+it a second meaning in your own Router — this crate's dispatch answers for the
+whole prefix before your router is ever reached, so a route of your own under
+it is simply unreachable, not a conflict you would notice at runtime.
+Reserving the prefix rather than only today's paths lets AFUI add another later
+without silently colliding with something you already routed there.
 
 ## What an override may and may not do
 
@@ -235,7 +375,10 @@ escaping policy, the render, the rendered-markup guard, and a check that every
 element id your runtime binds to actually exists in the output — a page
 missing one is reported by that id rather than opened as a window that does
 nothing. It knows nothing about what your elements or your document mean; it
-only checks that what you declared is there.
+only checks that what you declared is there. A page missing several is
+reported once, naming all of them: somebody writing a replacement cannot read
+your contract from where they stand, and finding it one render at a time is
+the same fix spread across five sittings.
 
 The builder also covers template trees without weakening that boundary.
 `entry_at` and `template_at` separate a stable logical template name from its
@@ -255,6 +398,394 @@ stay owned by `UiPage`, including when a page needs locale-aware formatting or
 another domain-specific projection. A filter that needs to return a sequence
 or map selected from its input can use `UiPageSerializedValue`; it rebuilds the
 data through JSON and deliberately drops engine-only safety provenance.
+
+## Errors: what happened, and what to do about it
+
+`Error`'s `Display` says what happened. It does not say what to do — that is
+`hint()`, and keeping the two apart is what stops a caller with a hint field of
+its own from printing the same sentence twice, once inside the message and once
+beside it.
+
+```rust
+Err(error) => fail(
+    &format!("myprovider_{}", error.kind()),
+    &error.to_string(),
+    error.hint(),
+),
+```
+
+A coarser code than that is yours to build, but build it out of named arms
+rather than a default. A fallback that names one cause — "the frontend could
+not be read" — reports a closed session runtime and a machine with no browser
+as a broken frontend, and sends somebody to look at a file that is fine. If
+you want a fallback at all, let it carry AFUI's own word through.
+
+`kind()` returns `UiErrorKind`, a closed enum with no domain in it, so your own
+error code is a prefix rather than a match over every AFUI variant. It is an
+enum rather than a string on purpose: translating a dependency's failures into
+your own vocabulary is your job, but you can only do it *completely* if
+something tells you when you have missed one, and nothing exhaustively matches
+a string. A `&'static str` here forced every caller into a wildcard arm, which
+is where a classification added later goes to be mis-reported.
+
+```rust
+match error.kind() {
+    UiErrorKind::WindowUnavailable | UiErrorKind::WindowWaitFailed => ...,
+    // no wildcard: a classification added to AFUI stops this compiling
+}
+```
+
+It is deliberately not `#[non_exhaustive]`, for that reason. `Display` and
+`as_str()` give the stable `snake_case` word when a prefix is all you want.
+
+| `kind()` | `as_str()` | Raised by |
+| --- | --- | --- |
+| `InvalidArgument` | `invalid_argument` | an identifier, URL, TTL, or icon AFUI cannot accept |
+| `DeliveryModeInvalid` | `delivery_mode_invalid` | `--mode` or `AFUI_DELIVERY` named something other than the three words |
+| `DeliveryModeNotOffered` | `delivery_mode_not_offered` | the resolved delivery is one this Provider did not offer |
+| `UpstreamNotProxyable` | `upstream_not_proxyable` | an `https://` upstream behind a delivery that proxies plain HTTP |
+| `LinkAddressUnavailable` | `link_address_unavailable` | no LAN-reachable address to advertise a `link` on |
+| `RuntimeMisconfigured` | `runtime_misconfigured` | a second runtime, a zero capacity, or a page that cannot reach its runtime |
+| `RuntimeClosed` | `runtime_closed` | the session or one of its calls has ended |
+| `RuntimeBusy` | `runtime_busy` | a bounded in-process runtime state lock was temporarily unavailable |
+| `RuntimeMessageTooLarge` | `runtime_message_too_large` | one encoded runtime frame exceeded the fixed wire bound |
+| `RuntimeBlob` | `runtime_blob` | managed blobs were not enabled, or bytes violated their declared policy |
+| `RuntimePayload` | `runtime_payload` | a runtime payload could not be encoded or decoded |
+| `FrontendUnreadable` | `frontend_unreadable` | a frontend that exists and is trusted but could not be read |
+| `FrontendIncompatible` | `frontend_incompatible` | a frontend written against another `ui_api_version` |
+| `FrontendUnsafe` | `frontend_unsafe` | markup or a file name an override may not supply |
+| `PageRender` | `page_render` | a template failed to compile or render |
+| `PageIncomplete` | `page_incomplete` | a rendered page is missing an element id or its runtime marker |
+| `ConfigUnreadable` | `config_unreadable` | AFUI's own configuration directory or attention config |
+| `WindowUnavailable` | `window_unavailable` | no browser found, or one that would not launch |
+| `WindowWaitFailed` | `window_wait_failed` | waiting on an open window failed |
+| `Io` | `io` | anything else AFUI could not read, write, or generate |
+
+The match behind `kind()` has no wildcard arm, so a new AFUI variant does not
+compile until someone classifies it; `tests/error_kinds.rs` fails if that
+classification invents a word that is not in this table, and again if a
+classification in the table is one no error can actually raise.
+
+`hint()` returns a recovery action or `None`. Safe mode is suggested only for a
+failure an override could have caused — a built-in page that will not render is
+the Provider's own bug, and sending a person to disable something they never
+installed helps nobody.
+
+## AFUI's own routes, from inside your page
+
+Every session reserves the whole `__afui/` prefix under its own credential.
+AFUI uses it for the resolved application icon, ending, the typed runtime, and
+managed blobs. Provider routers must not claim anything below that prefix.
+
+A `UiPage` render carries the paths a template may render directly as a
+reserved `afui` global:
+
+```jinja
+<link rel="icon" href="{{ afui.app_icon_path }}" type="image/svg+xml">
+```
+
+`app_icon_path` and `end_path` are relative to the session root, which makes
+them resolve under the session's own credential in every delivery. `afui` is
+reserved exactly the way `document` is: an extension that registered that name
+is refused, because a replaceable layer may not redirect AFUI-owned behavior.
+From Rust they are `APP_ICON_PATH` and `SESSION_END_PATH`, available without the
+`session` feature.
+
+The runtime and blob paths are deliberately absent from the template global.
+Trusted JavaScript uses `afui.connect()` and its blob methods; Provider code
+uses `UiBlobRef`. Neither side names transport paths or builds their URLs.
+
+## When your own listener hands out access
+
+The usual shape is one credential per session, minted when you hand AFUI a
+session and dropped when that session ends. Some Providers have the other
+shape: a long-lived listener with a domain API of its own that grants access to
+the same UI on request, and takes it away again.
+
+Do not reimplement credential routing for that. It is the same dispatch, driven
+from outside:
+
+```rust
+let mount = UiMount::new("http://127.0.0.1:8080/ui/")?;
+let app = provider_routes.nest_service("/ui", mount.router());
+let access = mount.external_access(ui_routes, policy, Some(app_icon));
+
+// From your own endpoint, when you decide a request deserves access:
+let credential = access.issue(UiExpiry::Idle(Duration::from_secs(1800)))?;
+credential.access_url_secret();  // the URL to hand back
+access.revoke(credential.secret());
+```
+
+If that mounted page is live, mint the credential and its runtime together:
+
+```rust
+let (credential, runtime) = access
+    .issue_with_runtime::<Action, Reply, State>(UiExpiry::Idle(Duration::from_secs(1800)))?;
+```
+
+Use `issue_with_runtime_and_blobs` when calls also return managed bytes, or the
+`*_capacities*` variants when the default unacknowledged-call and event replay bounds
+are not the right ones. The runtime is scoped to exactly that credential;
+revoking, ending, or reaping it closes the runtime and wakes `recv`. Do not
+combine `issue` with a Provider WebSocket or SSE route.
+
+Everything a session gets comes with it: the 404 that does not confirm a UI is
+here, the `Host` check that stops a rebound name reaching the same socket, the
+response headers, the Provider icon route, the reserved `__afui/` prefix — and
+`__afui/end`, which for these credentials revokes the one it arrived on, since
+there is no session waiting on an outcome to wake. What stays yours is the part
+that is genuinely yours: which request deserves a credential, what your endpoint
+for asking looks like, and what you do with the URL afterwards.
+
+**The idle expiry is crash cleanup, not a lifetime a person sees.** A process
+that revokes on its way out never reaches it; one that dies without revoking
+leaves a credential that stops working on its own. Do not present it to anyone
+as how long their UI lasts — the delivery decides that.
+
+### Holding a credential open from the other side
+
+A process that was handed one of these URLs renews it while a person is still
+using it:
+
+```rust
+let lease = UiCredentialLease::new(idle_timeout);
+tokio::select! {
+    outcome = delivery.wait() => { /* the person finished */ }
+    failure = lease.keep_alive(async || my_api.renew(&credential).await) => { /* it stopped */ }
+}
+```
+
+`keep_alive` renews three times per idle window, so one lost renewal is not a
+lapsed credential, and resolves only when a renewal fails. The call itself is
+yours: the endpoint that renews a credential is your domain API, and AFUI
+inventing a wire protocol for your service is not a trade worth making.
+`is_ui_credential` answers whether a string is the shape AFUI issues, for a
+caller reading one back out of a URL — that fact belongs here rather than as
+"sixty-four hex digits" written down somewhere else.
+
+## The floor your page stands on
+
+Every session serves one AFUI-owned stylesheet at `BASE_STYLE_PATH`. Link it
+before your own, from the template:
+
+```jinja
+<link rel="stylesheet" href="{{ afui.base_style_path }}">
+<link rel="stylesheet" href="style.css">
+```
+
+In that order, because yours loads second and wins at equal specificity; most
+selectors in the baseline are wrapped in `:where()` so overriding one is never
+a specificity fight.
+
+It carries two kinds of rule and no others: what AFUI's own runtime decides —
+what a control looks like while a call is in flight, what `hidden` does — and
+what is *wrong* rather than plain when a page forgets it: a focus ring, a
+`[hidden]` that beats an author `display`, a page inset that clears the edges
+of the phone a `link` session was opened on, `prefers-reduced-motion`. There
+are no components: no button variants, no grid, no utility classes.
+
+It carries exactly one vocabulary, and the line it is on is the same one:
+`afui.connection(el)` writes AFUI's own connection word to
+`data-afui-connection`, and `reconnecting` and `closed` are dressed here
+because *this page may be showing something that is already wrong* is AFUI's
+fact and no page should answer it five times. `afui.status(el).set(text,
+state)` is the other direction — that word is yours, it lands on `data-state`,
+and what "busy" looks like is not AFUI's to say.
+
+Everything tunable is a custom property on `:root`, so a different palette is
+a declaration in your own stylesheet rather than a fork:
+
+| | |
+|---|---|
+| Surfaces | `--afui-page` `--afui-panel` `--afui-panel-strong` |
+| Text | `--afui-ink` `--afui-muted` |
+| Lines | `--afui-line` |
+| Emphasis | `--afui-accent` `--afui-accent-ink` `--afui-focus` |
+| Meaning | `--afui-warn-ink/-bg` `--afui-danger-ink/-bg` `--afui-ok-ink/-bg` |
+| Shape | `--afui-radius` `--afui-shadow` `--afui-font` `--afui-mono` |
+| Layout | `--afui-page-padding` |
+
+Every colour has a light and a dark value already; redeclaring one outside a
+`prefers-color-scheme` block sets it for both.
+
+`--afui-page-padding` is how far your content sits from the edge of the
+viewport: set that one value and each edge takes the larger of it and the area
+the hardware actually leaves reachable. A page that is edge-to-edge instead —
+a sticky bar, a full-bleed deck — says so with `body { padding: 0 }` and
+places its own insets, because a sticky bar pushed down by a body inset leaves
+content scrolling past above it.
+
+A route rather than bytes handed to you to serve, for one reason that decides
+it: an override replaces your stylesheet in full, and a baseline concatenated
+into that file would go with it. Answered by the session, the floor survives
+the replacement — which is what lets an override be one template and no CSS at
+all and still open as a page that belongs here. `page_base_style_source()` is
+there for a build that assembles a page outside a session, such as a preview.
+
+## The routes a page serves
+
+A page is at `/`, its stylesheet is a route rather than an inline block, and
+the override's `assets/` tree is nested under a fixed name so a template can
+refer to it relatively. That shape is the same for every page here:
+
+```rust
+page_routes(page, stylesheet, &frontend).merge(my_domain_routes)
+```
+
+For a page rebuilt per request — a live panel, or one reread because the
+workspace behind it can change while a person is looking at it — route `/`
+yourself and merge `page_asset_routes(stylesheet, &frontend)` instead.
+
+### Bytes your page serves itself
+
+A preview, a generated code, an attachment. `UiBlobPolicy` is a media-type
+allowlist and a size bound; you supply both, because only you know what your
+page is for.
+
+```rust
+let policy = UiBlobPolicy::new(max_bytes, ["image/png", "image/jpeg"]);
+policy.respond(media_type, bytes)                     // bytes you already have
+policy.respond_with_file(&root, relative, media_type) // one file under a root
+policy.read(&root, relative)                          // just the bounded read
+```
+
+Every refusal is a `404`, whatever the reason — too large, a type you never
+listed, a symlink, a path that tried to leave the root. A page asking for
+something it may not have learns only that it is not there.
+
+`respond_with_file` never follows a link: `relative` must be plain names, and
+every component is checked before the next is appended, so there is no window
+between resolving and comparing. The bound is applied to the file's own length
+and again to what was actually read. `read` is the same walk without the
+response, for a page that serves one part of a container it read off disk.
+
+There is no caching, no `Range`, and no upload here. None of those has been
+needed by a page in this kit, and each is a second thing to get right in a
+response a session hands to a browser under a bearer credential.
+
+## What your page may load
+
+Every page in this kit denies everything and then names a small set of
+exceptions. Say which with switches rather than a string:
+
+```rust
+let policy = UiPagePolicy::new(UiPageScript::Nonce(nonce.clone()))
+    .allow_images()
+    .allow_form_submission()
+    .into_security_policy();
+```
+
+The floor `UiPagePolicy::new` starts from is `default-src 'none'` plus a
+stylesheet from this session's own origin — no base URI, no framing, no plugin,
+no form target, and no network destination. Everything else is an addition you
+name:
+
+| Switch | Adds |
+| --- | --- |
+| `UiPageScript::None` | nothing; the page has no behaviour and cannot be given any |
+| `UiPageScript::Nonce(nonce)` | exactly one script, carrying this session's nonce |
+| `UiPageScript::SameOrigin` | script files served from this session's own origin |
+| `allow_images()` | images from this session's own origin |
+| `allow_fonts()` | fonts from this session's own origin |
+| `allow_runtime()` | the same-origin AFUI runtime connection |
+| `allow_form_submission()` | form posts back to this session |
+| `allow_inline_styles()` | inline `style` attributes and `<style>` blocks |
+
+Assembling rather than formatting is the point. A hand-written policy is a
+`format!` over nine directives, where a typo produces a policy that is merely
+*different* rather than invalid, and where the `HeaderValue::from_str` at the
+end has a failure arm that is very tempting to answer by quietly serving some
+other policy. That is the one outcome a security header must never have. Here
+every part is fixed ASCII or a hex nonce, so there is no parse step and nothing
+to fall back from.
+
+Attaching a `UiSessionRuntime` to a page built without `allow_runtime()` is
+refused when the session is mounted. It has to be caught there: the browser
+refuses that connection, not AFUI, so nothing on this side would otherwise hear
+about it and the page would simply sit there connected to nothing.
+
+`UiSecurityPolicy::with_content_security_policy` remains the escape hatch for a
+page these switches do not cover. Two things come with taking it. The string is
+yours, so a mistake in it is your error and must be reported as one — never
+answered by falling back to a different policy, which turns a broken security
+header into a page that looks like it worked. And AFUI can no longer tell
+whether your page may reach its own session, so the runtime check above stops
+applying to it.
+
+## What your page runtime is written in
+
+Roughly seven hundred lines across the pages in this kit were the same work
+done again: deriving the session root, reconnecting live state, keeping call
+identity straight, releasing temporary byte bodies, and half a dozen small
+pieces of care that are only interesting when they are missing.
+
+`page_kernel_source()` is that, as source to concatenate ahead of your own
+runtime inside one function scope:
+
+```rust
+format!(
+    "<script nonce=\"{}\">(function(){{\n{}\n{}\n}})();</script>",
+    nonce.as_str(),
+    page_kernel_source(),
+    MY_RUNTIME,
+)
+```
+
+It defines one lexical `afui` binding and writes nothing to `window`.
+
+The pages in this kit are built out of these:
+
+| Primitive | What it is |
+| --- | --- |
+| `afui.sessionRoot`, `afui.url` | a Provider-owned static or navigation URL kept under this session's credential |
+| `afui.connect({onState, onEvent, onEventReset, onConnectionState})` | the complete typed session runtime; `call` sends actions and receives progress/result/error |
+| `runtime.blobUrl`, `runtime.fetchBlob`, `runtime.releaseBlob` | AFUI-managed byte bodies without a Provider download protocol |
+| `afui.status(element)` | an aria-live region written as text, with `data-state` for the stylesheet |
+| `afui.connection(element, words)` | the runtime's own connection state, marked for the baseline and worded by you |
+| `afui.guardUnload(isDirty)` | warn before leaving, asked at the moment of leaving |
+| `afui.place({at, show, hide, onFrame})` | a second screen inside one page: one history entry per place, `popstate` in both directions, Escape, and focus returned to whatever opened it |
+| `afui.frame({onHead})` | what the window frame around your page should say about it — `title`, `status` — and whether it draws a head at all, so a framed page stops drawing a second one |
+
+And these exist, but no page here has needed one yet. They are collected
+rather than recommended: each was written for a shape that had turned up
+before, and the shape has not turned up since. Use one if it fits; the reason
+it is worth saying which is that a table where everything looks equally
+established is a table that recommends by omission.
+
+| Primitive | What it is | What it is waiting for |
+| --- | --- | --- |
+| `afui.inFlight(elements)` | `disabled` and `aria-disabled` together | a control that is not a native form element — an anchor styled as a button. Every page here disables real `<button>`s and `<input>`s, where `disabled` is already complete. AFUI's own `UiDecisionRuntime` sets both, so the baseline's `[aria-disabled]` rule is not idle |
+| `afui.autosave({save, baseHash})` | debounce, revision, base-hash writeback, and a 409 reported as a conflict rather than an error | a field that saves as somebody types. The one page that had it moved to an explicit save control |
+| `afui.whileVisible(run, ms)` | poll only while somebody is looking, and refresh at once on return; `stop()` is final, and a later tab switch does not undo it | a surface that polls. The one that did now receives a live runtime state instead |
+| `afui.end()` | end this session from inside its own page — the browser side of `SESSION_END_PATH`, so whoever created it sees the same `Closed` as a shut window | a page with its own "done" control. Today the window, the card and `afui session close` are the ways out |
+
+There is deliberately no `location.hash` helper. One was here, capped and
+comma-joined; the only page that needed hash state wanted repeated keys and a
+different eviction rule, and a primitive that has to be worked around is worse
+than none — the next person tries it first and then writes theirs anyway.
+
+`afui.connection` is the one primitive with a vocabulary of its own, so it is
+worth a paragraph. The runtime's connection state is `connecting`, `live`,
+`reconnecting` or `closed`. Only three of those are ever handed to
+`onConnectionState`: `connecting` is where every page starts, so there is
+nothing to announce — `afui.connection` paints it when you call it, and
+`runtime.state` reports it. A handler with an `else if (state ===
+'connecting')` arm has an arm that never runs, which is what four pages here
+had to discover one at a time. The word lands on `data-afui-connection`, which
+the baseline stylesheet dresses for the two values that mean *what you are
+looking at may already be wrong*; the wording stays yours, and a line that
+also carries your own messages passes no wording at all and keeps its text.
+
+**This is not a framework and will not become one.** There is no template here,
+no DOM diff and no state store; every text write is `textContent` and every
+element comes from you. A primitive that needed a third-party library would not
+be collected — it would be declined.
+
+The boundary is unchanged: a frontend still cannot supply JavaScript. This
+source reaches a browser only because you spliced it into your own trusted
+runtime. `socketUrl`, generic request wrappers, raw channels, and SSE helpers
+are intentionally not exposed: they would recreate a second UI protocol beside
+`afui.connect()`.
 
 ## Decide panels: declaration is theirs, binding is yours
 
@@ -289,6 +820,70 @@ What remains is that a trusted template can mislabel a control it declared. That
 is the accepted model: the person enabled that exact fingerprint, and any later
 byte revokes it. Encryption of intent is not on offer; what is on offer is that
 the *binding* is never up for grabs.
+
+### You do not write those four rules again
+
+`UiDecisionRuntime` generates the script; you own the tag it goes in, because
+only you know this session's nonce.
+
+```rust
+let runtime = UiDecisionRuntime::new("data-myprovider-decision")?
+    .with_status_attribute("data-myprovider-decision-status")?
+    .with_decision("approve", "approve")?
+    .with_pending_text("approve", "Approving…")?
+    .with_decision("refuse", "refuse")?
+    .with_pending_text("refuse", "Refusing…")?;
+
+let page = UiPage::builder(&frontend)
+    .entry("templates/page.html.j2")
+    .fallback(BUILTIN_PAGE)
+    // The same list, read back as the page's contract.
+    .requires_decisions(&runtime)
+    .runtime_marker("<!-- myprovider:trusted-runtime -->")
+    .runtime(Some(format!(
+        "<script nonce=\"{}\">{}</script>",
+        nonce.as_str(),
+        runtime.source()
+    )))
+    .render(&document)?;
+```
+
+The declaration vocabulary, the routes, and every word a person reads are
+yours. AFUI carries no default text and never will: "Approving…" and "Sending
+payment…" are the same moment in two domains, and a library that guessed
+between them would be writing your product copy.
+
+`requires_decisions` is the reason the runtime and the page cannot drift: add a
+decision to one and the other stops rendering until it catches up. Underneath
+it are two checks you can also use directly —
+`requires_attribute_values(attribute, values)` for one attribute's vocabulary,
+and `requires_attributes(names)` for a contract whose vocabulary is the
+attribute names themselves. Both match the same way `requires_elements` does:
+the whole value, and only on an element a browser would actually render, so a
+declaration surviving in a comment or inside `<template>` does not count as a
+control anyone can press.
+
+At least one carrier per value, not exactly one — a runtime binds every control
+it finds, so an approve button at the top of a long page and another at the
+bottom is a page that works.
+
+### Partials the Provider has never heard of
+
+A frontend that restructures a page needs partials of its own, and every
+template has to be registered before an `{% include %}` resolves:
+
+```rust
+UiPage::builder(&frontend)
+    .entry("templates/page.html.j2")
+    .fallback(BUILTIN_PAGE)
+    .template("templates/layout.html.j2", BUILTIN_LAYOUT)
+    // Everything else the frontend put under `templates/`.
+    .override_templates_under("templates", ".j2")?
+```
+
+Templates already named keep their own fallbacks; the rest are registered
+override-only, so a partial that disappears between discovery and render fails
+the page rather than silently resolving to a built-in of the same name.
 
 ## What is shown must be what happens
 
@@ -328,10 +923,11 @@ a lapsed view is reopened: the credential the old address carried was
 revoked, so the new one needs a new frame, not the old one reused. Whatever
 your page was showing at that moment — an expanded tree, a half-filled
 form — is gone, and AFUI cannot preserve it: the frame is on an origin AFUI's
-own page cannot read by design (see above), and the shell does not consume or
-store a Provider's channel values. An optional session channel can let the
-surface ask its own Provider to persist something, but AFUI assigns that no
-meaning and replays nothing. It is not automatic view-state preservation.
+own page cannot read by design (see above), and the shell does not consume
+Provider payloads. The runtime restores the Provider's retained current state,
+but it cannot infer that an expanded disclosure or half-filled local form is
+domain state. Persist anything that must survive through an explicit typed
+action; DOM view state is not automatic persistence.
 
 Dropping `allow-same-origin` from the sandbox to let the shell reach in would
 remove the isolation that keeps one session's frame from reading another's.
@@ -347,3 +943,167 @@ stable across every poll while its view is live or merely warning, and
 your control. The one moment your page has to answer for is being loaded
 fresh at a new address after its own view lapsed and someone asked for it
 back.
+
+### A second screen inside your page is a place, not a panel
+
+The moment your page opens one record over its list, it has made a second
+screen — and at the width these sessions are opened at most often, that record
+covers the list completely. There are then four ways a person can ask to leave
+it: the system's own back gesture, the key that closes things, a control you
+drew, and the navigation control of a window frame your page may be running
+inside. They have to be one gesture with one result. A page that pushes no
+history entry loses the first outright: back leaves the whole page from under
+the record, which on a phone is the gesture people reach for first. A page that
+pushes one per disclosure loses it the other way, and leaving takes a dozen
+taps.
+
+`afui.place` is that one entry and the four ways in and out of it. It renders
+nothing: `show` and `hide` are yours, because whether a place is a pane beside
+the list or a screen over it is a question about your width and your content.
+Enter it after the place is on screen and *before* you write it into the
+address — what is pushed is a duplicate of where the person already was, so the
+entry below keeps your page as they left it and your own `replaceState` writes
+the place into the new one.
+
+`at` and `show` are a pair rather than one "you left" callback because a place
+is somewhere a person can arrive: going forward again, or opening an address
+that already names it. `at` is asked what the current address names; whatever
+it returns is handed to `show`, and arriving that way pushes nothing.
+
+Read what `at` returns off what your page has already been given, not off the
+address as a name to fetch. An address is a person's to edit, and a place
+restored by handing a raw identifier to a typed call is a page asking for
+something nobody listed.
+
+### Do not draw a second head inside a frame
+
+Every page in this kit grew the same header: the program's name, what the
+session is on, and a word about how it is going. A framed session then shows it
+twice — once in the frame's own head, which already has the first two from the
+listener, and once again underneath in the page. On the width these sessions
+are opened at, the second one is a row of the screen spent on nothing.
+
+`afui.frame` is the ask. `onHead(true)` means there is a head out there; a page
+that hears it hides its own and sends up the two things a frame cannot know:
+
+- `frame.title(text)` — where the page is now. `null` says nothing and leaves
+  the frame showing whatever the session itself is on. A place is the usual
+  reason it changes: set it as you enter and clear it as you leave.
+- `frame.status(text, state)` — one short line about what is being shown. The
+  optional `state` is one of AFUI's own connection words, and a frame that
+  knows the vocabulary dresses the line exactly as your baseline would.
+
+Identity is never sent. Whose program this is and what the session is on are the
+listener's word, and a page repeating either into a head it does not own would
+be a page naming itself in somebody else's chrome. That is also what makes the
+rest safe to hand over: a card cannot be made to introduce itself as something
+else.
+
+`afui.place` uses the same channel for the one navigational fact — that your
+page is somewhere with a way back — and a frame with navigation to offer draws
+the control the person's window already keeps in that corner, reaching you as
+`onFrame({navigation: true})`.
+
+Keep drawing your own head and your own way back. Your page is delivered in its
+own window and as a direct link as often as it is framed, and in those there is
+no head but yours. What these callbacks are for is dropping the *second* one,
+not having none.
+
+Nothing else crosses. The frame cannot read your page and does not consume what
+it is showing; it takes a boolean and two lines of text, and the only thing it
+ever sends back is a request to leave the place you said you were in. Both lines
+are flattened and capped before they are shown, so they are words and never a
+lever on the frame's own layout.
+
+## One page, handed over, waited on
+
+Everything above composes, and composing it is nine steps every Provider here
+wrote for itself. `UiSurface` is those nine:
+
+```rust
+let active = UiSurface::<Decision>::new("myprovider", "confirm")?
+    .with_subject(subject)
+    .with_app_icon(app_icon)
+    .with_page_policy(policy)
+    .on("approve", |_fields| Decision::Approve)
+    .on("refuse", |_fields| Decision::Refuse)
+    .with_answer_page(|decision, recorded| decided_page(decision, recorded))
+    .merge(my_domain_routes)
+    .start(plan, page, stylesheet, &frontend)
+    .await?;
+
+let facts = active.facts();
+let outcome = active.wait().await?;
+```
+
+A submission arrives as `BTreeMap<String, String>` and is parsed by a function
+you wrote. **AFUI does not learn what a field means, and this layer will never
+gain validation, field types, conditional display, layout, or grouping.**
+Anyone who needs those needs a Router, which they have always had. `with_answer_page`
+is called with what was answered and whether that answer was the one that
+counted — `false` for a click that arrived after the decision, which is the
+only honest thing to show the person who made it.
+
+This is deliberately the last layer, not the first. Everything it does is
+reachable directly, and a page that does not fit this shape should use the
+pieces rather than bend to it.
+
+## Testing your UI through AFUI
+
+Add AFUI to your `[dev-dependencies]` with `features = ["test-support"]`. It is
+not in the default set and never reaches a release binary.
+
+```rust
+use agent_first_ui::test_support::{InstalledFrontend, stub_browser, write_attention_config};
+
+InstalledFrontend::new(&workspace, "myprovider", "console", "1")
+    .with_frontend_id("custom")
+    .with_file("templates/page.html.j2", MY_TEST_PAGE)
+    .install()?
+    .trust()?;
+```
+
+`trust()` computes the fingerprint with AFUI's own code, through the same
+function AFUI trusts against. That is the whole point: a fingerprint
+reimplemented in a consumer's tests agrees with AFUI today and goes on agreeing
+right up until AFUI's algorithm changes, at which point several test suites
+fail for a reason none of them is about. Keeping AFUI honest about not drifting
+is AFUI's job; yours is to prove your UI works.
+
+Drive a live session through AFUI's real wire with `RuntimeClient`:
+
+```rust
+use agent_first_ui::test_support::RuntimeClient;
+
+let mut page = RuntimeClient::connect(&access_url, "integration-page").await?;
+let state: Option<MyState> = page.opening_state().await?;
+let reply: MyReply = page.call(&MyAction::Refresh).await?;
+page.close().await?;
+```
+
+The test supplies only domain payloads. `RuntimeClient` owns the reserved path,
+protocol hello, request identity, acknowledgements, JSON envelope, and
+WebSocket framing. Do not reproduce those details in a Provider test any more
+than you would reproduce the fingerprint algorithm. Both clients expose
+`call_with_progress`; a synchronous process test uses `BlockingRuntimeClient`
+so that callback can drive child stdin/stdout between typed progress and the
+final reply without exposing transport identity.
+
+The rest is what every suite here had written for itself: `stub_browser`
+records the URL instead of opening one, so window delivery is testable on a
+machine with no screen; `write_attention_config` puts a one-second idle policy
+where AFUI reads it, instead of waiting fifteen minutes for the default; and
+`wait_for_session` / `wait_for_no_session` poll the registry for a session this
+process is not the one announcing.
+
+Those last two are for a test that drives a Provider **as a child process**. In
+a test that holds the session itself they buy nothing: announcing happens
+inside `attach`, before the active session is handed back, so the entry is
+already there on the line after `start`. Withdrawal is the direction that is
+genuinely late — the entry goes when the handle drops — and both helpers block
+the thread they are called on, so an async test reaches for them through
+`spawn_blocking` rather than from inside a single-threaded runtime that the
+session it is waiting for also needs.
+
+Keep your own end-to-end tests driving the real library. `RuntimeClient` also
+drives a real socket; what this removes is the arranging, not the proving.

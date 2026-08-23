@@ -188,7 +188,11 @@ check() {
     echo "ShellCheck: no shell scripts under $root"
     return 0
   fi
-  "$binary" -x "${files[@]}" || return 1
+  # A checked script may use `source=/dev/stdin` for generated runtime code.
+  # Under `-x`, inheriting an interactive terminal makes ShellCheck wait for
+  # input forever; CI happens to provide EOF, so close stdin explicitly and
+  # keep local and CI behavior identical.
+  "$binary" -x "${files[@]}" </dev/null || return 1
   echo "ShellCheck $SHELLCHECK_VERSION clean: ${#files[@]} script(s)"
 }
 

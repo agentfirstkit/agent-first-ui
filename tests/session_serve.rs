@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use agent_first_ui::{
-    ActiveUiSession, Outcome, SessionServer, UiExpiry, UiIdlePolicy, UiSecurityPolicy, UiSession,
-    UiUrlDelivery, UiWindowConfig,
+    ActiveUiSession, Outcome, SessionServer, UiAttentionPolicy, UiExpiry, UiSecurityPolicy,
+    UiSession, UiUrlDelivery, UiWindowConfig,
 };
 use axum::Router;
 use axum::body::Body;
@@ -134,14 +134,14 @@ struct Framed {
 
 #[allow(clippy::expect_used)]
 async fn serving(shape: Shape) -> Shell {
-    serving_with(shape, UiIdlePolicy::never()).await
+    serving_with(shape, UiAttentionPolicy::never()).await
 }
 
 #[allow(clippy::expect_used)]
-async fn serving_with(shape: Shape, idle_policy: UiIdlePolicy) -> Shell {
+async fn serving_with(shape: Shape, attention_policy: UiAttentionPolicy) -> Shell {
     registry_root();
-    let mut server =
-        SessionServer::new("127.0.0.1:0".parse().expect("address")).with_idle_policy(idle_policy);
+    let mut server = SessionServer::new("127.0.0.1:0".parse().expect("address"))
+        .with_attention_policy(attention_policy);
     if shape == Shape::OriginPerSession {
         server = server.with_session_origin_host("localhost");
     }
@@ -168,6 +168,21 @@ impl Shell {
     /// What the person proves to reach the page, as it appears in their URL.
     fn credential(&self) -> String {
         self.page_path.trim_matches('/').to_owned()
+    }
+
+    /// The same listener, reached by somebody who has no credential for it.
+    ///
+    /// Same wire and same claimed name as the page, so the only thing that
+    /// differs is the one thing being tested.
+    async fn wrong_credential(&self) -> Reply {
+        request(
+            &self.wire,
+            &self.host,
+            "/0000000000000000000000000000000000000000000000000000000000000000/",
+            &[],
+            None,
+        )
+        .await
     }
 
     /// One request to the page itself.
@@ -588,14 +603,14 @@ in_both_shapes! {
             assert_eq!(reply.header("cache-control"), "no-store", "{path}");
             assert_eq!(reply.header("x-content-type-options"), "nosniff", "{path}");
             assert!(reply.body.contains("<title>Not Found</title>"), "{path}");
-            assert!(!reply.body.contains("Sessions on this machine"), "{path}");
+            assert!(!reply.body.contains("Open interfaces"), "{path}");
             assert!(!reply.body.contains("proxy_url_secret"), "{path}");
         }
 
         // The same listener, with the credential, is a page.
         let reply = shell.page("", &[], None).await;
         assert_eq!(reply.status, 200);
-        assert!(reply.body.contains("Sessions on this machine"));
+        assert!(reply.body.contains("Open interfaces"));
 
         // A live session is reachable at its own address and at no other. In
         // the per-session shape that is the whole claim: the path a session
@@ -1171,8 +1186,10 @@ in_both_shapes! {
 const IDLE: Duration = Duration::from_millis(700);
 const GRACE: Duration = Duration::from_millis(700);
 
-fn lapsing() -> UiIdlePolicy {
-    UiIdlePolicy::after(IDLE).with_grace(GRACE)
+fn lapsing() -> UiAttentionPolicy {
+    UiAttentionPolicy::default()
+        .with_idle_timeout(IDLE)
+        .with_grace_period(GRACE)
 }
 
 /// Wait out one card's whole window with somebody still at the page.
@@ -1283,9 +1300,32 @@ in_both_shapes! {
         let framed = shell.framed(&session).await;
 
         tokio::time::sleep(IDLE + GRACE).await;
+        // Gone, not missing. Somebody arriving here holds the page's own
+        // credential — they had this page — so being told it is finished
+        // reveals nothing they did not already have, and it is the one thing
+        // that tells them apart from a person who mistyped a URL.
         let refused = shell.page("sessions", &[], None).await;
-        assert_eq!(refused.status, 404, "{}", refused.body);
-        assert_eq!(shell.page("", &[], None).await.status, 404);
+        assert_eq!(refused.status, 410, "{}", refused.body);
+        let landing = shell.page("", &[], None).await;
+        assert_eq!(landing.status, 410, "{}", landing.body);
+        // The three questions arriving at a dead URL raises, each answered:
+        // was the address wrong, is the work lost, and what do I do now.
+        assert!(landing.body.contains("expired"), "{}", landing.body);
+        assert!(
+            landing.body.contains("not a mistyped link"),
+            "a lapsed page must rule out the explanation a 404 implies: {}",
+            landing.body
+        );
+        assert!(
+            landing.body.contains("still running"),
+            "a lapsed page must say the sessions outlived it: {}",
+            landing.body
+        );
+        assert!(
+            landing.body.contains("afui session serve"),
+            "a lapsed page must name the way back: {}",
+            landing.body
+        );
         assert_eq!(
             framed.request("", &[], None).await.status,
             404,
@@ -1294,8 +1334,40 @@ in_both_shapes! {
         );
         // And the page cannot talk its own way back: the person who could
         // attend it is the one who is no longer there.
-        assert_eq!(shell.attend(&[]).await, 404);
-        assert_eq!(shell.page("sessions", &[], None).await.status, 404);
+        assert_eq!(shell.attend(&[]).await, 410);
+        assert_eq!(shell.page("sessions", &[], None).await.status, 410);
+
+        drop(session);
+        shell.handle.abort();
+    }
+}
+
+in_both_shapes! {
+    /// What a lapse must not turn into: a way to learn this port hosts AFUI.
+    ///
+    /// The explanation above is owed to whoever held the page. It is owed to
+    /// nobody else, and a listener that answered a passing scan with "an AFUI
+    /// page expired here" would be answering the question the 404 exists to
+    /// refuse — before and after the lapse alike.
+    async fn a_lapsed_listener_still_says_nothing_to_a_credential_it_does_not_know(shape: Shape) {
+        let session = provider_session(Router::new().route("/", get(|| async { "panel" }))).await;
+        let shell = serving_with(shape, lapsing()).await;
+
+        let before = shell.wrong_credential().await;
+        assert_eq!(before.status, 404, "{}", before.body);
+
+        tokio::time::sleep(IDLE + GRACE).await;
+        let after = shell.wrong_credential().await;
+        assert_eq!(after.status, 404, "{}", after.body);
+        assert_eq!(
+            after.body, before.body,
+            "a lapse must not make a stranger's 404 read differently"
+        );
+        assert!(
+            !after.body.contains("expired"),
+            "a credential this listener never issued must not be told anything: {}",
+            after.body
+        );
 
         drop(session);
         shell.handle.abort();

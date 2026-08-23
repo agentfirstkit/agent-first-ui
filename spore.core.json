@@ -2,22 +2,34 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-ui",
   "name": "Agent-First UI",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
   "synopsis": "Let your AI agent hand you a real interface when a step needs a person — a window opens, values can stay live in both directions, and the session ends with one typed outcome.",
   "intent": [
     "Host a Provider-owned Axum Router without interpreting its domain data or defining a shared domain UI protocol",
-    "Deliver a session through an isolated Chromium-family window, an explicitly managed direct URL, or a page served to a browser on another device",
-    "Route typed completion, window closure, and TTL expiry to the exact waiting session while revoking credentials and cleaning up resources"
+    "Deliver a session through an isolated Chromium-family window, an AFUI-owned direct link, or a page served to a browser on another device",
+    "Carry typed live state, calls, progress, replies, ordered events, and bounded byte bodies through one reconnecting AFUI-owned session protocol",
+    "Route typed completion, window closure, and remote attention expiry to the exact waiting session while revoking credentials and cleaning up resources"
   ],
   "license": "MIT",
   "mutations": [
-    "Add an optional bounded full-duplex session channel carrying Provider-defined JSON in both directions, with no envelope, request ids, or retained history",
-    "Add UiPage and a page feature so turning a frontend's files into a checked page is one assembly rather than one per Provider",
-    "Collapse window, link and session delivery into one call with an environment default, and offer link only when a Provider declares its expiry",
-    "Reserve the __afui/ prefix and let any delivery be ended through __afui/end, including a served page that nobody is attending",
-    "Make the served session list a replaceable frontend whose every card action reports pending, done, or failed"
+    "Replace the raw session channel with a typed runtime — retained latest-value state, one call handle carrying progress, result, error and cancellation, ordered events with a bounded replay window, and managed byte bodies — so a page has one entry point in afui.connect() instead of a private SSE route, sequence field and reconnect flag per Provider",
+    "Add a page kernel a Provider concatenates ahead of its own runtime: session-root derivation, correlated request/reply, reconnect-aware streams that distinguish open from resumed, status line, in-flight disabling, debounced save, hash survival, unload guard and visibility-gated polling",
+    "Add afui.place and afui.frame so a record opened over a list is a place a person leaves with the back gesture or Escape, and a framed page feeds one title and status up to the card head instead of stacking a second header under it",
+    "Add UiSurface, UiPageBuilder declaration checks, UiDecisionRuntime and UiPagePolicy so a decide page's markup contract, its generated runtime and its Content-Security-Policy are composed from one closed set of switches rather than hand-written per Provider",
+    "Add page_routes, page_asset_routes and UiBlobPolicy so a page's stylesheet, an override's assets and any bytes a session hands a browser go through one caller-supplied media allowlist and size bound, with link-refusing reads and a 404 for every refusal",
+    "Unify managed and upstream delivery: UiDeliveryPlan::mode() and facts() return the resolved delivery and its five fields once, Outcome::ending() gives completed/closed/expired one spelling, and link is refused while the plan is built rather than when delivery starts",
+    "Split the delivery word list into a featureless mode tier below session and add UiDeliveryOffer, so the --mode flag a command declares and the plan it resolves come from one value and a build without a window still declares the same flags",
+    "Publish the link URL as link_url on the one event whose job is handing it to a person, instead of a redacted link_url_secret each Provider had to reveal for itself",
+    "Add UiMount::external_access and UiCredentialLease so a long-lived listener issues, renews and revokes access to the same UI through AFUI's own dispatch — Host and Origin checks, reserved prefix and __afui/end included — instead of reimplementing credential routing",
+    "Replace Error::kind()'s &'static str with the closed UiErrorKind and move every recovery action out of Display into Error::hint(), so a consumer matches exhaustively and a safe-mode hint is never offered for a built-in page an override could not have broken",
+    "Add a test-support feature carrying AFUI's own trust fingerprint, a stub browser, an attention-policy writer, a registry waiter and a client for the session runtime, so a consumer's tests stop reimplementing them and drifting when AFUI changes",
+    "Serve the frontend files that the fingerprint covered from one snapshot taken at resolve, and refuse a symlink anywhere under the directory, so a running session serves exactly the bytes trust was decided over",
+    "Give a session one irreversible outcome slot, so close, expiry and window-close can no longer report that a person walked away from an answer that had just arrived, and a retained completion cannot win after a terminal",
+    "Answer a lapsed page's own credential with 410 Gone and three sentences saying the address was right and a new URL is one session serve away, while every other caller still gets the byte-identical 404",
+    "Ship a baseline stylesheet at AFUI's own reserved route, report page contract failures all at once, hand templates the reserved routes as a protected afui global instead of a literal copied into five spores, and leave something openable behind frontend init",
+    "Upgrade Agent-First Data to 0.34.0 and Agent-First Slug to 0.7.1"
   ],
   "bonds": [],
   "tree": {
