@@ -14,7 +14,16 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Run the browser smoke on every push and keep Chrome's stderr"
+    "Add runtime.openExternal so a page opens a link in the system browser from a local window and in a new tab from a remote view",
+    "Treat a surface as remote unless it presents the window key AFUI hands only its own window",
+    "Close root-path sessions and sessions behind authenticated mounts, and bound shutdown",
+    "End established streams when their attention budget expires or the mount is revoked",
+    "Exit 1 when afui session serve fails",
+    "Publish registry entries atomically and privately, including while another process reads them on Windows",
+    "Cap cookie lifetime at 400 days on every platform",
+    "Fold the serve feature into session so every build has afui session serve",
+    "Report the build commit in --version",
+    "Move to agent-first-data 0.35.0 and agent-first-slug 0.8.0"
   ],
   "bonds": [],
   "tree": {

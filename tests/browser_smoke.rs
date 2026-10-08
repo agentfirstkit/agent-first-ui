@@ -25,6 +25,10 @@ use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message};
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Starting Chrome is setup, not behaviour under test. A cold start on a fresh
+/// CI runner, right after a release build, has taken longer than a page step
+/// is allowed; this budget only has to catch a browser that never comes up.
+const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct FixtureTask(tokio::task::JoinHandle<()>);
 
@@ -136,7 +140,7 @@ async fn headless_browser_smoke() {
         .kill_on_drop(true)
         .spawn()
         .expect("start fixture Chrome");
-    let deadline = Instant::now() + STEP_TIMEOUT;
+    let deadline = Instant::now() + BROWSER_START_TIMEOUT;
     let control = loop {
         if let Ok(control) = std::fs::read_to_string(profile.path().join("DevToolsActivePort")) {
             break control;
@@ -149,7 +153,7 @@ async fn headless_browser_smoke() {
         }
         assert!(
             Instant::now() < deadline,
-            "Chrome did not start CDP within {STEP_TIMEOUT:?}; its stderr:\n{}",
+            "Chrome did not start CDP within {BROWSER_START_TIMEOUT:?}; its stderr:\n{}",
             chrome_stderr()
         );
         sleep(Duration::from_millis(50)).await;
