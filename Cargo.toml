@@ -1,6 +1,6 @@
 [package]
 name = "agent-first-ui"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Let your AI agent hand you a real interface when a step needs a person — a window opens, values can stay live in both directions, and the session ends with one typed outcome."
 license = "MIT"
@@ -11,6 +11,7 @@ include = [
     "src/**",
     "skills/**",
     "scripts/**",
+    "build.rs",
     "Cargo.toml",
     "README.md",
     "LICENSE",
@@ -36,9 +37,11 @@ include = [
 [features]
 default = ["session"]
 # Everything that hands a UI to a person: the session, its host, its credential,
-# its security policy, the cross-process registry, the browser window, and the
-# `assets/` route a frontend's static files are served from. This is what a
-# Provider needs, and what the `afui` binary is built from.
+# its security policy, the cross-process registry, the browser window, the
+# `assets/` route a frontend's static files are served from, and the remote-view
+# shell and proxy. This is what a Provider needs, and what the `afui` binary is
+# built from — the same set a default `cargo install` and a release package
+# get, so `afui session serve` is never missing from one of them.
 session = [
     "cli",
     "dep:agent-first-data",
@@ -58,6 +61,7 @@ session = [
     "tokio/net",
     "tokio/process",
     "tokio/rt-multi-thread",
+    "tokio/signal",
     "tokio/sync",
     "tokio/time",
 ]
@@ -90,13 +94,6 @@ test-support = [
     "dep:futures-util",
     "dep:tokio-tungstenite",
 ]
-# The `afui session serve` CLI verb. The shell and streaming proxy themselves
-# belong to `session`: direct `link` delivery uses that same remote-view path,
-# so keeping a second implementation behind this flag would split lifecycle
-# semantics again. This flag adds only the process signal the long-running CLI
-# verb waits on.
-serve = ["session", "tokio/signal"]
-
 # Cargo discovers src/bin/afui.rs without being told. The release pipeline does
 # not: it reads this table to learn what a release ships, deriving the archive
 # name, the Homebrew formula, and the Scoop manifest from bin.0.name, and it
@@ -114,13 +111,13 @@ required-features = ["session"]
 [dependencies]
 # The CLI's argument parsing, event stream and skill installer. Only the binary
 # uses it, and the binary is a `session` build.
-agent-first-data = { version = "0.34.0", default-features = false, features = ["cli", "skill-admin"], optional = true }
+agent-first-data = { version = "0.35.0", default-features = false, features = ["cli", "skill-admin"], optional = true }
 # A `provider_id` and a `ui_kind` are path segments in a frontend directory
 # before they are anything else, so the grammar is checked in the guard tier.
-agent-first-slug = { version = "0.7.1", default-features = false }
+agent-first-slug = { version = "0.8.0", default-features = false }
 axum = { version = "0.8", features = ["ws"], optional = true }
 blake3 = "1"
-dirs = "6"
+dirs = "7"
 getrandom = { version = "0.4", optional = true }
 hex = { version = "0.4", optional = true }
 futures-util = { version = "0.3", default-features = false, optional = true }

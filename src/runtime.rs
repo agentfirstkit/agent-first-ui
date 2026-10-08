@@ -43,6 +43,9 @@ const MAX_ID_BYTES: usize = 128;
 const DEFAULT_RUNTIME_BLOB_CAPACITY: usize = 16;
 const RUNTIME_BLOB_TOTAL_MULTIPLIER: u64 = 4;
 const BLOB_ID_BYTES: usize = 16;
+const RUNTIME_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const RUNTIME_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const RUNTIME_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// One AFUI-managed byte body a Provider can hand to its page.
 ///
@@ -330,6 +333,10 @@ struct RuntimeShared {
     event_capacity: usize,
     blobs: Option<RuntimeBlobStore>,
     shutdown: watch::Receiver<bool>,
+    /// Proof that a surface is the local window AFUI itself opened. Only a
+    /// window launched through AFUI is handed it, in the URL fragment, which
+    /// never reaches a server; see [`window_url`].
+    window_key: String,
 }
 
 impl<Action, Reply, SurfaceState> UiSessionRuntime<Action, Reply, SurfaceState> {
@@ -386,6 +393,7 @@ impl<Action, Reply, SurfaceState> UiSessionRuntime<Action, Reply, SurfaceState> 
                 blobs: StdMutex::new(StoredBlobs::default()),
             }),
             shutdown: shutdown_rx.clone(),
+            window_key: random_window_key()?,
         });
         Ok((
             Self {
@@ -548,6 +556,16 @@ impl<Action, Reply, SurfaceState> Drop for UiSessionRuntime<Action, Reply, Surfa
 }
 
 impl RuntimeShared {
+    fn presents_window_key(&self, candidate: Option<&str>) -> bool {
+        use subtle::ConstantTimeEq;
+        candidate.is_some_and(|candidate| {
+            candidate
+                .as_bytes()
+                .ct_eq(self.window_key.as_bytes())
+                .into()
+        })
+    }
+
     fn is_closed(&self) -> bool {
         *self.shutdown.borrow()
     }
@@ -791,6 +809,30 @@ impl RuntimeBlobStore {
     }
 }
 
+/// The fragment parameter a local window's URL carries its key in.
+pub(crate) const WINDOW_KEY_FRAGMENT: &str = "afui-window";
+const WINDOW_KEY_BYTES: usize = 32;
+
+fn random_window_key() -> Result<String> {
+    let mut bytes = [0_u8; WINDOW_KEY_BYTES];
+    fill(&mut bytes).map_err(|error| {
+        Error::Random(std::io::Error::other(format!(
+            "could not generate UI window key: {error}"
+        )))
+    })?;
+    Ok(hex::encode(bytes))
+}
+
+/// The URL AFUI opens its own local window on: the access URL plus the
+/// runtime's window key in the fragment, so the key reaches the page's script
+/// and never a server, a proxy, or a log.
+pub(crate) fn window_url(access_url: &str, endpoint: &UiSessionRuntimeEndpoint) -> String {
+    format!(
+        "{access_url}#{WINDOW_KEY_FRAGMENT}={}",
+        endpoint.shared.window_key
+    )
+}
+
 fn random_blob_id() -> Result<String> {
     let mut bytes = [0_u8; BLOB_ID_BYTES];
     fill(&mut bytes).map_err(|error| {
@@ -815,26 +857,60 @@ impl UiSessionRuntimeEndpoint {
         )
     }
 
-    async fn serve(self, mut socket: WebSocket) {
-        let Some(hello) = read_hello(&mut socket).await else {
+    async fn serve(self, mut socket: WebSocket, proxied: bool) {
+        let mut shutdown = self.shutdown.clone();
+        if *shutdown.borrow() {
+            return;
+        }
+        let mut introduced = false;
+        // Cancellation owns the whole protocol, including initial replay and
+        // socket writes. A peer that stops reading cannot prevent teardown.
+        let ended = tokio::select! {
+            biased;
+            _changed = shutdown.changed() => true,
+            () = self.serve_protocol(&mut socket, proxied, &mut introduced) => *shutdown.borrow(),
+        };
+        if ended && introduced {
+            let _ignored = tokio::time::timeout(RUNTIME_CLOSE_TIMEOUT, async {
+                if let Ok(closed) = encode("closed", json!({ "reason": "session_ended" })) {
+                    let _ignored = send_encoded(&mut socket, &closed).await;
+                }
+                let _ignored = send_message(&mut socket, Message::Close(None)).await;
+            })
+            .await;
+        }
+    }
+
+    async fn serve_protocol(self, socket: &mut WebSocket, proxied: bool, introduced: &mut bool) {
+        // An upgraded socket already owns a task and a file descriptor. A
+        // surface that never introduces itself must not outlive the session
+        // or retain that socket indefinitely.
+        let hello = tokio::time::timeout(RUNTIME_HELLO_TIMEOUT, read_hello(socket))
+            .await
+            .ok()
+            .flatten();
+        let Some(hello) = hello else {
             return;
         };
         if hello.protocol != UI_RUNTIME_PROTOCOL || !valid_id(&hello.client_id) {
             let _ignored = send_protocol_error(
-                &mut socket,
+                socket,
                 "ui_protocol_invalid",
                 "the UI runtime hello is invalid or unsupported",
             )
             .await;
             return;
         }
+        *introduced = true;
         if *self.shutdown.borrow() {
-            if let Ok(closed) = encode("closed", json!({ "reason": "session_ended" })) {
-                let _ignored = send_encoded(&mut socket, &closed).await;
-            }
-            let _ignored = socket.send(Message::Close(None)).await;
             return;
         }
+        // Remote unless proven local. Not having come through AFUI's proxy
+        // proves nothing: a Provider's own listener, a tunnel, or a container
+        // port reaches the runtime directly from another machine. Only the
+        // window AFUI opened holds the key, so only it may ask this machine to
+        // open a URL.
+        let remote_view = proxied || !self.shared.presents_window_key(hello.window_key.as_deref());
 
         let client_id = hello.client_id;
         let mut state = self.state.clone();
@@ -845,7 +921,7 @@ impl UiSessionRuntimeEndpoint {
 
         let initial_state = { state.borrow_and_update().clone() };
         if let Some(current) = initial_state
-            && send_encoded(&mut socket, &current).await.is_err()
+            && send_encoded(socket, &current).await.is_err()
         {
             return;
         }
@@ -867,13 +943,13 @@ impl UiSessionRuntimeEndpoint {
             ) else {
                 return;
             };
-            if send_encoded(&mut socket, &frame).await.is_err() {
+            if send_encoded(socket, &frame).await.is_err() {
                 return;
             }
             sent_event_sequence = latest_sequence;
         } else {
             for frame in replay {
-                if send_encoded(&mut socket, &frame.encoded).await.is_err() {
+                if send_encoded(socket, &frame.encoded).await.is_err() {
                     return;
                 }
                 sent_event_sequence = frame.sequence;
@@ -881,16 +957,15 @@ impl UiSessionRuntimeEndpoint {
         }
 
         if *shutdown.borrow() {
-            if let Ok(closed) = encode("closed", json!({ "reason": "session_ended" })) {
-                let _ignored = send_encoded(&mut socket, &closed).await;
-            }
-            let _ignored = socket.send(Message::Close(None)).await;
             return;
         }
-        let Ok(ready) = encode("ready", json!({ "protocol": UI_RUNTIME_PROTOCOL })) else {
+        let Ok(ready) = encode(
+            "ready",
+            json!({ "protocol": UI_RUNTIME_PROTOCOL, "remote_view": remote_view }),
+        ) else {
             return;
         };
-        if send_encoded(&mut socket, &ready).await.is_err() {
+        if send_encoded(socket, &ready).await.is_err() {
             return;
         }
 
@@ -902,20 +977,20 @@ impl UiSessionRuntimeEndpoint {
                     };
                     match message {
                         Message::Text(text) => {
-                            if self.handle_surface_frame(&client_id, text.as_bytes(), &mut socket).await.is_err() {
+                            if self.handle_surface_frame(&client_id, text.as_bytes(), socket, remote_view).await.is_err() {
                                 return;
                             }
                         }
                         Message::Binary(_) => {
                             let _ignored = send_protocol_error(
-                                &mut socket,
+                                socket,
                                 "ui_protocol_invalid",
                                 "the UI runtime accepts JSON text frames only",
                             ).await;
                             return;
                         }
                         Message::Ping(bytes) => {
-                            if socket.send(Message::Pong(bytes)).await.is_err() {
+                            if send_message(socket, Message::Pong(bytes)).await.is_err() {
                                 return;
                             }
                         }
@@ -929,7 +1004,7 @@ impl UiSessionRuntimeEndpoint {
                     }
                     let current = { state.borrow_and_update().clone() };
                     if let Some(current) = current
-                        && send_encoded(&mut socket, &current).await.is_err()
+                        && send_encoded(socket, &current).await.is_err()
                     {
                         return;
                     }
@@ -937,7 +1012,7 @@ impl UiSessionRuntimeEndpoint {
                 event = events.recv() => {
                     match event {
                         Ok(frame) if frame.sequence > sent_event_sequence => {
-                            if send_encoded(&mut socket, &frame.encoded).await.is_err() {
+                            if send_encoded(socket, &frame.encoded).await.is_err() {
                                 return;
                             }
                             sent_event_sequence = frame.sequence;
@@ -950,7 +1025,7 @@ impl UiSessionRuntimeEndpoint {
                 response = responses.recv() => {
                     match response {
                         Ok(frame) if frame.client_id == client_id => {
-                            if send_encoded(&mut socket, &frame.encoded).await.is_err() {
+                            if send_encoded(socket, &frame.encoded).await.is_err() {
                                 return;
                             }
                         }
@@ -961,10 +1036,6 @@ impl UiSessionRuntimeEndpoint {
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
-                        if let Ok(closed) = encode("closed", json!({ "reason": "session_ended" })) {
-                            let _ignored = send_encoded(&mut socket, &closed).await;
-                        }
-                        let _ignored = socket.send(Message::Close(None)).await;
                         return;
                     }
                 }
@@ -1007,6 +1078,7 @@ impl UiSessionRuntimeEndpoint {
         client_id: &str,
         encoded: &[u8],
         socket: &mut WebSocket,
+        remote_view: bool,
     ) -> Result<()> {
         ensure_size(encoded.len())?;
         let frame: SurfaceFrame =
@@ -1053,6 +1125,20 @@ impl UiSessionRuntimeEndpoint {
             SurfaceFrame::ReleaseBlob { release_blob } => {
                 self.shared.release_blob_url(&release_blob.blob_url);
             }
+            SurfaceFrame::OpenExternal { open_external } => {
+                if !valid_id(&open_external.request_id) {
+                    send_protocol_error(
+                        socket,
+                        "ui_request_id_invalid",
+                        "the UI runtime request id is invalid",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                let result = open_external_result(remote_view, &open_external);
+                let encoded = encode("open_external_result", result)?;
+                send_encoded(socket, &encoded).await?;
+            }
         }
         Ok(())
     }
@@ -1077,6 +1163,8 @@ struct HelloFrame {
     client_id: String,
     #[serde(default)]
     last_event_sequence: u64,
+    #[serde(default)]
+    window_key: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1086,6 +1174,14 @@ enum SurfaceFrame {
     Cancel { cancel: RequestFrame },
     Ack { ack: RequestFrame },
     ReleaseBlob { release_blob: BlobReferenceFrame },
+    OpenExternal { open_external: OpenExternalFrame },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenExternalFrame {
+    request_id: String,
+    url: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -1118,7 +1214,7 @@ async fn read_hello(socket: &mut WebSocket) -> Option<HelloFrame> {
                 return Some(hello);
             }
             Message::Ping(bytes) => {
-                socket.send(Message::Pong(bytes)).await.ok()?;
+                send_message(socket, Message::Pong(bytes)).await.ok()?;
             }
             Message::Pong(_) => {}
             Message::Binary(_) | Message::Close(_) => return None,
@@ -1128,13 +1224,53 @@ async fn read_hello(socket: &mut WebSocket) -> Option<HelloFrame> {
 
 async fn upgrade_runtime(
     AxumState(endpoint): AxumState<UiSessionRuntimeEndpoint>,
+    headers: axum::http::HeaderMap,
     websocket: WebSocketUpgrade,
 ) -> Response {
+    // A connection that came through AFUI's own proxy is a person on another
+    // device. The proxy is the only party that sets this header (see
+    // `serve::proxy`). Its absence is not proof of the local window; the
+    // window key in the hello is (see `serve_protocol`).
+    let proxied = headers.contains_key(crate::serve::AFUI_REMOTE_VIEW);
     websocket
         .max_message_size(MAX_UI_RUNTIME_MESSAGE_BYTES)
         .max_frame_size(MAX_UI_RUNTIME_MESSAGE_BYTES)
-        .on_upgrade(move |socket| endpoint.serve(socket))
+        .on_upgrade(move |socket| endpoint.serve(socket, proxied))
         .into_response()
+}
+
+/// Answer one `open_external` frame. The host, not the page, decides whether
+/// a URL is handed to the system browser: only plain `http`/`https`, and only
+/// for the local window — a remote view has a browser of its own to open
+/// things in, and the machine this runtime is on is not where that person is.
+fn open_external_result(remote_view: bool, frame: &OpenExternalFrame) -> Value {
+    let refusal = |code: &str, message: &str| {
+        json!({
+            "request_id": frame.request_id,
+            "opened": false,
+            "code": code,
+            "message": message,
+        })
+    };
+    if remote_view {
+        return refusal(
+            "ui_open_external_remote",
+            "a remote view opens links in its own browser; the host does not open them",
+        );
+    }
+    if let Some(code) = crate::external::external_url_rejection(&frame.url) {
+        return refusal(
+            code,
+            "only a plain http or https URL can be opened outside the page",
+        );
+    }
+    match crate::external::open_in_system_browser(&frame.url) {
+        Ok(()) => json!({ "request_id": frame.request_id, "opened": true }),
+        Err(error) => refusal(
+            "ui_open_external_failed",
+            &format!("the system browser could not be started: {error}"),
+        ),
+    }
 }
 
 fn encode(kind: &'static str, payload: Value) -> Result<Arc<str>> {
@@ -1170,9 +1306,13 @@ fn valid_id(value: &str) -> bool {
 }
 
 async fn send_encoded(socket: &mut WebSocket, encoded: &str) -> Result<()> {
-    socket
-        .send(Message::Text(encoded.to_owned().into()))
+    send_message(socket, Message::Text(encoded.to_owned().into())).await
+}
+
+async fn send_message(socket: &mut WebSocket, message: Message) -> Result<()> {
+    tokio::time::timeout(RUNTIME_WRITE_TIMEOUT, socket.send(message))
         .await
+        .map_err(|_| Error::SessionRuntimeClosed)?
         .map_err(|_| Error::SessionRuntimeClosed)
 }
 
@@ -1200,6 +1340,169 @@ mod tests {
     use serde::{Deserialize, Serialize, Serializer};
 
     use super::*;
+
+    #[tokio::test]
+    async fn ending_a_session_releases_a_socket_blocked_sending_replay() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as SurfaceMessage;
+
+        let host = crate::UiHost::bind_local().await.unwrap();
+        let (session, runtime) = crate::UiSession::<()>::new("inspector", "console")
+            .unwrap()
+            .with_runtime::<Action, Reply<'static>, SurfaceState<'static>>()
+            .unwrap();
+        let retained = Arc::downgrade(&runtime.shared);
+        // The peer reads the upgrade only. Its unread replay exceeds TCP's
+        // buffers, so teardown must cancel a pending write rather than wait
+        // for the peer to resume consuming frames.
+        let payload = "x".repeat(256 * 1024);
+        for _ in 0..64 {
+            runtime.publish_event(&payload).unwrap();
+        }
+        let active = host
+            .attach(session, Router::new(), crate::UiExpiry::Never)
+            .unwrap();
+        let endpoint = format!(
+            "{}__afui/runtime",
+            active.access_url().replacen("http://", "ws://", 1)
+        );
+        let stream = tokio::net::TcpStream::connect(host.local_addr())
+            .await
+            .unwrap();
+        let (mut surface, _) = tokio_tungstenite::client_async(endpoint, stream)
+            .await
+            .unwrap();
+        surface
+            .send(SurfaceMessage::Text(
+                json!({
+                    "kind": "hello",
+                    "hello": {
+                        "protocol": UI_RUNTIME_PROTOCOL,
+                        "client_id": "silent-surface",
+                        "last_event_sequence": 0,
+                    },
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(active);
+        drop(runtime);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while retained.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shutdown must release the upgraded task even with an unread replay");
+        drop(surface);
+        host.shutdown().await.unwrap();
+    }
+
+    /// Remote unless proven local: only the key AFUI hands its own window
+    /// makes a surface local, and a proxied connection is remote even with it.
+    /// Coming straight to the listener proves nothing — a Provider's own
+    /// listener, a tunnel or a mapped port reaches it from another machine.
+    #[tokio::test]
+    async fn only_the_window_key_makes_a_surface_local() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as SurfaceMessage;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let host = crate::UiHost::bind_local().await.unwrap();
+        let (session, _runtime) = crate::UiSession::<()>::new("inspector", "console")
+            .unwrap()
+            .with_runtime::<Action, Reply<'static>, SurfaceState<'static>>()
+            .unwrap();
+        let active = host
+            .attach(session, Router::new(), crate::UiExpiry::Never)
+            .unwrap();
+        let (base, key) = active
+            .window_url()
+            .split_once(&format!("#{WINDOW_KEY_FRAGMENT}="))
+            .expect("a session with a runtime opens its window with a key");
+        assert_eq!(base, active.access_url());
+        assert_eq!(key.len(), WINDOW_KEY_BYTES * 2);
+        let endpoint = format!("{}__afui/runtime", base.replacen("http://", "ws://", 1));
+        let wrong = "0".repeat(WINDOW_KEY_BYTES * 2);
+
+        for (case, window_key, proxied, remote) in [
+            ("no key", None, false, true),
+            ("wrong key", Some(wrong.as_str()), false, true),
+            ("window key", Some(key), false, false),
+            ("window key through the proxy", Some(key), true, true),
+        ] {
+            let mut request = endpoint.as_str().into_client_request().unwrap();
+            if proxied {
+                request
+                    .headers_mut()
+                    .insert(crate::serve::AFUI_REMOTE_VIEW, "1".parse().unwrap());
+            }
+            let stream = tokio::net::TcpStream::connect(host.local_addr())
+                .await
+                .unwrap();
+            let (surface, _) = tokio_tungstenite::client_async(request, stream)
+                .await
+                .unwrap();
+            let (mut sink, mut frames) = surface.split();
+            let mut hello = json!({
+                "protocol": UI_RUNTIME_PROTOCOL,
+                "client_id": "surface",
+                "last_event_sequence": 0,
+            });
+            if let Some(window_key) = window_key {
+                hello["window_key"] = json!(window_key);
+            }
+            sink.send(SurfaceMessage::Text(
+                json!({"kind": "hello", "hello": hello}).to_string().into(),
+            ))
+            .await
+            .unwrap();
+            let mut next = async || loop {
+                let frame = tokio::time::timeout(std::time::Duration::from_secs(5), frames.next())
+                    .await
+                    .expect("the runtime answers")
+                    .expect("the socket stays open")
+                    .unwrap();
+                if let SurfaceMessage::Text(text) = frame {
+                    break serde_json::from_str::<Value>(&text).unwrap();
+                }
+            };
+            let ready = loop {
+                let frame = next().await;
+                if frame["kind"] == "ready" {
+                    break frame;
+                }
+            };
+            assert_eq!(ready["ready"]["remote_view"], json!(remote), "{case}");
+
+            // `javascript:` is refused by the URL check, which only a local
+            // window reaches; a remote one is refused before it. Either way
+            // nothing is ever handed to a browser here.
+            sink.send(SurfaceMessage::Text(
+                json!({
+                    "kind": "open_external",
+                    "open_external": {"request_id": "o1", "url": "javascript:alert(1)"},
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            let answer = next().await;
+            assert_eq!(answer["kind"], "open_external_result", "{case}");
+            let expected = if remote {
+                "ui_open_external_remote"
+            } else {
+                "ui_open_external_url_invalid"
+            };
+            assert_eq!(answer["open_external_result"]["code"], expected, "{case}");
+        }
+        drop(active);
+        host.shutdown().await.unwrap();
+    }
 
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     struct Action {
@@ -1495,6 +1798,30 @@ mod tests {
                 command: "second".to_string()
             }
         );
+    }
+
+    #[test]
+    fn open_external_is_refused_for_remote_views_and_odd_urls_before_anything_runs() {
+        let frame = OpenExternalFrame {
+            request_id: "o1".to_string(),
+            url: "https://example.com/x".to_string(),
+        };
+        let remote = open_external_result(true, &frame);
+        assert_eq!(remote["opened"], false);
+        assert_eq!(remote["code"], "ui_open_external_remote");
+        assert_eq!(remote["request_id"], "o1");
+        let odd = OpenExternalFrame {
+            request_id: "o2".to_string(),
+            url: "javascript:alert(1)".to_string(),
+        };
+        let refused = open_external_result(false, &odd);
+        assert_eq!(refused["opened"], false);
+        assert_eq!(refused["code"], "ui_open_external_url_invalid");
+        // Decoding: the page cannot smuggle extra fields into the request.
+        let extra: std::result::Result<SurfaceFrame, _> = serde_json::from_str(
+            r#"{"kind":"open_external","open_external":{"request_id":"o3","url":"https://x","target":"_self"}}"#,
+        );
+        assert!(extra.is_err());
     }
 
     #[tokio::test]

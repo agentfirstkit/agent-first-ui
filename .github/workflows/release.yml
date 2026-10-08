@@ -61,18 +61,21 @@ jobs:
             target
           key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
 
-      # `--features serve` is not optional here, and it is the one thing about
-      # this build that differs from `cargo build --release`.
-      #
-      # `serve` is off by default because five Provider spores consume this
-      # crate as a library and none of them proxies anything. A released binary
-      # is the other case: `afui session serve` is the reason the binary exists
-      # on a phone-accessible machine, and a build without the feature answers
-      # that verb with `feature_unavailable`. The library default stays light;
-      # the shipped executable is built with the feature on. scripts/
-      # release-smoke.sh below asserts it rather than trusting this line.
       - name: Build
-        run: cargo build --release --features serve --bin afui --target ${{ matrix.target }}
+        run: cargo build --release --bin afui --target ${{ matrix.target }}
+
+      # One real browser checks the shell's DOM lifecycle and enforced CSP.
+      # Other targets keep the binary smoke; this is deliberately no matrix.
+      - name: Install afdata for browser smoke
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo install agent-first-data --version 0.34.0 --locked --features skill
+
+      - name: Browser smoke
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        env:
+          AFUI_TEST_BROWSER_BINARY: /usr/bin/google-chrome
+        run: ./scripts/test.sh browser
 
       - name: Package
         shell: bash

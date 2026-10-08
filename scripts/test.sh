@@ -40,10 +40,6 @@ run_static() {
   # page but binds no port. Nothing else in this gate compiles it.
   run_clippy --no-default-features --features page
   run_clippy
-  # The remote shell belongs to the default session tier because direct links
-  # use it. The `serve` flag still compiles the long-running CLI branch and its
-  # process-signal shutdown path.
-  run_clippy --features serve
   # What a consumer's own test suite compiles against. A tier nothing builds is
   # a tier that compiles by accident.
   run_clippy --features test-support
@@ -55,7 +51,6 @@ run_unit() {
   afdata_run --quiet cargo test --all-targets
   afdata_run --quiet cargo test --doc
   afdata_run --quiet cargo test --doc --no-default-features --features page
-  afdata_run --quiet cargo test --all-targets --features serve
   afdata_run --quiet cargo test --all-targets --features test-support
   check_guard_tier_dependencies
   run_page_kernel
@@ -152,7 +147,7 @@ run_serve_smoke() {
 
   [ -n "$session_origin_host" ] && extra_args=(--session-origin-host "$session_origin_host")
 
-  afdata_run --quiet cargo build --bin afui --features serve
+  afdata_run --quiet cargo build --bin afui
   # `0` is how a person says "no limit", and the gate has to prove the CLI reads
   # it that way: the alternative spelling of nothing is a listener that stops
   # answering in the middle of this script.
@@ -221,21 +216,71 @@ run_serve_smoke() {
     done
   fi
 
-  kill "$serve_pid" 2>/dev/null || true
-  wait "$serve_pid" 2>/dev/null || true
+  # An interrupt is the normal way to stop serving: the terminal event must be
+  # a result and the exit status 0, the mirror image of a failed start.
+  local serve_status=0
+  kill -INT "$serve_pid" 2>/dev/null || true
+  wait "$serve_pid" 2>/dev/null || serve_status=$?
   # shellcheck disable=SC2064
   trap "rm -rf '$TEST_TMP'" EXIT
+  tail -n 1 "$log" >"$TEST_TMP/stopped.json"
+  if [ "$serve_status" != 0 ] ||
+    [ "$(afdata value "$TEST_TMP/stopped.json" result.code --default "")" != session_serve_stopped ]; then
+    afdata_error serve_stop_failed \
+      "afui session serve exited $serve_status without a session_serve_stopped result" \
+      "inspect $log" || :
+    return 1
+  fi
 }
 
 # The release build, checked the way a release ships it.
-#
-# `serve` is off by default because only the long-running CLI verb waits on a
-# process signal. A release build that forgets it still produces a
-# working-looking afui whose remote-access verb answers `feature_unavailable`;
-# this gate catches that before publish.
 run_release_smoke() {
-  afdata_run --quiet cargo build --release --features serve --bin afui
+  afdata_run --quiet cargo build --release --bin afui
   afdata_run --quiet ./scripts/release-smoke.sh target/release
+}
+
+# A real browser is a release check, not a requirement of every push. The
+# fixture uses only loopback servers, a fresh profile and its own registry.
+run_browser() {
+  local browser_binary="${AFUI_TEST_BROWSER_BINARY:-}"
+  local candidate config_root
+  if [ -n "$browser_binary" ]; then
+    if [ ! -x "$browser_binary" ]; then
+      afdata_error browser_unavailable \
+        "AFUI_TEST_BROWSER_BINARY must name an executable Chrome or Chromium binary" || :
+      return 1
+    fi
+  else
+    for candidate in google-chrome google-chrome-stable chromium chromium-browser chrome chrome.exe; do
+      browser_binary="$(command -v "$candidate" || true)"
+      [ -n "$browser_binary" ] && break
+    done
+    if [ -z "$browser_binary" ]; then
+      for candidate in \
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+        "/Applications/Chromium.app/Contents/MacOS/Chromium"; do
+        if [ -x "$candidate" ]; then
+          browser_binary="$candidate"
+          break
+        fi
+      done
+    fi
+  fi
+  if [ -z "$browser_binary" ]; then
+    afdata_log info \
+      "browser smoke skipped: Chrome or Chromium is unavailable; set AFUI_TEST_BROWSER_BINARY to select it"
+    return 0
+  fi
+  config_root="$TEST_TMP/browser-config"
+  mkdir -p "$config_root"
+  if command -v cygpath >/dev/null 2>&1; then
+    config_root="$(cygpath -w "$config_root")"
+    browser_binary="$(cygpath -w "$browser_binary")"
+  fi
+  AFUI_CONFIG_DIR="$config_root" AFUI_SAFE_MODE=1 AFUI_NO_REGISTRY=0 \
+    AFUI_TEST_BROWSER_BINARY="$browser_binary" \
+    afdata_run --quiet cargo test --release \
+      --test browser_smoke headless_browser_smoke -- --ignored --exact
 }
 
 case "$MODE" in
@@ -243,13 +288,14 @@ case "$MODE" in
   unit)          run_unit ;;
   smoke)         run_smoke ;;
   release-smoke) run_release_smoke ;;
-  # `all` is the release gate, so everything that can fail a release has to be
-  # able to fail here first — including the release smoke, which otherwise runs
-  # only inside the Release workflow, i.e. after the crate is published.
+  browser)       run_browser ;;
+  release)       run_static; run_unit; run_smoke; run_release_smoke; run_browser ;;
+  # Every push uses this portable gate. The release mode above adds the real
+  # browser check without making Chrome a requirement of ordinary CI.
   all)           run_static; run_unit; run_smoke; run_release_smoke ;;
   *)
     afdata_error cli_error "unsupported test mode '$MODE'" \
-      "try: $0 static|unit|smoke|release-smoke|all" || :
+      "try: $0 static|unit|smoke|release-smoke|browser|release|all" || :
     exit 2
     ;;
 esac

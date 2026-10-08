@@ -30,10 +30,13 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::Request;
 use axum::http::header::{
     ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_SECURITY_POLICY,
@@ -46,6 +49,19 @@ use axum::response::IntoResponse;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
+use tokio::sync::watch;
+
+use super::attention::{AttentionClock, UiAttentionPolicy};
+
+const UPSTREAM_STEP_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_COOKIE_NAMES: usize = 256;
+/// The longest lifetime a cookie is kept for, whatever `Max-Age` asks: the
+/// 400 days RFC 6265bis lets a user agent cap it at. Without a cap, whether a
+/// huge `Max-Age` overflows the clock depends on the platform's time type, so
+/// one Provider's cookie would be dropped on one OS and kept on another.
+const MAX_COOKIE_AGE: Duration = Duration::from_secs(400 * 24 * 60 * 60);
+
+type Unavailable = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 const ACCESS_CONTROL_ALLOW_HEADERS: HeaderName =
     HeaderName::from_static("access-control-allow-headers");
@@ -62,6 +78,11 @@ const CONTENT_SECURITY_POLICY_REPORT_ONLY: HeaderName =
     HeaderName::from_static("content-security-policy-report-only");
 const LAST_EVENT_ID: HeaderName = HeaderName::from_static("last-event-id");
 const X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
+/// Set on every request this proxy forwards, so a Provider's runtime can tell
+/// a remote view from the local window. Browsers cannot set it on a WebSocket
+/// upgrade, and the allowlist above never copies a client's copy of it, so
+/// the only way it reaches a Provider is through this hop.
+pub(crate) const AFUI_REMOTE_VIEW: HeaderName = HeaderName::from_static("afui-remote-view");
 
 /// The only request headers that reach a Provider.
 ///
@@ -183,15 +204,109 @@ impl Framing<'_> {
 /// took its place on the same path.
 pub(super) struct Proxied {
     pub(super) upstream: Upstream,
+    pub(super) attention: AttentionClock,
     cookies: CookieJar,
+    revoked: watch::Sender<bool>,
 }
 
 impl Proxied {
     pub(super) fn new(upstream: Upstream) -> Self {
         Self {
             upstream,
+            attention: AttentionClock::new(),
             cookies: CookieJar::default(),
+            revoked: watch::channel(false).0,
         }
+    }
+
+    pub(super) fn revoke(&self) {
+        self.revoked.send_replace(true);
+    }
+
+    /// One owned waiter follows the same resettable clocks as new requests.
+    /// Revocation also wakes streams when reconciliation removes the mount.
+    fn unavailable(
+        self: &Arc<Self>,
+        shell_attention: Arc<AttentionClock>,
+        policy: UiAttentionPolicy,
+    ) -> Unavailable {
+        let proxied = Arc::clone(self);
+        let mut revoked = self.revoked.subscribe();
+        Box::pin(async move {
+            let changed = async {
+                while !*revoked.borrow_and_update() {
+                    if revoked.changed().await.is_err() {
+                        return;
+                    }
+                }
+            };
+            tokio::select! {
+                biased;
+                () = changed => {}
+                () = proxied.attention.wait_until_dead(&policy) => proxied.revoke(),
+                () = shell_attention.wait_until_dead(&policy) => proxied.revoke(),
+            }
+        })
+    }
+}
+
+/// The driver belongs to this response, including an upgraded connection.
+/// Dropping a timed-out request or its body closes the otherwise detached task.
+struct ConnectionTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ConnectionTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Stream frames without collecting them, checking expiry before each frame.
+struct ScopedBody {
+    incoming: Option<Pin<Box<hyper::body::Incoming>>>,
+    unavailable: Unavailable,
+    connection: Option<ConnectionTask>,
+}
+
+impl HttpBody for ScopedBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let body = self.get_mut();
+        if body.incoming.is_none() {
+            return Poll::Ready(None);
+        }
+        if body.unavailable.as_mut().poll(context).is_ready() {
+            body.incoming = None;
+            body.connection = None;
+            return Poll::Ready(None);
+        }
+        let Some(incoming) = body.incoming.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let frame = incoming.as_mut().poll_frame(context);
+        if matches!(frame, Poll::Ready(None)) {
+            body.incoming = None;
+            body.connection = None;
+        }
+        frame
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.incoming
+            .as_ref()
+            .is_none_or(|incoming| incoming.is_end_stream())
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.incoming
+            .as_ref()
+            .map_or_else(hyper::body::SizeHint::default, |incoming| {
+                incoming.size_hint()
+            })
     }
 }
 
@@ -261,19 +376,36 @@ impl CookieJar {
         let Ok(mut cookies) = self.cookies.lock() else {
             return;
         };
+        let now = Instant::now();
+        cookies.retain(|_, stored| stored.expires_at.is_none_or(|expiry| now < expiry));
         match max_age {
             // How a Provider deletes one.
             Some(seconds) if seconds <= 0 => {
                 cookies.remove(name);
             }
             _ => {
+                let expires_at = match max_age {
+                    Some(seconds) => {
+                        let Ok(seconds) = u64::try_from(seconds) else {
+                            return;
+                        };
+                        let Some(expiry) =
+                            now.checked_add(Duration::from_secs(seconds).min(MAX_COOKIE_AGE))
+                        else {
+                            return;
+                        };
+                        Some(expiry)
+                    }
+                    None => None,
+                };
+                if !cookies.contains_key(name) && cookies.len() >= MAX_COOKIE_NAMES {
+                    return;
+                }
                 cookies.insert(
                     name.to_owned(),
                     Stored {
                         value: value.to_owned(),
-                        expires_at: max_age
-                            .and_then(|seconds| u64::try_from(seconds).ok())
-                            .map(|seconds| Instant::now() + Duration::from_secs(seconds)),
+                        expires_at,
                     },
                 );
             }
@@ -363,7 +495,9 @@ impl Upstream {
 /// `frame-ancestors 'none'` has to be told which page may frame it, which is a
 /// different origin in each shape.
 pub(super) async fn forward(
-    proxied: &Proxied,
+    proxied: Arc<Proxied>,
+    shell_attention: Arc<AttentionClock>,
+    attention_policy: UiAttentionPolicy,
     framing: Framing<'_>,
     remainder: &str,
     mut request: Request,
@@ -395,6 +529,7 @@ pub(super) async fn forward(
     let mut outbound = hyper::Request::builder().method(parts.method).uri(uri);
     if let Some(headers) = outbound.headers_mut() {
         headers.insert(HOST, host);
+        headers.insert(AFUI_REMOTE_VIEW, HeaderValue::from_static("1"));
         for name in &FORWARDED_REQUEST_HEADERS {
             for value in parts.headers.get_all(name) {
                 headers.append(name, value.clone());
@@ -420,12 +555,21 @@ pub(super) async fn forward(
     let Ok(outbound) = outbound.body(body) else {
         return bad_gateway();
     };
-    let Ok(stream) = TcpStream::connect(&upstream.authority).await else {
+    let mut unavailable = proxied.unavailable(Arc::clone(&shell_attention), attention_policy);
+    let connected = tokio::select! {
+        biased;
+        () = &mut unavailable => return super::not_found(),
+        result = tokio::time::timeout(UPSTREAM_STEP_TIMEOUT, TcpStream::connect(&upstream.authority)) => result,
+    };
+    let Ok(Ok(stream)) = connected else {
         return bad_gateway();
     };
-    let Ok((mut sender, connection)) =
-        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
-    else {
+    let handshaken = tokio::select! {
+        biased;
+        () = &mut unavailable => return super::not_found(),
+        result = tokio::time::timeout(UPSTREAM_STEP_TIMEOUT, hyper::client::conn::http1::handshake(TokioIo::new(stream))) => result,
+    };
+    let Ok(Ok((mut sender, connection))) = handshaken else {
         return bad_gateway();
     };
     // One connection per proxied request, driven for as long as the body is
@@ -434,10 +578,22 @@ pub(super) async fn forward(
     //
     // `with_upgrades` is what lets that connection stop being HTTP part way
     // through and be handed back as a socket instead.
-    tokio::spawn(async move {
-        let _ignored = connection.with_upgrades().await;
-    });
-    let Ok(mut response) = sender.send_request(outbound).await else {
+    // The driver also listens independently: a downstream socket under
+    // backpressure may stop polling its response body for a while.
+    let mut connection_unavailable = proxied.unavailable(shell_attention, attention_policy);
+    let connection = ConnectionTask(tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            () = &mut connection_unavailable => {}
+            result = connection.with_upgrades() => { let _ignored = result; }
+        }
+    }));
+    let answered = tokio::select! {
+        biased;
+        () = &mut unavailable => return super::not_found(),
+        result = tokio::time::timeout(UPSTREAM_STEP_TIMEOUT, sender.send_request(outbound)) => result,
+    };
+    let Ok(Ok(mut response)) = answered else {
         return bad_gateway();
     };
     for directive in response.headers().get_all(SET_COOKIE) {
@@ -447,12 +603,22 @@ pub(super) async fn forward(
     if response.status() == StatusCode::SWITCHING_PROTOCOLS
         && let Some(downstream) = downstream
     {
-        return splice(&mut response, downstream, &ancestors);
+        return splice(
+            &mut response,
+            downstream,
+            &ancestors,
+            unavailable,
+            connection,
+        );
     }
     let (parts, incoming) = response.into_parts();
     // `Body::new` wraps rather than reads: the frames the Provider produces are
     // the frames the person receives, when the Provider produces them.
-    let mut response = Response::new(Body::new(incoming));
+    let mut response = Response::new(Body::new(ScopedBody {
+        incoming: Some(Box::pin(incoming)),
+        unavailable,
+        connection: Some(connection),
+    }));
     *response.status_mut() = parts.status;
     copy_response_headers(&parts.headers, response.headers_mut(), &ancestors);
     relocate(response.headers_mut(), upstream, framing.mounted_at());
@@ -487,15 +653,25 @@ fn splice(
     response: &mut hyper::Response<hyper::body::Incoming>,
     downstream: OnUpgrade,
     ancestors: &str,
+    mut unavailable: Unavailable,
+    connection: ConnectionTask,
 ) -> Response<Body> {
     let upstream = hyper::upgrade::on(&mut *response);
     tokio::spawn(async move {
-        let (Ok(downstream), Ok(upstream)) = (downstream.await, upstream.await) else {
-            return;
+        let _connection = connection;
+        let relay = async move {
+            let (Ok(downstream), Ok(upstream)) = (downstream.await, upstream.await) else {
+                return;
+            };
+            let mut downstream = TokioIo::new(downstream);
+            let mut upstream = TokioIo::new(upstream);
+            let _ignored = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
         };
-        let mut downstream = TokioIo::new(downstream);
-        let mut upstream = TokioIo::new(upstream);
-        let _ignored = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+        tokio::select! {
+            biased;
+            () = &mut unavailable => {}
+            () = relay => {}
+        }
     });
     let mut switching = Response::new(Body::empty());
     *switching.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
@@ -847,6 +1023,89 @@ mod tests {
             stored.expires_at = Some(Instant::now() - Duration::from_secs(1));
         }
         assert_eq!(sent(&jar), None);
+    }
+
+    #[test]
+    fn a_jar_caps_a_huge_max_age_instead_of_overflowing() {
+        let jar = CookieJar::default();
+        jar.store(&HeaderValue::from_static(
+            "huge=value; Max-Age=9223372036854775807",
+        ));
+        assert_eq!(sent(&jar).as_deref(), Some("huge=value"));
+        let expiry = jar
+            .cookies
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())["huge"]
+            .expires_at
+            .expect("a Max-Age cookie expires");
+        assert!(expiry <= Instant::now() + MAX_COOKIE_AGE);
+    }
+
+    #[test]
+    fn a_jar_caps_new_names_but_allows_updates_and_deletions() {
+        let jar = CookieJar::default();
+        for index in 0..MAX_COOKIE_NAMES {
+            jar.store(&HeaderValue::from_str(&format!("cookie_{index}=value")).unwrap());
+        }
+        jar.store(&HeaderValue::from_static("extra=rejected"));
+        assert_eq!(jar.cookies.lock().unwrap().len(), MAX_COOKIE_NAMES);
+        assert!(!jar.cookies.lock().unwrap().contains_key("extra"));
+
+        jar.store(&HeaderValue::from_static("cookie_0=updated"));
+        assert_eq!(
+            jar.cookies.lock().unwrap().get("cookie_0").unwrap().value,
+            "updated"
+        );
+        jar.store(&HeaderValue::from_static("cookie_1=; Max-Age=0"));
+        jar.store(&HeaderValue::from_static("extra=accepted"));
+        assert_eq!(jar.cookies.lock().unwrap().len(), MAX_COOKIE_NAMES);
+        assert!(!jar.cookies.lock().unwrap().contains_key("cookie_1"));
+        assert!(jar.cookies.lock().unwrap().contains_key("extra"));
+    }
+
+    #[test]
+    fn a_jar_reuses_expired_slots_when_storing_new_cookies() {
+        let jar = CookieJar::default();
+        for index in 0..MAX_COOKIE_NAMES - 1 {
+            jar.store(&HeaderValue::from_str(&format!("cookie_{index}=value")).unwrap());
+        }
+        jar.store(&HeaderValue::from_static("expired=value; Max-Age=1"));
+        if let Some(stored) = jar.cookies.lock().unwrap().get_mut("expired") {
+            stored.expires_at = Some(Instant::now() - Duration::from_secs(1));
+        }
+        jar.store(&HeaderValue::from_static("new=accepted"));
+        assert_eq!(jar.cookies.lock().unwrap().len(), MAX_COOKIE_NAMES);
+        assert!(!jar.cookies.lock().unwrap().contains_key("expired"));
+        assert!(jar.cookies.lock().unwrap().contains_key("new"));
+    }
+
+    #[tokio::test]
+    async fn a_shell_deadline_ends_a_mount_whose_own_clock_is_still_attended() {
+        let proxied = Arc::new(Proxied::new(
+            Upstream::parse("http://127.0.0.1:8080/panel/").unwrap(),
+        ));
+        let shell = Arc::new(AttentionClock::new());
+        let policy = UiAttentionPolicy::never()
+            .with_idle_timeout(Duration::from_millis(700))
+            .with_grace_period(Duration::ZERO);
+        let unavailable = proxied.unavailable(shell, policy);
+        let attend_mount = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                proxied.attention.attend();
+            }
+        };
+        tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(2), unavailable) => {
+                assert!(result.is_ok(), "the shell deadline must cancel even an attended mount");
+            }
+            () = attend_mount => {}
+        }
+        assert!(*proxied.revoked.borrow());
+        assert_eq!(
+            proxied.attention.phase(&policy),
+            super::super::attention::Phase::Live
+        );
     }
 
     #[test]

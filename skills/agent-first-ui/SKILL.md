@@ -235,14 +235,16 @@ boundary instead of an attribute on a frame.
 One more thing it buys: with an origin per session, each card can be opened as a
 page of its own. Without it that control is absent — not broken — because a
 top-level navigation would put the Provider UI on the page's own origin and end
-the isolation the frames rely on. If somebody wants a session full-screen on a
-phone, that is the reason to suggest `--session-origin-host localhost`.
+the isolation the frames rely on.
 
 It is opt-in because it asks for names. Suggest `--session-origin-host localhost`
-freely — browsers resolve `*.localhost` to the machine itself, so it needs no
-setup. Suggest any other host only once the person has said that `*.<HOST>`
-resolves to that machine and, behind TLS, that their certificate covers it;
-without both, every frame fails. The page is then reachable only at `<HOST>`.
+when the browser and service run on the same machine, or the browser's device
+already forwards its local port to the service — browsers resolve `*.localhost`
+to their own machine. For a phone over a VPN or another remote connection,
+suggest a host only once the person has said that `<HOST>` and `*.<HOST>` resolve
+from that device to the service machine and, behind TLS, their certificate covers
+the wildcard; without both, every frame fails. The page is then reachable only
+at `<HOST>`.
 Never loosen the frame itself instead — there is no flag for that.
 
 The URL it prints carries the credential for everything running on that machine.
@@ -269,9 +271,9 @@ and it is theirs to ask for, because what it turns off is the thing that stops
 their terminal being readable by whoever picks the device up.
 
 A person who says a card wastes the screen wants the size control in its head —
-Short / Tall / Full, remembered per session. Do not suggest they reload, and do
-not go looking for a way to make a card fit its contents: what is inside a frame
-is on an origin the page cannot measure, and that is deliberate.
+Short / Tall / Full, remembered per Provider and UI kind. Do not suggest they
+reload, and do not go looking for a way to make a card fit its contents: what is
+inside a frame is on an origin the page cannot measure, and that is deliberate.
 
 ## Frontend overrides are trusted by content, not by path
 

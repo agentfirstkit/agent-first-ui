@@ -11,7 +11,7 @@
 //! and in nothing else, so an invariant that held in only one of them would be
 //! an invariant this listener does not have.
 
-#![cfg(feature = "serve")]
+#![cfg(feature = "session")]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -452,8 +452,8 @@ in_both_shapes! {
 
 /// Read until `wanted` shows up, or give up. A buffering proxy fails here by
 /// timing out, which is the whole point of the deadline.
-async fn read_for(
-    reader: &mut BufReader<&mut TcpStream>,
+async fn read_for<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
     wanted: &str,
     within: Duration,
 ) -> String {
@@ -469,6 +469,54 @@ async fn read_for(
         }
     }
     seen
+}
+
+type EventSender = tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>;
+
+fn event_stream_router() -> (Router, EventSender) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    let receiver = Arc::new(Mutex::new(Some(receiver)));
+    let router = Router::new().route(
+        "/stream",
+        get(move || {
+            let receiver = Arc::clone(&receiver);
+            async move {
+                match receiver.lock().ok().and_then(|mut slot| slot.take()) {
+                    Some(receiver) => (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(ReceiverStream::new(receiver)),
+                    )
+                        .into_response(),
+                    None => StatusCode::CONFLICT.into_response(),
+                }
+            }
+        }),
+    );
+    (router, sender)
+}
+
+#[allow(clippy::expect_used)]
+async fn established_event_stream(framed: &Framed, sender: &EventSender) -> BufReader<TcpStream> {
+    let mut stream = TcpStream::connect(&framed.wire).await.expect("connect");
+    stream
+        .write_all(
+            format!(
+                "GET {}stream HTTP/1.1\r\nHost: {}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n",
+                framed.path, framed.host
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write");
+    let mut reader = BufReader::new(stream);
+    sender
+        .send(Ok(b"data: established\n\n".to_vec()))
+        .await
+        .expect("send the first event");
+    let established = read_for(&mut reader, "data: established", Duration::from_secs(3)).await;
+    assert!(established.contains("200"), "{established}");
+    assert!(established.contains("data: established"), "{established}");
+    reader
 }
 
 // ── Nothing of this listener's reaches a Provider ───────────────────
@@ -1125,6 +1173,27 @@ fn websocket_echo() -> Router {
     )
 }
 
+#[allow(clippy::expect_used)]
+async fn established_websocket(framed: &Framed) -> tokio_tungstenite::WebSocketStream<TcpStream> {
+    use tokio_tungstenite::tungstenite::Message;
+
+    let stream = TcpStream::connect(&framed.wire).await.expect("connect");
+    let (mut socket, response) = tokio_tungstenite::client_async(
+        format!("ws://{}{}socket", framed.host, framed.path),
+        stream,
+    )
+    .await
+    .expect("establish the WebSocket through the proxy");
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    let greeting = tokio::time::timeout(Duration::from_secs(3), socket.next())
+        .await
+        .expect("the established socket receives a greeting")
+        .expect("a greeting frame")
+        .expect("a readable greeting frame");
+    assert_eq!(greeting, Message::text("hello from the provider"));
+    socket
+}
+
 in_both_shapes! {
     /// §2.5 step 3 needs this: a remote-framebuffer panel is RFB over WebSocket, and
     /// an upgrade the proxy refuses to perform cannot be framed at all.
@@ -1201,6 +1270,259 @@ async fn away_from_one_card(shell: &Shell) {
     for _ in 0..5 {
         tokio::time::sleep(IDLE / 2).await;
         assert_eq!(shell.attend(&[]).await, 204);
+    }
+}
+
+in_both_shapes! {
+    async fn an_established_sse_stream_ends_when_its_unattended_mount_expires(shape: Shape) {
+        let (router, sender) = event_stream_router();
+        let session = provider_session(router).await;
+        let shell = serving_with(shape, lapsing()).await;
+        let session_id = session.metadata().session_id.as_str().to_owned();
+        let framed = shell.framed(&session).await;
+        let mut reader = established_event_stream(&framed, &sender).await;
+
+        // The Provider and its sender remain alive. Only the page is attended:
+        // no card/list request may trigger lazy mount reconciliation before
+        // the already established stream has ended on its own.
+        away_from_one_card(&shell).await;
+        let mut remainder = Vec::new();
+        tokio::time::timeout(GRACE, reader.read_to_end(&mut remainder))
+            .await
+            .expect("the old SSE stream must end without another mount request")
+            .expect("read the end of the SSE response");
+
+        assert!(!session.access_token().is_revoked());
+        assert_eq!(shell.card(&session_id).await["state"], "dead");
+        assert_eq!(framed.request("stream", &[], None).await.status, 404);
+        drop(sender);
+        drop(session);
+        shell.handle.abort();
+    }
+}
+
+in_both_shapes! {
+    async fn an_established_websocket_ends_when_its_unattended_mount_expires(shape: Shape) {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let session = provider_session(websocket_echo()).await;
+        let shell = serving_with(shape, lapsing()).await;
+        let session_id = session.metadata().session_id.as_str().to_owned();
+        let framed = shell.framed(&session).await;
+        let mut socket = established_websocket(&framed).await;
+        socket.send(Message::text("before expiry")).await.expect("send before expiry");
+        let echoed = tokio::time::timeout(Duration::from_secs(3), socket.next())
+            .await
+            .expect("the established socket relays a frame")
+            .expect("an echo frame")
+            .expect("a readable echo frame");
+        assert_eq!(echoed, Message::text("before expiry"));
+
+        // Keep the page alive without naming this mount, and do not poll its
+        // card: cancellation must reach the existing upgraded connection.
+        away_from_one_card(&shell).await;
+        let ended = tokio::time::timeout(GRACE, socket.next())
+            .await
+            .expect("the old WebSocket must end without another mount request");
+        assert!(
+            matches!(ended, None | Some(Err(_)) | Some(Ok(Message::Close(_)))),
+            "an expired mount must end its old WebSocket: {ended:?}"
+        );
+
+        assert!(!session.access_token().is_revoked());
+        assert_eq!(shell.card(&session_id).await["state"], "dead");
+        assert_eq!(framed.request("socket", &[], None).await.status, 404);
+        drop(session);
+        shell.handle.abort();
+    }
+}
+
+in_both_shapes! {
+    async fn an_established_sse_stream_survives_warning_and_renewed_attention(shape: Shape) {
+        let (router, sender) = event_stream_router();
+        let session = provider_session(router).await;
+        let shell = serving_with(shape, lapsing()).await;
+        let session_id = session.metadata().session_id.as_str().to_owned();
+        let framed = shell.framed(&session).await;
+        let mut reader = established_event_stream(&framed, &sender).await;
+
+        tokio::time::sleep(IDLE).await;
+        sender.send(Ok(b"data: during warning\n\n".to_vec())).await.expect("warning event");
+        let warning = read_for(&mut reader, "data: during warning", GRACE / 2).await;
+        assert!(warning.contains("data: during warning"), "{warning}");
+
+        assert_eq!(shell.attend(&[&session_id]).await, 204);
+        // Cross the stream's initial deadline while resetting that same clock.
+        // No replacement URL or connection is opened to make the test pass.
+        for _ in 0..3 {
+            tokio::time::sleep(IDLE / 2).await;
+            assert_eq!(shell.attend(&[&session_id]).await, 204);
+        }
+        sender.send(Ok(b"data: still attended\n\n".to_vec())).await.expect("renewed event");
+        let renewed = read_for(&mut reader, "data: still attended", GRACE / 2).await;
+        assert!(renewed.contains("data: still attended"), "{renewed}");
+
+        drop(reader);
+        drop(sender);
+        drop(session);
+        shell.handle.abort();
+    }
+}
+
+in_both_shapes! {
+    async fn an_established_websocket_survives_warning_and_renewed_attention(shape: Shape) {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let session = provider_session(websocket_echo()).await;
+        let shell = serving_with(shape, lapsing()).await;
+        let session_id = session.metadata().session_id.as_str().to_owned();
+        let framed = shell.framed(&session).await;
+        let mut socket = established_websocket(&framed).await;
+
+        tokio::time::sleep(IDLE).await;
+        socket.send(Message::text("during warning")).await.expect("warning frame");
+        let warning = tokio::time::timeout(GRACE / 2, socket.next())
+            .await.expect("warning echo arrives").expect("warning echo").expect("read warning echo");
+        assert_eq!(warning, Message::text("during warning"));
+
+        assert_eq!(shell.attend(&[&session_id]).await, 204);
+        for _ in 0..3 {
+            tokio::time::sleep(IDLE / 2).await;
+            assert_eq!(shell.attend(&[&session_id]).await, 204);
+        }
+        socket.send(Message::text("still attended")).await.expect("renewed frame");
+        let renewed = tokio::time::timeout(GRACE / 2, socket.next())
+            .await.expect("renewed echo arrives").expect("renewed echo").expect("read renewed echo");
+        assert_eq!(renewed, Message::text("still attended"));
+
+        socket.close(None).await.expect("close");
+        drop(session);
+        shell.handle.abort();
+    }
+}
+
+in_both_shapes! {
+    async fn removing_an_announced_mount_ends_its_existing_streams_while_the_upstream_lives(shape: Shape) {
+        use agent_first_ui::UiUpstream;
+        use tokio_tungstenite::tungstenite::Message;
+
+        registry_root();
+        let (router, sender) = event_stream_router();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind upstream");
+        let upstream_addr = listener.local_addr().expect("upstream address");
+        let panel = tokio::spawn(async move {
+            let _ignored = axum::serve(listener, router.merge(websocket_echo())).await;
+        });
+        let announced = UiUpstream::new("reviewer", "panel", format!("http://{upstream_addr}/"))
+            .expect("upstream").announce().expect("announce");
+        let session_id = announced.metadata().session_id.as_str().to_owned();
+        let shell = serving(shape).await;
+        let framed = shell.framed_id(&session_id).await;
+        let mut events = established_event_stream(&framed, &sender).await;
+        let mut socket = established_websocket(&framed).await;
+
+        // Withdrawal, rather than upstream shutdown or an attention deadline,
+        // removes the mount. Both streams must see its sticky revocation.
+        drop(announced);
+        assert!(shell.listed(&session_id).await.is_none());
+        let mut remainder = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), events.read_to_end(&mut remainder))
+            .await.expect("withdrawn SSE ends").expect("read withdrawn SSE end");
+        let ended = tokio::time::timeout(Duration::from_secs(3), socket.next())
+            .await.expect("withdrawn WebSocket ends");
+        assert!(matches!(ended, None | Some(Err(_)) | Some(Ok(Message::Close(_)))), "{ended:?}");
+        assert!(!panel.is_finished(), "the independent upstream is still serving");
+        assert_eq!(framed.request("stream", &[], None).await.status, 404);
+
+        drop(sender);
+        panel.abort();
+        shell.handle.abort();
+    }
+}
+
+in_both_shapes! {
+    async fn an_upstream_that_withholds_response_headers_times_out_and_loses_its_connection(shape: Shape) {
+        use agent_first_ui::UiUpstream;
+
+        registry_root();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind upstream");
+        let upstream_addr = listener.local_addr().expect("upstream address");
+        let (closed, mut closed_connections) = tokio::sync::mpsc::channel(1);
+        let upstream = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let closed = closed.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream);
+                    loop {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => return, // registry liveness probe
+                            Ok(_) if line == "\r\n" => break,
+                            Ok(_) => {}
+                        }
+                    }
+                    // A real request arrived, but this Provider never answers
+                    // its headers. After the proxy's 502 its driver must close.
+                    let mut byte = [0];
+                    let ended = !matches!(reader.read(&mut byte).await, Ok(1..));
+                    let _ignored = closed.send(ended).await;
+                });
+            }
+        });
+        let announced = UiUpstream::new("reviewer", "panel", format!("http://{upstream_addr}/"))
+            .expect("upstream").announce().expect("announce");
+        let shell = serving(shape).await;
+        let framed = shell.framed_id(announced.metadata().session_id.as_str()).await;
+        let reply = tokio::time::timeout(Duration::from_secs(8), framed.request("", &[], None))
+            .await.expect("response headers have a finite proxy budget");
+        assert_eq!(reply.status, 502, "{}", reply.body);
+        assert!(tokio::time::timeout(Duration::from_secs(3), closed_connections.recv())
+            .await.expect("the timed-out driver closes its socket").expect("closed connection"));
+
+        drop(announced);
+        upstream.abort();
+        shell.handle.abort();
+    }
+}
+
+in_both_shapes! {
+    async fn refusing_an_expired_url_before_the_first_poll_does_not_remount_it(shape: Shape) {
+        let session = provider_session(Router::new().route("/", get(|| async { "panel" }))).await;
+        let shell = serving_with(shape, lapsing()).await;
+        let session_id = session.metadata().session_id.as_str().to_owned();
+        let framed = shell.framed(&session).await;
+
+        away_from_one_card(&shell).await;
+        assert_eq!(framed.request("", &[], None).await.status, 404);
+        // This is the first list/reconcile since expiry. A revoked token for
+        // the same upstream is dead, never a missing mount to mint again.
+        let card = shell.card(&session_id).await;
+        assert_eq!(card["state"], "dead");
+        assert!(card["proxy_url_secret"].is_null());
+        assert!(!session.access_token().is_revoked());
+
+        drop(session);
+        shell.handle.abort();
+    }
+}
+
+in_both_shapes! {
+    async fn a_late_named_heartbeat_before_the_first_poll_does_not_remount_a_lapsed_view(shape: Shape) {
+        let session = provider_session(Router::new().route("/", get(|| async { "panel" }))).await;
+        let shell = serving_with(shape, lapsing()).await;
+        let session_id = session.metadata().session_id.as_str().to_owned();
+        let framed = shell.framed(&session).await;
+
+        away_from_one_card(&shell).await;
+        assert_eq!(shell.attend(&[&session_id]).await, 204);
+        assert_eq!(framed.request("", &[], None).await.status, 404);
+        let card = shell.card(&session_id).await;
+        assert_eq!(card["state"], "dead");
+        assert!(card["proxy_url_secret"].is_null());
+        assert!(!session.access_token().is_revoked());
+
+        drop(session);
+        shell.handle.abort();
     }
 }
 
@@ -1435,4 +1757,93 @@ async fn a_window_still_opens_when_nothing_is_being_served() {
         launched.contains("--app=http://127.0.0.1:"),
         "a window must still be opened onto the session's own loopback URL: {launched:?}"
     );
+}
+
+in_both_shapes! {
+    /// Shell POSTs accept TLS termination on the same authority and reject
+    /// opaque or foreign origins in both delivery shapes.
+    async fn shell_posts_accept_the_same_authority_over_https(shape: Shape) {
+        let shell = serving(shape).await;
+        for scheme in ["http", "https"] {
+            let origin = format!("{scheme}://{}", shell.host);
+            let headers = [("Origin", origin.as_str())];
+            assert_eq!(shell.page("attention", &headers, Some("{}")).await.status, 204);
+            assert_eq!(shell.page("sessions/missing/reopen", &headers, Some("")).await.status, 404);
+        }
+        for origin in ["null", "https://foreign.example", "http://foreign.example"] {
+            let headers = [("Origin", origin)];
+            for route in ["attention", "sessions/missing/reopen"] {
+                assert_eq!(shell.page(route, &headers, Some("{}")).await.status, 403);
+            }
+        }
+        shell.handle.abort();
+    }
+}
+
+in_both_shapes! {
+    /// The shell's End button uses its own origin for either frame shape.
+    async fn the_shell_can_end_a_session_on_its_own_origin(shape: Shape) {
+        let active = provider_session(Router::new()).await;
+        let id = active.metadata().session_id.as_str().to_owned();
+        let shell = serving(shape).await;
+        shell.card(&id).await;
+        let origin = format!("http://{}", shell.host);
+        let route = format!("sessions/{id}/end");
+        assert_eq!(shell.page(&route, &[("Origin", "null")], Some("")).await.status, 403);
+        assert_eq!(shell.page(&route, &[("Origin", origin.as_str())], Some("")).await.status, 204);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(3), active.wait()).await.unwrap().unwrap(), Outcome::Closed);
+        assert_eq!(shell.page("sessions/missing/end", &[("Origin", origin.as_str())], Some("")).await.status, 404);
+        shell.handle.abort();
+    }
+}
+
+in_both_shapes! {
+    /// A Provider that takes the end request and never answers it costs the
+    /// page one bounded wait and a `504`, not a control that hangs.
+    async fn the_shell_gives_up_on_a_provider_that_never_answers_an_end(shape: Shape) {
+        use agent_first_ui::UiUpstream;
+
+        registry_root();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind upstream");
+        let upstream_addr = listener.local_addr().expect("upstream address");
+        let (asked, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let upstream = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let asked = asked.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    // A registry liveness probe sends nothing and is not a request.
+                    if matches!(reader.read_line(&mut line).await, Ok(1..)) {
+                        let _ignored = asked.send(line);
+                        // Held open and never answered, until the proxy lets go.
+                        let mut rest = Vec::new();
+                        let _ignored = reader.read_to_end(&mut rest).await;
+                    }
+                });
+            }
+        });
+        let announced = UiUpstream::new("reviewer", "panel", format!("http://{upstream_addr}/"))
+            .expect("upstream").announce().expect("announce");
+        let id = announced.metadata().session_id.as_str().to_owned();
+        let shell = serving(shape).await;
+        shell.card(&id).await;
+        let origin = format!("http://{}", shell.host);
+
+        let started = std::time::Instant::now();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(15),
+            shell.page(&format!("sessions/{id}/end"), &[("Origin", origin.as_str())], Some("")),
+        ).await.expect("the end request has a finite budget");
+        let elapsed = started.elapsed();
+        assert_eq!(reply.status, 504, "{}", reply.body);
+        assert!(elapsed >= Duration::from_millis(4500), "gave up before its budget: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(12), "gave up long after its budget: {elapsed:?}");
+        // The wait was on the Provider: it was asked, at the reserved route.
+        assert_eq!(requests.recv().await.expect("the end request reached the provider"), "POST /__afui/end HTTP/1.1\r\n");
+
+        drop(announced);
+        upstream.abort();
+        shell.handle.abort();
+    }
 }

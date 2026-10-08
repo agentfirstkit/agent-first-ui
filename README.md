@@ -58,8 +58,10 @@ another device, reverse-proxying each so that `127.0.0.1` — which on a phone i
 the phone — stops being the problem.
 
 Remote expiry belongs to the AFUI-owned view rather than the session. A window
-is bounded by the window, a registered session is bounded by its owner process,
-and both a direct link and a shared served page use the same attention policy.
+is bounded by the window. Registry liveness checks the owner process and host
+on Unix; Windows checks host reachability only. An upstream listing may therefore
+remain on Windows if its announcer exits while the upstream host stays alive.
+Both a direct link and a shared served page use the same attention policy.
 
 `UiDeliveryPlan` collapses those three ways into one plan instead of a Provider
 writing its own `match` over `window`/`link`/`session`. Use
@@ -97,10 +99,11 @@ closed a window themselves.
 
 The credential never appears in that listing — a session URL carries one, and
 stdout is where an agent reads. `open` hands the URL straight to a window
-instead of printing it. Entries are written `0600` under a `0700` directory, and
-a session is pruned rather than offered once either its host stops answering or
-the process that announced it is gone. `AFUI_NO_REGISTRY=1` keeps a session out
-entirely.
+instead of printing it. Entries are published atomically from a private temporary
+file; on Unix they are `0600` under a `0700` directory. A malformed or unreadable
+entry is left in place rather than treated as an ended session. Parsed entries
+are pruned when the host stops answering, or on Unix when their owner is gone.
+`AFUI_NO_REGISTRY=1` keeps a session out entirely.
 
 Not every interface worth listing is one this crate serves. `UiUpstream` names
 one that already exists somewhere else — a third-party web client behind its
@@ -173,6 +176,10 @@ again at an address it has never had before. When the page itself lapses it
 stops answering for everything, frames included, and the way back is a new
 `session serve` URL from the machine doing the work.
 
+Already established SSE and WebSocket streams end when their mount or page
+expires, including when no further request arrives to check the credential.
+Keeping another card attended does not extend an unattended mount's streams.
+
 Its own URL says that rather than going blank. A request carrying the page's
 credential is answered `410 Gone` and a page that names all three of the things
 somebody arriving at a dead link needs: the address was right, the sessions
@@ -186,7 +193,8 @@ What this bounds is how long an unattended *view* lasts, not who may open one.
 Whoever holds the page's URL can reload it and mount every live session again.
 
 How tall each card is, is yours: one control cycles **Short / Tall / Full**, and
-the choice is remembered per session. It has to be a choice — what is inside a
+the choice is remembered per Provider and UI kind, so a new session of the same
+kind starts with the previous choice. It has to be a choice — what is inside a
 frame is on an origin this page cannot read, so the page cannot measure it and
 the frame cannot tell it without a protocol this listener refuses to have.
 Rather than guess a height for a program it has never heard of, it offers three.
@@ -202,12 +210,24 @@ that is not the page's, and requests are forwarded upstream through a header
 allowlist that has no line for a `Cookie`, an `Authorization`, an `Origin`, or a
 `Referer`.
 
+A TLS terminator in front has to pass the original `Host` through (nginx needs an
+explicit `proxy_set_header Host $host`). The page's own POSTs are checked by
+comparing their `Origin` with `Host`, so a rewritten `Host` gets its heartbeat,
+*Reopen* and *End* answered `403`.
+
 Cookies still work, because a Provider that identifies a visitor by one — a VNC
 takeover panel, say — would otherwise be unproxyable. They are simply held here
 rather than by the browser: each proxied session gets a jar of its own, and what
 is in it goes to that session and nowhere else. The same goes for an upgraded
 connection: a WebSocket is relayed once both ends have agreed to switch, which is
 what a remote framebuffer needs and what nothing above it can see anyway.
+
+Each jar holds at most 256 cookie names. Updating or deleting an existing name
+still works at capacity, and a cookie lives at most 400 days whatever its
+`Max-Age` asks.
+Proxy connection, handshake, and response-header waits have finite budgets and
+return the existing 502 response on timeout. Streaming bodies have no total
+duration limit; the remote view's attention and revocation rules still apply.
 
 Each card also offers to open its session as a page of its own — but only under
 `--session-origin-host`. In the default shape a session is a path on the
@@ -244,18 +264,19 @@ pointing here, and, behind TLS, a certificate that covers `*.<HOST>`. The page
 must then be reached at exactly `<HOST>`; a request arriving under any other name
 is refused rather than served a page whose every frame the browser would blank.
 
-The shell and its proxy are behind the `serve` feature, off by default, so a
-Provider consuming this crate as a library gets none of it.
+The shell and its proxy belong to the default `session` feature and are also
+used by direct link delivery.
 
 ## What you depend on
 
-Three tiers, so a Provider pays for what it uses and nothing else:
+Choose the features for the capabilities your program uses:
 
 | Feature | What it adds | What it costs |
 | --- | --- | --- |
 | *(none)* | the frontend script guard, frontend discovery, the trust gate, the per-file overlay | file reading and hashing — no server |
-| `session` *(default)* | `UiSession`, `UiSessionRuntime`, managed blobs, `UiHost`, `UiMount`, `UiWindow`, credentials, security policy, the registry, `UiUpstream`, `UiFrontend::assets_router` | axum with WebSockets, tokio, tower |
-| `serve` | the reverse proxy and the shell above it | a streaming HTTP client |
+| `cli` | delivery flags and their typed plans | AFDATA CLI types |
+| `page` | template rendering, markup guards, and page contract checks | minijinja |
+| `session` *(default)* | `UiSession`, `UiSessionRuntime`, managed blobs, `UiHost`, `UiMount`, `UiWindow`, credentials, security policy, the registry, `UiUpstream`, `UiFrontend::assets_router`, remote-view shell and proxy | `cli`, axum with WebSockets, tokio, tower, hyper, minijinja |
 
 The featureless tier exists because keeping a frontend honest is not the same
 job as hosting one. A Provider whose human UI is itself an optional feature
@@ -449,17 +470,40 @@ brew install agentfirstkit/tap/afui   # macOS / Linux
 scoop bucket add agentfirstkit https://github.com/agentfirstkit/scoop-bucket && scoop install afui   # Windows
 
 # or from source, after reviewing the repo
-cargo install agent-first-ui --features serve
+cargo install agent-first-ui
 ```
 
-`--features serve` is deliberate, and only the binary needs it. The published
-packages above are built with it, so `afui session serve` works out of the box;
-a `cargo install` without it gives you every other verb and answers that one
-with `feature_unavailable` and this same line. A Provider depending on this
-crate as a library wants the opposite: `default-features = false` and only the
-tier it uses.
+A source install builds the same feature set as the published packages. A
+Provider depending on this crate as a library wants the opposite:
+`default-features = false` and only the tier it uses.
+
+Prebuilt archives are also available from
+[GitHub Releases](https://github.com/agentfirstkit/agent-first-ui/releases).
+
+## Agent Skill
+
+Then install the embedded [Agent Skill](skills/agent-first-ui/SKILL.md) so the
+agent follows AFUI's rules for handing a person an interface — when a step
+needs a window at all, which delivery reaches them, and what an override may
+and may not change. `skill install` targets Codex, Claude Code, opencode and
+Hermes; `skill status` reports whether each install is present, valid and
+current:
+
+```bash
+afui skill install --agent all --scope workspace
+afui skill status
+```
 
 ## Docs
+
+For development, `scripts/test.sh all` runs the portable checks and binary
+smokes. `scripts/test.sh browser` runs one optional real Chrome/Chromium smoke
+at a 360 × 640 viewport, checking iframe removal after attention expiry and
+enforced CSP. The fixture uses the stock polling cadence with a 1-second idle
+window and 3-second warning period. If no browser is available it reports a
+visible skip; `AFUI_TEST_BROWSER_BINARY` selects an explicit executable.
+`scripts/test.sh release` adds that browser check to the portable gate, and the
+release workflow runs it on its Linux x86_64 leg.
 
 - [Building a Provider UI](docs/providers.md) — is your UI a session, what an
   override may do to it, and how a decide panel stays safe when its template is

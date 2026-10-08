@@ -83,6 +83,16 @@ pub struct UiHost {
     server_task: Mutex<Option<JoinHandle<Result<()>>>>,
 }
 
+/// Keep shutdown's task owned while its caller awaits graceful draining.
+/// Dropping the wait must cancel the task rather than detach it.
+struct ShutdownTask(JoinHandle<Result<()>>);
+
+impl Drop for ShutdownTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 type SessionRegistry = Arc<Mutex<HashMap<String, MountedSession>>>;
 
 /// What the host needs to serve one session. Deliberately not generic over the
@@ -122,6 +132,9 @@ pub(crate) struct SessionRegistration {
 
 pub(crate) struct RegisteredSession {
     pub(crate) access_url: String,
+    /// What AFUI opens its own local window on: the access URL plus, for a
+    /// session with a runtime, the window key that marks it local.
+    pub(crate) window_url: String,
     pub(crate) registration: SessionRegistration,
     pub(crate) close: Arc<Notify>,
     pub(crate) runtime_closer: Option<UiSessionRuntimeCloser>,
@@ -264,6 +277,10 @@ impl UiMount {
             Some(runtime) => (Some(runtime.endpoint), Some(runtime.closer)),
             None => (None, None),
         };
+        let window_url = runtime_endpoint.as_ref().map_or_else(
+            || access_url.clone(),
+            |endpoint| crate::runtime::window_url(&access_url, endpoint),
+        );
         let mut sessions = self
             .sessions
             .lock()
@@ -284,6 +301,7 @@ impl UiMount {
         drop(sessions);
         Ok(RegisteredSession {
             access_url,
+            window_url,
             registration: SessionRegistration {
                 sessions: Arc::clone(&self.sessions),
                 secret,
@@ -661,7 +679,8 @@ impl UiHost {
         let Some(task) = task else {
             return Ok(());
         };
-        match task.await {
+        let mut task = ShutdownTask(task);
+        match (&mut task.0).await {
             Ok(result) => result,
             Err(join_error) if join_error.is_cancelled() => Ok(()),
             Err(join_error) => Err(Error::Io(std::io::Error::other(join_error.to_string()))),
@@ -862,6 +881,35 @@ fn with_headers(mut response: Response<Body>, policy: &UiSecurityPolicy) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelling_shutdown_does_not_detach_the_server_task() {
+        let host = Arc::new(UiHost {
+            mount: UiMount::new("http://127.0.0.1:1/").unwrap(),
+            local_addr: "127.0.0.1:1".parse().unwrap(),
+            shutdown_tx: watch::channel(false).0,
+            server_task: Mutex::new(None),
+        });
+        let (stopped, mut observed) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let _stopped = stopped;
+            std::future::pending::<Result<()>>().await
+        });
+        *host.server_task.lock().unwrap() = Some(server);
+        let shutting_down = {
+            let host = Arc::clone(&host);
+            tokio::spawn(async move { host.shutdown().await })
+        };
+        while host.server_task.lock().unwrap().is_some() {
+            tokio::task::yield_now().await;
+        }
+        shutting_down.abort();
+        let _cancelled = shutting_down.await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut observed)
+            .await
+            .expect("cancelling shutdown must abort its owned server task")
+            .expect_err("aborting the task drops its notification sender");
+    }
 
     #[test]
     fn the_whole_reserved_prefix_is_taken_not_only_the_one_route_defined_today() {

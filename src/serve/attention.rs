@@ -211,11 +211,11 @@ impl Attention {
     }
 }
 
-/// A clock shared by request handlers and the direct-link waiter.
+/// A clock shared by request handlers and remote-view waiters.
 ///
-/// The served page advances the phase lazily on requests. Direct link delivery
-/// also needs an outcome when nobody ever opens the URL, so this wrapper adds a
-/// wake-up signal and an async deadline without introducing another clock.
+/// Requests advance the phase lazily. Direct link delivery and established
+/// proxy streams also need to end when no further request arrives, so this
+/// wrapper adds a wake-up signal and an async deadline to the same clock.
 pub(super) struct AttentionClock {
     attention: Mutex<Attention>,
     changed: Notify,

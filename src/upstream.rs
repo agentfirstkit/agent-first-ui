@@ -184,6 +184,7 @@ impl UiUpstream {
                 self.subject.clone(),
                 false,
                 &self.access_url,
+                None,
             )
         };
         Ok(AnnouncedUiUpstream {
@@ -217,6 +218,7 @@ impl AnnouncedUiUpstream {
             subject: self.subject.clone(),
             waits_for_decision: false,
             access_url_secret: self.access_url.clone(),
+            window_url_secret: None,
             announced_at_epoch_ms: 0,
             owner_pid: std::process::id(),
         }

@@ -29,6 +29,30 @@ const afui = (function () {
     ? location.pathname
     : location.pathname + '/';
 
+  /* The key that marks this page as the local window AFUI itself opened.
+   *
+   * AFUI opens its own window on the session URL with the key in the
+   * fragment, which no server, proxy or log ever sees. A page reached any
+   * other way — a link, a remote view, a Provider's own listener reached from
+   * another machine — has none, and the runtime treats it as remote. The key
+   * moves into this tab's session storage and out of the address at once, so
+   * a reload keeps it and nothing the page later copies from the address
+   * carries it along. */
+  const windowKey = (function () {
+    const storageName = 'afui-window-key:' + sessionRoot;
+    const pattern = /(^#|&)afui-window=([0-9a-f]{64})(?=&|$)/;
+    const match = pattern.exec(location.hash);
+    if (!match) {
+      try { return sessionStorage.getItem(storageName); } catch (_failure) { return null; }
+    }
+    try { sessionStorage.setItem(storageName, match[2]); } catch (_failure) {}
+    const rest = location.hash.replace(pattern, match[1] === '#' ? '#' : '').replace(/^#&/, '#');
+    try {
+      history.replaceState(history.state, '', location.pathname + location.search + (rest === '#' ? '' : rest));
+    } catch (_failure) {}
+    return match[2];
+  })();
+
   function url(path) {
     return sessionRoot + String(path).replace(/^\//, '');
   }
@@ -141,6 +165,12 @@ const afui = (function () {
     const protocol = 'afui-session-v1';
     const browserClientId = clientId();
     const pending = new Map();
+    // Open-outside requests are not calls: nothing is resent after a wire drop
+    // — a link the person clicked once must not open twice — so they wait in
+    // their own map and simply fail when the connection is lost.
+    const openPending = new Map();
+    let openSequence = 0;
+    let remoteView = false;
     let requestSequence = 0;
     let lastEventSequence = 0;
     let socket = null;
@@ -182,6 +212,27 @@ const afui = (function () {
         waiting.reject(failure);
       }
       pending.clear();
+      failOpenPending(failure);
+    }
+
+    function failOpenPending(failure) {
+      for (const [, waiting] of openPending) waiting.reject(failure);
+      openPending.clear();
+    }
+
+    function openFailure(code, message) {
+      const failure = new Error(message);
+      failure.code = code;
+      return failure;
+    }
+
+    function openInOwnBrowser(target) {
+      // A remote view is a person's own browser: the address bar is right
+      // there, and the machine the runtime is on is not where they are.
+      const opened = window.open(target, '_blank', 'noopener,noreferrer');
+      return opened === null
+        ? Promise.reject(openFailure('ui_open_external_blocked', 'the browser blocked opening a new tab'))
+        : Promise.resolve({opened: true, via: 'browser'});
     }
 
     function stopWith(failure) {
@@ -248,7 +299,11 @@ const afui = (function () {
           return;
         }
         ready = true;
+        remoteView = body.remote_view === true;
         reconnectDelayMs = 100;
+        // Open-outside requests that were in flight when the wire dropped are
+        // over; the person clicks again if they still want the page.
+        failOpenPending(openFailure('ui_open_external_interrupted', 'the connection was lost before the link was opened'));
         for (const [requestId, waiting] of pending) {
           sendCall(requestId, waiting);
           if (waiting.cancelled) send('cancel', {request_id: requestId});
@@ -266,6 +321,14 @@ const afui = (function () {
       }
 
       const requestId = body.request_id;
+      if (envelope.kind === 'open_external_result') {
+        const opening = typeof requestId === 'string' ? openPending.get(requestId) : null;
+        if (!opening) return;
+        openPending.delete(requestId);
+        if (body.opened === true) opening.resolve({opened: true, via: 'host'});
+        else opening.reject(openFailure(body.code || 'ui_open_external_failed', body.message || 'the link was not opened'));
+        return;
+      }
       const waiting = typeof requestId === 'string' ? pending.get(requestId) : null;
       if (!waiting) return;
       if (envelope.kind === 'call_progress') {
@@ -310,11 +373,11 @@ const afui = (function () {
       socket.addEventListener('open', () => {
         socket.send(JSON.stringify({
           kind: 'hello',
-          hello: {
+          hello: Object.assign({
             protocol,
             client_id: browserClientId,
             last_event_sequence: lastEventSequence,
-          },
+          }, windowKey ? {window_key: windowKey} : {}),
         }));
       });
       socket.addEventListener('message', receive);
@@ -384,6 +447,35 @@ const afui = (function () {
           else callOptions.signal.addEventListener('abort', cancel, {once: true});
         }
         return result;
+      },
+      /* Open a URL outside the page.
+       *
+       * A page never navigates its own surface to a remote site: a window
+       * has no address bar, so the person could not see where they were. In
+       * the local window the host opens the URL in the system default
+       * browser; in a remote view — the person's own browser — a new tab is
+       * opened right there. Only plain http/https URLs are eligible, and the
+       * host checks that again. Resolves to `{opened, via}`; rejects with a
+       * `code` when the URL was refused, the host could not start a browser,
+       * or the connection was lost first. */
+      openExternal(target) {
+        const value = typeof target === 'string' ? target.trim() : '';
+        if (!/^https?:\/\/[^\s/]/i.test(value)) {
+          return Promise.reject(openFailure('ui_open_external_url_invalid', 'only a plain http or https URL can be opened outside the page'));
+        }
+        if (remoteView) return openInOwnBrowser(value);
+        if (stopped || !ready) {
+          return Promise.reject(openFailure('ui_runtime_closed', 'the UI runtime is not connected'));
+        }
+        openSequence += 1;
+        const requestId = 'o' + openSequence;
+        return new Promise((resolve, reject) => {
+          openPending.set(requestId, {resolve, reject});
+          if (!send('open_external', {request_id: requestId, url: value})) {
+            openPending.delete(requestId);
+            reject(openFailure('ui_runtime_closed', 'the UI runtime is not connected'));
+          }
+        });
       },
       blobUrl(reference) {
         return url(blobPath(reference));

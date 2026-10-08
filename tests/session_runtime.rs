@@ -51,6 +51,54 @@ async fn connect(access_url: &str) -> tokio_tungstenite::WebSocketStream<TcpStre
         .0
 }
 
+#[tokio::test]
+async fn a_socket_without_hello_closes_when_its_session_ends() {
+    let host = agent_first_ui::UiHost::bind_local().await.unwrap();
+    let (session, _runtime) = UiSession::<()>::new("inspector", "console")
+        .unwrap()
+        .with_runtime::<Action, Reply, SurfaceState<'static>>()
+        .unwrap();
+    let active = host
+        .attach(session, Router::new(), UiExpiry::Never)
+        .unwrap();
+    let mut socket = connect(active.access_url()).await;
+    drop(active);
+    let closed = tokio::time::timeout(Duration::from_secs(1), socket.next())
+        .await
+        .expect("ending a session must release sockets that never send hello");
+    assert!(matches!(
+        closed,
+        None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+    ));
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_socket_without_hello_has_a_deadline_while_the_session_stays_open() {
+    let host = agent_first_ui::UiHost::bind_local().await.unwrap();
+    let (session, _runtime) = UiSession::<()>::new("inspector", "console")
+        .unwrap()
+        .with_runtime::<Action, Reply, SurfaceState<'static>>()
+        .unwrap();
+    let active = host
+        .attach(session, Router::new(), UiExpiry::Never)
+        .unwrap();
+    let mut socket = connect(active.access_url()).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(11)).await;
+    tokio::time::resume();
+    let closed = tokio::time::timeout(Duration::from_secs(1), socket.next())
+        .await
+        .expect("a silent upgraded socket must expire while its session remains open");
+    assert!(matches!(
+        closed,
+        None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+    ));
+    assert_eq!(host.session_count(), 1);
+    drop(active);
+    host.shutdown().await.unwrap();
+}
+
 async fn send(socket: &mut tokio_tungstenite::WebSocketStream<TcpStream>, value: Value) {
     socket
         .send(Message::Text(value.to_string().into()))

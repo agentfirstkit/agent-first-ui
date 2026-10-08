@@ -22,7 +22,7 @@ use axum::response::IntoResponse;
 
 use super::attention::Phase;
 use super::{Addressing, ServeState, not_found};
-use crate::{APP_ICON_PATH, BASE_STYLE_PATH, OriginDecision, UiSecurityPolicy};
+use crate::{APP_ICON_PATH, BASE_STYLE_PATH, UiSecurityPolicy};
 
 /// The most a page may say about who it is watching.
 ///
@@ -52,7 +52,7 @@ pub(super) async fn respond(
 ) -> Response<Body> {
     let policy = UiSecurityPolicy::isolated()
         .with_content_security_policy(content_security_policy(&state.addressing));
-    if policy.check_origin(&request) == OriginDecision::Rejected {
+    if !origin_allowed(request.headers()) {
         return finish(StatusCode::FORBIDDEN.into_response(), &policy);
     }
     // The credential's URL has to end in a slash or the page's own relative
@@ -93,16 +93,47 @@ pub(super) async fn respond(
             state.shell.asset(rest.trim_start_matches("/assets/"))
         }
         (&Method::POST, "/attention") => attention(state, request).await,
-        (&Method::POST, rest) => match rest
-            .strip_prefix("/sessions/")
-            .and_then(|rest| rest.strip_suffix("/reopen"))
-        {
-            Some(session_id) if !session_id.contains('/') => reopen(state, session_id),
-            _ => not_found(),
-        },
+        (&Method::POST, rest) => {
+            if let Some(session_id) = rest
+                .strip_prefix("/sessions/")
+                .and_then(|rest| rest.strip_suffix("/reopen"))
+                && !session_id.is_empty()
+                && !session_id.contains('/')
+            {
+                reopen(state, session_id)
+            } else if let Some(session_id) = rest
+                .strip_prefix("/sessions/")
+                .and_then(|rest| rest.strip_suffix("/end"))
+                && !session_id.is_empty()
+                && !session_id.contains('/')
+            {
+                end(state, session_id).await
+            } else {
+                not_found()
+            }
+        }
         _ => not_found(),
     };
     finish(response, &policy)
+}
+
+/// The shell may sit behind a TLS terminator. Accept either scheme for its
+/// own authority, as the frame proxy does, but never an opaque `null` origin:
+/// this page is not sandboxed into an opaque origin.
+fn origin_allowed(headers: &axum::http::HeaderMap) -> bool {
+    use axum::http::header::{HOST, ORIGIN};
+    let Some(origin) = headers.get(ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    headers
+        .get(HOST)
+        .and_then(|host| host.to_str().ok())
+        .is_some_and(|host| {
+            origin == format!("http://{host}") || origin == format!("https://{host}")
+        })
 }
 
 /// Somebody is here, and these are the sessions they can see.
@@ -130,6 +161,36 @@ async fn attention(state: &Arc<ServeState>, request: Request) -> Response<Body> 
     }
     state.attend(&watching);
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// The browser calls its own origin; only the listener reaches the upstream.
+/// Reuse the mount's credentials and transport, with one total request budget.
+async fn end(state: &Arc<ServeState>, session_id: &str) -> Response<Body> {
+    let Some(proxied) = state.mount_session(session_id) else {
+        return not_found();
+    };
+    let mut request = Request::new(Body::empty());
+    *request.method_mut() = Method::POST;
+    let end_path = format!("/{}", crate::SESSION_END_PATH);
+    let forwarded = super::proxy::forward(
+        proxied,
+        Arc::clone(&state.attention),
+        state.attention_policy,
+        super::proxy::Framing::Path { mounted_at: "/" },
+        &end_path,
+        request,
+    );
+    // The budget is asked first. The proxy bounds each of its own steps by the
+    // same five seconds and answers `502` when one runs out, so a Provider that
+    // takes the request and never answers ends both clocks on the same tick;
+    // asked second, this one would lose that tie and report a timeout as a
+    // refusal.
+    let budget = tokio::time::sleep(std::time::Duration::from_secs(5));
+    tokio::select! {
+        biased;
+        () = budget => StatusCode::GATEWAY_TIMEOUT.into_response(),
+        response = forwarded => response.status().into_response(),
+    }
 }
 
 /// Put one lapsed session back on the page.

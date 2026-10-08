@@ -47,13 +47,12 @@ jobs:
       - name: Validate Agent Skill
         run: afdata skill validate skills/agent-first-ui
 
-      # Run the release gate itself rather than a hand-written command list:
-      # Step 0 of a release is `projects.sh test agent-first-ui all`, which
-      # execs this same script, so anything that can fail a release fails here
-      # first. `all` covers fmt, both clippy profiles, the unit suites with and
-      # without `serve`, the frontend and `session serve` smokes, and the
-      # release smoke that proves a `--features serve` build really has serve.
-      - name: Release gate
+      # Run the portable gate rather than a hand-written command list.
+      # Release preflight uses this script's release mode, adding the optional
+      # real-browser check. The portable checks can already fail here
+      # first. `all` covers fmt, the feature Clippy and unit profiles,
+      # the frontend and `session serve` smokes, and the release smoke.
+      - name: Portable gate
         run: ./scripts/test.sh all
 
   # This spore ships a Windows binary in every release and, until now, tested it
@@ -80,7 +79,7 @@ jobs:
           key: ${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Build what the release builds
-        run: cargo build --release --features serve --bin afui
+        run: cargo build --release --bin afui
 
       - name: Unit suites
-        run: cargo test --features serve --lib --bins
+        run: cargo test --lib --bins

@@ -131,6 +131,7 @@ pub struct ActiveUiSession<T> {
     subject: Option<String>,
     waits_for_decision: bool,
     access_url: String,
+    window_url: String,
     access_token: UiAccessToken,
     completion: UiCompletion<T>,
     /// Signalled by the reserved end route this session answers under its own
@@ -446,12 +447,15 @@ impl UiMount {
             subject.clone(),
             waits_for_decision,
             &registered.access_url,
+            (registered.window_url != registered.access_url)
+                .then_some(registered.window_url.as_str()),
         );
         Ok(ActiveUiSession {
             metadata: session.metadata,
             subject,
             waits_for_decision,
             access_url: registered.access_url,
+            window_url: registered.window_url,
             access_token,
             completion: session.completion,
             close: registered.close,
@@ -494,6 +498,12 @@ where
         &self.access_url
     }
 
+    /// The URL AFUI's own local window opens: the access URL plus the window
+    /// key that lets that window, and only it, ask this machine to open a link.
+    pub(crate) fn window_url(&self) -> &str {
+        &self.window_url
+    }
+
     #[must_use]
     pub fn access_token(&self) -> &UiAccessToken {
         &self.access_token
@@ -510,6 +520,7 @@ where
             subject: self.subject.clone(),
             waits_for_decision: self.waits_for_decision,
             access_url_secret: self.access_url.clone(),
+            window_url_secret: None,
             announced_at_epoch_ms: 0,
             owner_pid: std::process::id(),
         }
@@ -544,7 +555,7 @@ where
     }
 
     pub async fn open_window(self, config: &UiWindowConfig) -> Result<Outcome<T>> {
-        let window = UiWindow::launch(&self.access_url, config)?;
+        let window = UiWindow::launch(&self.window_url, config)?;
         self.wait_with_window(window).await
     }
 

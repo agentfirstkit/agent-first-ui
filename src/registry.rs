@@ -53,6 +53,13 @@ pub struct UiSessionEntry {
     pub waits_for_decision: bool,
     /// The session URL, credential included. `_secret` because it is one.
     pub access_url_secret: String,
+    /// The URL a local window opens: [`Self::access_url_secret`] plus the
+    /// session runtime's window key, which is what lets that window ask this
+    /// machine to open a link. Only `afui session open` reads it; a remote
+    /// view is always reached through [`Self::access_url_secret`]. Absent for
+    /// a session with no runtime, and for an upstream AFUI does not serve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_url_secret: Option<String>,
     /// When this session announced itself.
     ///
     /// Load-bearing: it is what puts a session where a person expects to find
@@ -121,13 +128,21 @@ pub(crate) fn publish(
     subject: Option<String>,
     waits_for_decision: bool,
     access_url: &str,
+    window_url: Option<&str>,
 ) -> RegistryHandle {
     if opted_out() {
         return RegistryHandle { path: None };
     }
     // Announcing is a convenience, never a precondition. A session that cannot
     // write here still works; it is only invisible to `afui session list`.
-    let path = write_entry(metadata, subject, waits_for_decision, access_url).ok();
+    let path = write_entry(
+        metadata,
+        subject,
+        waits_for_decision,
+        access_url,
+        window_url,
+    )
+    .ok();
     RegistryHandle { path }
 }
 
@@ -154,6 +169,7 @@ pub(crate) fn publish_strictly(
             subject,
             waits_for_decision,
             access_url,
+            None,
         )?),
     })
 }
@@ -163,6 +179,7 @@ fn write_entry(
     subject: Option<String>,
     waits_for_decision: bool,
     access_url: &str,
+    window_url: Option<&str>,
 ) -> Result<PathBuf> {
     let directory = sessions_directory()?;
     fs::create_dir_all(&directory).map_err(Error::Io)?;
@@ -174,6 +191,7 @@ fn write_entry(
         subject,
         waits_for_decision,
         access_url_secret: access_url.to_owned(),
+        window_url_secret: window_url.map(str::to_owned),
         // Read back from the file this call is about to write; nothing is
         // stamped into the entry itself.
         announced_at_epoch_ms: 0,
@@ -183,35 +201,46 @@ fn write_entry(
     let body = serde_json::to_vec_pretty(&entry)
         .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
     write_private(&path, &body)?;
-    // Also after the fact, because the mode above only applies to a file this
-    // call created: an entry left behind by an earlier run keeps its own.
-    restrict_to_owner(&path, 0o600)?;
     Ok(path)
 }
 
-/// Write an entry that is never briefly readable by anyone else.
+/// Publish a complete, private entry atomically from the same directory.
 ///
-/// Creating it and then narrowing it leaves a window in which the file holds a
-/// session credential at whatever the umask allowed. The window is small, and
-/// so is the change that closes it.
-#[cfg(unix)]
+/// The temporary file is private from creation, gets its final permissions
+/// before holding a credential, and is ignored by registry readers. Its unique
+/// name permits concurrent publication; failed writes or installs remove it.
 fn write_private(path: &Path, body: &[u8]) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
 
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
+    let parent = path.parent().ok_or_else(|| {
+        Error::Io(std::io::Error::other(
+            "session entry path has no parent directory",
+        ))
+    })?;
+    let mut file = tempfile::Builder::new()
+        .prefix(".entry-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
         .map_err(Error::Io)?;
-    file.write_all(body).map_err(Error::Io)
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, body: &[u8]) -> Result<()> {
-    fs::write(path, body).map_err(Error::Io)
+    restrict_to_owner(file.path(), 0o600)?;
+    file.write_all(body).map_err(Error::Io)?;
+    // `std::fs::rename`, not `NamedTempFile::persist`. On Windows `persist`
+    // replaces through `MoveFileEx`, which is refused while any reader has the
+    // old entry open, so a provider republishing while another process lists
+    // sessions failed with access denied. std renames with POSIX semantics
+    // there, which replace a file that readers opened with delete sharing, as
+    // std opens every file. `keep` first, so the installed entry does not
+    // carry the temporary-file attribute on Windows; the temporary is then
+    // ours to remove if the rename fails.
+    let temp = file
+        .into_temp_path()
+        .keep()
+        .map_err(|error| Error::Io(error.error))?;
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ignored = fs::remove_file(&temp);
+        return Err(Error::Io(error));
+    }
+    Ok(())
 }
 
 /// Every live session this user owns, with dead owners' entries removed.
@@ -231,9 +260,12 @@ pub fn list_sessions() -> Result<Vec<UiSessionEntry>> {
             // not evidence of anything. What makes a session real is that it is
             // still being served *and* that whoever announced it still exists.
             Some(entry) if entry.is_live() => entries.push(entry),
-            _ => {
+            Some(_) => {
                 let _ignored = fs::remove_file(&path);
             }
+            // An unreadable or malformed record does not establish that its
+            // session ended. Leave it in place for a later read or repair.
+            None => {}
         }
     }
     // The order things happened, which is the order a person remembers them
@@ -417,6 +449,156 @@ mod tests {
         (listener, url)
     }
 
+    /// Drain liveness probes so repeated listing cannot fill a listen backlog.
+    struct AcceptingHost {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl AcceptingHost {
+        fn start() -> (Self, String) {
+            use std::sync::atomic::Ordering;
+
+            let (listener, url) = listening();
+            listener.set_nonblocking(true).unwrap();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_stop = std::sync::Arc::clone(&stop);
+            let worker = std::thread::spawn(move || {
+                while !worker_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((_stream, _address)) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept a registry liveness probe: {error}"),
+                    }
+                }
+            });
+            (
+                Self {
+                    stop,
+                    worker: Some(worker),
+                },
+                url,
+            )
+        }
+    }
+
+    impl Drop for AcceptingHost {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(worker) = self.worker.take() {
+                let _ignored = worker.join();
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_publication_and_listing_preserve_a_complete_live_entry() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _root = isolated_root();
+        let metadata = metadata("reviewer", "case_review");
+        let (_host, url) = AcceptingHost::start();
+        let padding = "x".repeat(32 * 1024);
+        let path = write_entry(
+            &metadata,
+            Some(format!("revision 0: {padding}")),
+            true,
+            &url,
+            None,
+        )
+        .unwrap();
+        let start = std::sync::Barrier::new(2);
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                start.wait();
+                for revision in 1..=128 {
+                    write_entry(
+                        &metadata,
+                        Some(format!("revision {revision}: {padding}")),
+                        true,
+                        &url,
+                        None,
+                    )
+                    .unwrap();
+                }
+            });
+            start.wait();
+            for _ in 0..128 {
+                let entry = find_session(metadata.session_id.as_str())
+                    .unwrap()
+                    .expect("publishing another revision must not hide a live session");
+                assert_eq!(entry.access_url_secret, url);
+                assert!(entry.waits_for_decision);
+                assert!(entry.subject.unwrap().starts_with("revision "));
+                let bytes = fs::read(&path).expect("listing must not remove the live entry");
+                let complete: UiSessionEntry = serde_json::from_slice(&bytes)
+                    .expect("a concurrent reader must see a complete JSON record");
+                assert_eq!(complete.session_id, metadata.session_id.as_str());
+                assert_eq!(complete.access_url_secret, url);
+            }
+            writer.join().unwrap();
+        });
+
+        assert!(
+            find_session(metadata.session_id.as_str())
+                .unwrap()
+                .is_some()
+        );
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn malformed_registry_entries_are_left_in_place() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _root = isolated_root();
+        let directory = sessions_directory().unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        let partial = directory.join("partial.json");
+        let missing_fields = directory.join("missing-fields.json");
+        let partial_body = br#"{"session_id":"incomplete""#;
+        let missing_fields_body = br#"{"session_id":"missing-fields"}"#;
+        fs::write(&partial, partial_body).unwrap();
+        fs::write(&missing_fields, missing_fields_body).unwrap();
+
+        let entries = list_sessions().unwrap();
+        assert!(entries.iter().all(|entry| {
+            entry.session_id != "incomplete" && entry.session_id != "missing-fields"
+        }));
+        assert_eq!(fs::read(&partial).unwrap(), partial_body);
+        assert_eq!(fs::read(&missing_fields).unwrap(), missing_fields_body);
+    }
+
+    #[test]
+    fn failed_publication_leaves_the_target_and_no_temporary_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("occupied.json");
+        fs::create_dir(&target).unwrap();
+        let sentinel = target.join("keep.txt");
+        fs::write(&sentinel, b"existing target contents").unwrap();
+        let before = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(matches!(
+            write_private(&target, b"temporary-credential-canary"),
+            Err(Error::Io(_))
+        ));
+
+        assert!(target.is_dir());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"existing target contents");
+        let after = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            after, before,
+            "failed publication must remove its temporary file"
+        );
+    }
+
     #[test]
     fn a_published_session_is_visible_then_disappears_when_it_ends() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
@@ -424,7 +606,13 @@ mod tests {
         let metadata = metadata("inspector", "table_inspect");
         let (host, url) = listening();
 
-        let handle = publish(&metadata, Some("public.orders".to_owned()), true, &url);
+        let handle = publish(
+            &metadata,
+            Some("public.orders".to_owned()),
+            true,
+            &url,
+            None,
+        );
         // Assert on this session rather than on the directory as a whole:
         // every session in this binary announces itself, so the registry is
         // shared and a total count would be a race, not a fact.
@@ -454,7 +642,7 @@ mod tests {
         let (host, url) = listening();
         // Leak the handle so nothing cleans up on drop: this is a Provider
         // that died, leaving its file behind with nothing on its port.
-        std::mem::forget(publish(&metadata, None, false, &url));
+        std::mem::forget(publish(&metadata, None, false, &url, None));
         assert!(
             find_session(metadata.session_id.as_str())
                 .unwrap()
@@ -485,7 +673,7 @@ mod tests {
         unsafe { std::env::set_var(NO_REGISTRY_ENV, "1") };
         let (host, url) = listening();
         let metadata = metadata("reviewer", "case_review");
-        let handle = publish(&metadata, None, false, &url);
+        let handle = publish(&metadata, None, false, &url, None);
         let found = find_session(metadata.session_id.as_str()).unwrap();
         drop(host);
         unsafe { std::env::remove_var(NO_REGISTRY_ENV) };
@@ -514,6 +702,7 @@ mod tests {
             subject: None,
             waits_for_decision: false,
             access_url_secret: format!("{url}?handoff_secret=deadbeef"),
+            window_url_secret: None,
             announced_at_epoch_ms: 0,
             owner_pid: departed_pid(),
         };
@@ -548,7 +737,7 @@ mod tests {
         let _root = isolated_root();
         let (host, url) = listening();
         let published = metadata("console", "terminal");
-        let handle = publish(&published, None, false, &url);
+        let handle = publish(&published, None, false, &url, None);
         let directory = sessions_directory().unwrap();
         // The URL carries a credential, so neither the file nor the directory
         // that lists it may be readable by anyone else.
@@ -566,6 +755,16 @@ mod tests {
             0o600,
             "{path:?}"
         );
+        // Replacing an older entry must install a private inode even when the
+        // previous file was accidentally made readable by other users.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        write_entry(&published, None, false, &url, None).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "republishing must restore owner-only access"
+        );
+        assert_eq!(read_entry(&path).unwrap().access_url_secret, url);
         drop(handle);
         drop(host);
     }

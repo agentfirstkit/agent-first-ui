@@ -550,20 +550,13 @@
     if (current) setCardAction(current, false, 'Reopened');
   }
 
-  /* End the session itself, not merely this card's view of it.
-   *
-   * Reached through the same proxied path the frame is loaded at, one level
-   * deeper: `<proxy_url_secret>__afui/end` is the reserved route every
-   * session answers under its own credential, regardless of delivery. This
-   * page never talks to the session's real URL — only this listener does —
-   * so ending it has to go through the same forwarded path everything else
-   * about that session goes through. The process waiting on it sees exactly
-   * the outcome it would see if a person had closed its own window. */
+  /* End through the page's own origin in both delivery shapes. The listener
+   * alone reaches the session upstream under its existing credential. */
   async function end(entry, sessionId) {
     if (!entry || !entry.path) return;
     setCardAction(entry, true, 'Ending session…', 'pending');
     try {
-      const response = await fetch(`${entry.path}__afui/end`, {method: 'POST'});
+      const response = await fetch(`${base}sessions/${encodeURIComponent(sessionId)}/end`, {method: 'POST'});
       if (!response.ok) throw new Error(String(response.status));
     } catch (error) {
       setCardAction(entry, false, 'Couldn’t end the session. Try again.', 'error');

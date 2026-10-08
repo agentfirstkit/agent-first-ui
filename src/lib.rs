@@ -12,6 +12,10 @@ mod app_icon;
 /// underneath it needs a server, and stays behind `session`.
 mod delivery;
 mod error;
+/// Hands a URL to the system browser on the runtime's behalf; only a served
+/// session has a page that could ask.
+#[cfg(feature = "session")]
+mod external;
 mod frontend;
 mod frontend_script;
 /// Address discovery: which of this machine's addresses another device on

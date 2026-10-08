@@ -62,7 +62,7 @@ const EVERY_AGENT: &str = "all";
 
 fn cli_spec() -> Result<BuiltCliSpec, CliSpecError> {
     let mut spec = CliSpec::new("afui", env!("CARGO_PKG_VERSION"))
-        .display_name("Agent-First UI")
+        .display_name(env!("DISPLAY_NAME"))
         .about("Create, validate, trust, inspect, and compare Provider-owned UI frontends.")
         .lifecycle_output(output())
         .command(CommandSpec::root())
@@ -211,6 +211,11 @@ fn cli_spec() -> Result<BuiltCliSpec, CliSpecError> {
             "Remove an afui-managed Agent-First UI skill.",
             true,
         ));
+    // Absent from a source tarball with no reachable .git, and the version
+    // payload omits it rather than reporting the literal "unknown".
+    if let Some(build) = Some(env!("GIT_SHA")).filter(|sha| *sha != "unknown") {
+        spec = spec.build_id(build);
+    }
     build_afdata_cli(spec)
 }
 
@@ -719,7 +724,6 @@ fn flag(invocation: &ResolvedInvocation, id: &str) -> bool {
 /// Zero and negative both mean "no limit". A person reaching for that reaches
 /// for `0`, and telling them `-1` is an error while `0` is not would be a
 /// distinction with nothing behind it.
-#[cfg(feature = "serve")]
 fn attention_policy_override(
     invocation: &ResolvedInvocation,
 ) -> Result<Option<agent_first_ui::UiAttentionPolicy>, String> {
@@ -804,7 +808,13 @@ fn run_session_open(invocation: &ResolvedInvocation) -> ExitCode {
             .build()
             .map_err(|error| error.to_string())?;
         runtime.block_on(async {
-            let mut window = UiWindow::launch(&entry.access_url_secret, &UiWindowConfig::default())
+            // The window URL carries the key that marks this window local;
+            // a session with no runtime, or an upstream, has only its access URL.
+            let url = entry
+                .window_url_secret
+                .as_deref()
+                .unwrap_or(&entry.access_url_secret);
+            let mut window = UiWindow::launch(url, &UiWindowConfig::default())
                 .map_err(|error| error.to_string())?;
             window
                 .wait_closed()
@@ -876,22 +886,44 @@ fn run_session_close(invocation: &ResolvedInvocation) -> ExitCode {
 /// this binary that talks to a session's own URL (`session serve`'s proxy
 /// aside) already does the same by hand.
 async fn post_session_end(access_url_secret: &str) -> Result<u16, String> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        post_session_end_request(access_url_secret),
+    )
+    .await
+    .map_err(|_| "session close request timed out after 5 seconds".to_owned())?
+}
+
+async fn post_session_end_request(access_url_secret: &str) -> Result<u16, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let rest = access_url_secret
         .strip_prefix("http://")
         .ok_or_else(|| format!("session URL `{access_url_secret}` is not an http:// URL"))?;
-    let (authority, path) = rest
-        .split_once('/')
-        .ok_or_else(|| format!("session URL `{access_url_secret}` has no path"))?;
+    // The same split the remote view's proxy makes of the same URL: the path
+    // keeps its leading `/` and loses any trailing one, so a root path is the
+    // empty prefix and contributes no separator of its own.
+    let boundary = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, remainder) = rest.split_at(boundary);
+    let (path, query) = remainder
+        .split_once('?')
+        .map_or((remainder, None), |(path, query)| (path, Some(query)));
+    let mut target = format!(
+        "{}/{}",
+        path.trim_end_matches('/'),
+        agent_first_ui::SESSION_END_PATH
+    );
+    if let Some(query) = query {
+        target.push('?');
+        target.push_str(query);
+    }
     let mut stream = tokio::net::TcpStream::connect(authority)
         .await
         .map_err(|error| format!("could not reach the session at `{authority}`: {error}"))?;
     stream
         .write_all(
             format!(
-                "POST /{path}{} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 0\r\n\
-                 Connection: close\r\n\r\n",
-                agent_first_ui::SESSION_END_PATH
+                "POST {target} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
             )
             .as_bytes(),
         )
@@ -919,7 +951,6 @@ async fn post_session_end(access_url_secret: &str) -> Result<u16, String> {
 /// It is not a transport, and says so. The listener binds a port on this
 /// machine; crossing anything to get to that port is WireGuard, Tailscale, an
 /// SSH tunnel, or a TLS reverse proxy — mature things that already exist.
-#[cfg(feature = "serve")]
 fn run_session_serve(invocation: &ResolvedInvocation) -> ExitCode {
     let (format, output_to) = plan_output(invocation.output_plan());
     let listen = optional(invocation, "listen").unwrap_or_else(|| DEFAULT_LISTEN.to_owned());
@@ -1014,6 +1045,7 @@ fn run_session_serve(invocation: &ResolvedInvocation) -> ExitCode {
             .map_err(|error| error.to_string())?;
         Ok::<String, String>(bound)
     });
+    let exit_code = if outcome.is_ok() { 0 } else { 1 };
     let emitted = match outcome {
         Ok(bound) => emitter.emit_result(json!({
             "code": "session_serve_stopped",
@@ -1022,25 +1054,9 @@ fn run_session_serve(invocation: &ResolvedInvocation) -> ExitCode {
         Err(message) => emitter.emit_error("session_serve_failed", &message),
     };
     match emitted {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => ExitCode::from(exit_code),
         Err(_) => ExitCode::from(4),
     }
-}
-
-/// The same verb, in a build that left the shell and its proxy out.
-///
-/// Registered rather than absent: a person who typed the right command should
-/// be told what to rebuild, not told the command does not exist.
-#[cfg(not(feature = "serve"))]
-fn run_session_serve(invocation: &ResolvedInvocation) -> ExitCode {
-    let (format, output_to) = plan_output(invocation.output_plan());
-    emit_error(
-        "feature_unavailable",
-        "`afui session serve` requires feature 'serve'; rebuild with: cargo install agent-first-ui --features serve",
-        format,
-        output_to,
-        1,
-    )
 }
 
 fn run_domain(
@@ -1276,6 +1292,58 @@ mod tests {
         );
         // Gone now, the same as any credential that never existed.
         assert_eq!(post_session_end(&url).await.unwrap(), 404);
+    }
+
+    #[tokio::test]
+    async fn post_session_end_preserves_queries_and_separates_paths() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        for (path, expected) in [
+            ("/panel/sub", "/panel/sub/__afui/end"),
+            (
+                "/panel/sub?handoff_secret=abc",
+                "/panel/sub/__afui/end?handoff_secret=abc",
+            ),
+            (
+                "/panel/sub/?handoff_secret=abc",
+                "/panel/sub/__afui/end?handoff_secret=abc",
+            ),
+            // A root path is the empty prefix: one `/`, never two.
+            ("/", "/__afui/end"),
+            ("/?q=1", "/__afui/end?q=1"),
+            // No path at all. The registry never stores this shape — an
+            // announced URL is given a `/` first — but the request line is the
+            // same if one arrives.
+            ("", "/__afui/end"),
+            ("?q=1", "/__afui/end?q=1"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}{path}", listener.local_addr().unwrap());
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                stream.read_line(&mut line).await.unwrap();
+                assert_eq!(line, format!("POST {expected} HTTP/1.1\r\n"));
+                stream.get_mut().write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            });
+            assert_eq!(post_session_end(&url).await.unwrap(), 204);
+            peer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn post_session_end_has_a_deadline_when_the_peer_does_not_reply() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/panel", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let started = std::time::Instant::now();
+        let error = post_session_end(&url).await.unwrap_err();
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(7));
+        peer.abort();
     }
 
     #[tokio::test]

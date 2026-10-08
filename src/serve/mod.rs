@@ -56,6 +56,7 @@ mod attention;
 mod frontend;
 mod mounts;
 mod proxy;
+pub(crate) use proxy::AFUI_REMOTE_VIEW;
 mod shell;
 
 use addressing::{
@@ -289,7 +290,7 @@ impl SessionServer {
             state: Arc::new(ServeState {
                 token,
                 attention_policy,
-                attention: AttentionClock::new(),
+                attention: Arc::new(AttentionClock::new()),
                 shell,
                 mounts: Mutex::new(Mounts::default()),
                 addressing,
@@ -397,7 +398,7 @@ struct ServeState {
     /// The page's own clock. Its ending is final: this URL stops answering, and
     /// the way back is a new `session serve` URL from the machine, which is
     /// exactly the property that makes it a deadman rather than a nuisance.
-    attention: AttentionClock,
+    attention: Arc<AttentionClock>,
     /// The page this listener serves, resolved once before the port was bound.
     /// A replacement AFUI cannot use is an error at `bind`, never a listener
     /// quietly serving the built-in page to somebody expecting theirs.
@@ -466,7 +467,7 @@ impl ServeState {
     fn attend(&self, session_ids: &[String]) {
         self.attention.attend();
         if let Ok(mut mounts) = self.mounts.lock() {
-            mounts.attend(session_ids);
+            mounts.attend(session_ids, &self.attention_policy);
         }
     }
 
@@ -487,6 +488,16 @@ impl ServeState {
             self.attention.attend();
         }
         removed
+    }
+
+    fn mount_session(&self, session_id: &str) -> Option<Arc<Proxied>> {
+        let proxied = self
+            .mounts
+            .lock()
+            .ok()?
+            .authorize_session(session_id, &self.attention_policy)?;
+        self.attention.attend();
+        Some(proxied)
     }
 
     /// The mount a proxy credential names, if it is still live.
@@ -551,7 +562,9 @@ async fn on_one_origin(state: &Arc<ServeState>, lapsed: bool, request: Request) 
         };
         let mounted_at = format!("/{PROXY_SEGMENT}/{secret}/");
         return proxy::forward(
-            &proxied,
+            proxied,
+            Arc::clone(&state.attention),
+            state.attention_policy,
             Framing::Path {
                 mounted_at: &mounted_at,
             },
@@ -604,7 +617,9 @@ async fn across_origins(
         };
         let path = request.uri().path().to_owned();
         return proxy::forward(
-            &proxied,
+            proxied,
+            Arc::clone(&state.attention),
+            state.attention_policy,
             Framing::Origin { shell_authority },
             &path,
             request,
@@ -669,6 +684,7 @@ mod tests {
             subject: None,
             waits_for_decision: false,
             access_url_secret: url.to_owned(),
+            window_url_secret: None,
             announced_at_epoch_ms: 0,
             owner_pid: 1,
         }
@@ -682,7 +698,7 @@ mod tests {
         Ok(ServeState {
             token: UiAccessToken::issue(UiExpiry::Never)?,
             attention_policy,
-            attention: AttentionClock::new(),
+            attention: Arc::new(AttentionClock::new()),
             shell: frontend::ShellUi::resolve(std::path::Path::new("/nonexistent"))?,
             mounts: Mutex::new(Mounts::default()),
             addressing: Addressing::Path,

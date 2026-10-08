@@ -321,7 +321,7 @@ impl UiDeliveryPlan {
                 let active = session
                     .serve(router, UiUrlDelivery::new(UiExpiry::Never))
                     .await?;
-                let window = UiWindow::launch(active.access_url(), &self.window_config)?;
+                let window = UiWindow::launch(active.window_url(), &self.window_config)?;
                 (active, Some(window), None)
             }
             UiDeliveryMode::Link => {

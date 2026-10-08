@@ -673,4 +673,58 @@ function sandbox(overrides = {}) {
   assert.deepEqual(context.__posted, [], 'and nothing was said to a frame that is not there');
 }
 
+/* The window key: what lets AFUI's own window, and only it, ask the host to
+ * open a link. It arrives in the fragment, leaves the address before anything
+ * can copy it, survives a reload through this tab's storage, and rides in the
+ * hello. A page with no key says nothing, and the runtime treats it as remote. */
+{
+  const key = 'ab'.repeat(32);
+  const helloOf = overrides => {
+    const sockets = [];
+    class FakeSocket {
+      static OPEN = 1;
+      constructor() {
+        this.readyState = 1;
+        this.handlers = {};
+        this.sent = [];
+        sockets.push(this);
+      }
+      addEventListener(name, handler) {
+        this.handlers[name] = handler;
+      }
+      send(data) {
+        this.sent.push(JSON.parse(data));
+      }
+    }
+    const {afui, context} = sandbox({WebSocket: FakeSocket, ...overrides});
+    afui.connect({});
+    sockets[0].handlers.open();
+    return {hello: sockets[0].sent[0].hello, context};
+  };
+  const storage = () => {
+    const items = new Map();
+    return {
+      getItem: name => (items.has(name) ? items.get(name) : null),
+      setItem: (name, value) => items.set(name, String(value)),
+    };
+  };
+  const at = hash => ({pathname: '/abc123/', search: '', protocol: 'http:', host: 'localhost:8080', hash});
+
+  const sessionStorage = storage();
+  const opened = helloOf({location: at(`#afui-window=${key}&record=7`), sessionStorage});
+  assert.equal(opened.hello.window_key, key);
+  assert.equal(opened.context.__replaced, '/abc123/#record=7', 'the key leaves the address and the page\'s own fragment stays');
+  assert.equal(sessionStorage.getItem('afui-window-key:/abc123/'), key);
+
+  const reloaded = helloOf({location: at(''), sessionStorage});
+  assert.equal(reloaded.hello.window_key, key, 'a reload of the same window is still the window');
+
+  const linked = helloOf({location: at('#record=7'), sessionStorage: storage()});
+  assert.equal('window_key' in linked.hello, false, 'a page reached any other way claims nothing');
+  assert.equal(linked.context.__replaced, undefined, 'and its address is left alone');
+
+  const malformed = helloOf({location: at('#afui-window=not-a-key'), sessionStorage: storage()});
+  assert.equal('window_key' in malformed.hello, false);
+}
+
 console.log('page kernel: ok');

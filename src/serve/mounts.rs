@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::addressing::frame_address;
-use super::attention::{Attention, Phase, UiAttentionPolicy};
+use super::attention::{Phase, UiAttentionPolicy};
 use super::proxy::{Proxied, Upstream};
 use crate::{Result, UiAccessToken, UiExpiry, UiSessionEntry};
 
@@ -33,7 +33,19 @@ pub(super) struct Mounts {
 struct Mount {
     token: UiAccessToken,
     proxied: Arc<Proxied>,
-    attention: Attention,
+}
+
+impl Mount {
+    fn revoke(&self) {
+        self.token.revoke();
+        self.proxied.revoke();
+    }
+}
+
+impl Drop for Mount {
+    fn drop(&mut self) {
+        self.revoke();
+    }
 }
 
 impl Mounts {
@@ -70,7 +82,7 @@ impl Mounts {
                 return true;
             }
             if let Some(mount) = by_secret.remove(secret) {
-                mount.token.revoke();
+                mount.revoke();
             }
             false
         });
@@ -91,8 +103,14 @@ impl Mounts {
                 let usable = by_session
                     .get(&entry.session_id)
                     .and_then(|secret| by_secret.get_mut(secret))
-                    .filter(|mount| !mount.token.is_revoked() && mount.proxied.upstream == upstream)
-                    .map(|mount| mount.attention.phase(attention_policy));
+                    .filter(|mount| mount.proxied.upstream == upstream)
+                    .map(|mount| {
+                        if mount.token.is_revoked() {
+                            Phase::Dead
+                        } else {
+                            mount.proxied.attention.phase(attention_policy)
+                        }
+                    });
                 match usable {
                     Some(Phase::Dead) | None => {
                         if let Some(stale) = by_session.remove(&entry.session_id)
@@ -101,7 +119,7 @@ impl Mounts {
                             // Revoked, not merely dropped: a frame address that
                             // leaked is this credential, and its whole promise
                             // is that it stops working here.
-                            mount.token.revoke();
+                            mount.revoke();
                         }
                         if usable == Some(Phase::Dead) {
                             lapsed.insert(entry.session_id.clone());
@@ -114,7 +132,6 @@ impl Mounts {
                                 Mount {
                                     token,
                                     proxied: Arc::new(Proxied::new(upstream)),
-                                    attention: Attention::new(),
                                 },
                             );
                             by_session.insert(entry.session_id.clone(), secret);
@@ -160,13 +177,17 @@ impl Mounts {
     /// Somebody is looking at these. A session already lapsed is skipped rather
     /// than revived — coming back is [`Self::revive`], an act a person performs
     /// on one card, not something a heartbeat does to everything it can reach.
-    pub(super) fn attend(&mut self, session_ids: &[String]) {
+    pub(super) fn attend(&mut self, session_ids: &[String], policy: &UiAttentionPolicy) {
         for session_id in session_ids {
             let Some(secret) = self.by_session.get(session_id).cloned() else {
                 continue;
             };
             if let Some(mount) = self.by_secret.get_mut(&secret) {
-                mount.attention.attend();
+                if mount.proxied.attention.phase(policy) == Phase::Dead {
+                    mount.revoke();
+                } else {
+                    mount.proxied.attention.attend();
+                }
             }
         }
     }
@@ -176,6 +197,16 @@ impl Mounts {
     /// away, and the credential that lapsed stays revoked.
     pub(super) fn revive(&mut self, session_id: &str) -> bool {
         self.lapsed.remove(session_id)
+    }
+
+    /// The live mount belonging to a session already listed on the shell.
+    pub(super) fn authorize_session(
+        &mut self,
+        session_id: &str,
+        attention_policy: &UiAttentionPolicy,
+    ) -> Option<Arc<Proxied>> {
+        let secret = self.by_session.get(session_id)?.clone();
+        self.authorize(&secret, attention_policy)
     }
 
     /// The session a proxy credential names, if it is still live.
@@ -195,10 +226,11 @@ impl Mounts {
         }
         // Still served while the warning runs: five minutes of a broken frame
         // is not a warning, it is the outage arriving early.
-        if mount.attention.phase(attention_policy) == Phase::Dead {
+        if mount.proxied.attention.phase(attention_policy) == Phase::Dead {
+            mount.revoke();
             return None;
         }
-        mount.attention.attend();
+        mount.proxied.attention.attend();
         Some(Arc::clone(&mount.proxied))
     }
 }

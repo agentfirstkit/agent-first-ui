@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
 # Check a built afui the way a release ships it.
 #
-# One thing is worth asserting here that no other test can: that this binary was
-# compiled with `serve`. The feature is off by default so that library consumers
-# do not pay for a reverse proxy, and a release build that drops `--features
-# serve` still yields an afui that starts, prints help, and reports its version
-# — its one remote-access verb just answers `feature_unavailable` forever.
-#
 # Called from scripts/test.sh (release-smoke, and `all`) and from the Release
 # workflow, against the same binary layout, so the check that can fail a release
 # fails locally first.
@@ -38,22 +32,16 @@ case "$version_out" in
   ;;
 esac
 
-# The `serve` probe. A deliberately unparseable address means the verb reports
-# its own rejection without binding a port, so this stays hermetic: with the
-# feature the code is `session_serve_listen_invalid`, without it the same
-# invocation reports `feature_unavailable`.
+# The `session serve` probe. A deliberately unparseable address means the verb
+# reports its own rejection without binding a port, so this stays hermetic.
 set +e
 serve_out="$("$AFUI" session serve --listen not-an-address 2>&1)"
 serve_status=$?
 set -e
 case "$serve_out" in
 *'"code":"session_serve_listen_invalid"'*) ;;
-*'"code":"feature_unavailable"'*)
-  echo "this afui was built without the serve feature; a release build must pass --features serve" >&2
-  exit 1
-  ;;
 *)
-  echo "afui session serve reported neither outcome this check knows: $serve_out" >&2
+  echo "afui session serve did not reject an invalid --listen address: $serve_out" >&2
   exit 1
   ;;
 esac

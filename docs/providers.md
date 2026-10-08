@@ -42,6 +42,20 @@ not give a Provider a second remote-lifetime policy:
   each later AFUI view applies the remote policy without expiring the session
   underneath.
 
+Registry entries are published as complete files by an atomic replacement in
+their private directory. Listing skips unreadable or malformed records and
+leaves them in place; it prunes only a successfully parsed entry whose session
+is no longer live.
+
+On Unix, registry liveness requires both an existing owner process and a host
+that accepts a TCP connection. On Windows, the registry checks host
+reachability only. An AFUI-served session has its host and owner in the same
+process, so that process exiting also stops the host. An announced upstream
+can have a separate host: if its announcing process crashes on Windows while
+the host continues to answer, its listing can remain until that host stops.
+The upstream owner remains responsible for revoking its credential when the
+delivery ends.
+
 Getting this backwards is the common failure: putting a timeout on the session
 itself kills work a person may still be using through another view, while
 putting separate clocks on direct and shared pages gives the same AFUI URL two
@@ -740,6 +754,7 @@ The pages in this kit are built out of these:
 | `afui.sessionRoot`, `afui.url` | a Provider-owned static or navigation URL kept under this session's credential |
 | `afui.connect({onState, onEvent, onEventReset, onConnectionState})` | the complete typed session runtime; `call` sends actions and receives progress/result/error |
 | `runtime.blobUrl`, `runtime.fetchBlob`, `runtime.releaseBlob` | AFUI-managed byte bodies without a Provider download protocol |
+| `runtime.openExternal(url)` | a URL opened *outside* the page — the system browser for the local window, a new tab for a remote view — instead of navigating the surface (see below) |
 | `afui.status(element)` | an aria-live region written as text, with `data-state` for the stylesheet |
 | `afui.connection(element, words)` | the runtime's own connection state, marked for the baseline and worded by you |
 | `afui.guardUnload(isDirty)` | warn before leaving, asked at the moment of leaving |
@@ -884,6 +899,46 @@ UiPage::builder(&frontend)
 Templates already named keep their own fallbacks; the rest are registered
 override-only, so a partial that disappears between discovery and render fails
 the page rather than silently resolving to a built-in of the same name.
+
+## A link inside a window opens outside it
+
+A `window` is a bare web view: no address bar, no tabs, nothing to navigate
+away to. That is what makes it a window rather than a browser, and it is also
+why a page must never let a link navigate *inside* it. A person who followed
+one would be on a site whose address they cannot see, in a surface that has
+just lost the session it existed for — and the content that put the link
+there was usually not the Provider's own. A page that shows remote content
+therefore renders links as text with a visible destination, and when a person
+asks for the page itself, calls `runtime.openExternal(url)`.
+
+What happens then depends on where the person is. In the local window the
+host opens the URL in the system default browser, where the address bar and
+the browser's own protections apply. In a remote view — the person's own
+browser, reached through `afui session serve` or a `link` — a new tab is
+opened right there; the host never opens anything on the machine the runtime
+runs on for someone who is not sitting at it. The runtime tells the page which
+case it is (`remote_view` on the `ready` frame), and the host enforces the
+distinction again on its side, refusing `open_external` from a remote view
+with `ui_open_external_remote`.
+
+A surface is remote unless it proves it is local. Arriving without AFUI's
+proxy proves nothing: your own listener behind a `UiMount`, a tunnel, or a
+mapped container port reaches the runtime straight from another machine. So
+when AFUI opens its own window — through `UiDeliveryPlan`, `open_window`, or
+`afui session open` — it puts a per-session key in the URL's fragment, which
+never reaches a server or a log, and the page kernel hands it back in the
+runtime hello. Only that key makes a surface local, and a connection through
+AFUI's proxy, which marks every request it forwards, is remote even with it.
+A window you launch yourself with `UiWindow::launch` on a bare access URL has
+no key, so its links open as a remote view's would.
+
+The host, not the page, decides what is eligible: a plain `http` or `https`
+URL of readable length, nothing else. `javascript:`, `data:`, `file:` and
+`mailto:` are refused as `ui_open_external_url_invalid` before any opener
+runs, and the URL is handed to the platform opener as one argument, never
+through a shell. A request is not a call: nothing is resent after a wire drop,
+because a link a person clicked once must not open twice. The promise resolves
+to `{opened, via}` or rejects with a `code`.
 
 ## What is shown must be what happens
 
