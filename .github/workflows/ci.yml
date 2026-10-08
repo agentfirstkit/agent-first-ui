@@ -55,6 +55,15 @@ jobs:
       - name: Portable gate
         run: ./scripts/test.sh all
 
+      # The real-browser check release.yml runs before the crate is published.
+      # Here it fails on the push that broke it, before a tag or a GitHub
+      # release exists, rather than after both.
+      - name: Browser smoke
+        shell: bash
+        env:
+          AFUI_TEST_BROWSER_BINARY: /usr/bin/google-chrome
+        run: ./scripts/test.sh browser
+
   # This spore ships a Windows binary in every release and, until now, tested it
   # in none of them: the gate here is Linux and the only Windows leg lives in
   # release.yml, which does not start until a tag does. Building what the release

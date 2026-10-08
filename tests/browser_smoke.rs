@@ -107,6 +107,15 @@ async fn headless_browser_smoke() {
     let config_root =
         std::env::var(agent_first_ui::CONFIG_DIR_ENV).expect("fixed script isolates config");
     let profile = tempfile::tempdir().expect("browser profile");
+    // Chrome says why it will not start on stderr and nowhere else. Keep it in
+    // a file beside the profile so a start failure carries its own cause.
+    let stderr_path = profile.path().join("chrome-stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("Chrome stderr file");
+    let chrome_stderr = || {
+        let text = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        lines[lines.len().saturating_sub(40)..].join("\n")
+    };
     let mut browser = Command::new(browser_binary)
         .args([
             "--headless=new",
@@ -123,7 +132,7 @@ async fn headless_browser_smoke() {
         .arg(format!("--user-data-dir={}", profile.path().display()))
         .arg("about:blank")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr_file)
         .kill_on_drop(true)
         .spawn()
         .expect("start fixture Chrome");
@@ -132,11 +141,17 @@ async fn headless_browser_smoke() {
         if let Ok(control) = std::fs::read_to_string(profile.path().join("DevToolsActivePort")) {
             break control;
         }
+        if let Some(status) = browser.try_wait().expect("Chrome status") {
+            panic!(
+                "Chrome exited before CDP was ready ({status}); its stderr:\n{}",
+                chrome_stderr()
+            );
+        }
         assert!(
-            browser.try_wait().expect("Chrome status").is_none(),
-            "Chrome exited before CDP was ready"
+            Instant::now() < deadline,
+            "Chrome did not start CDP within {STEP_TIMEOUT:?}; its stderr:\n{}",
+            chrome_stderr()
         );
-        assert!(Instant::now() < deadline, "Chrome did not start CDP");
         sleep(Duration::from_millis(50)).await;
     };
     let mut lines = control.lines();
