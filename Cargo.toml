@@ -1,6 +1,6 @@
 [package]
 name = "agent-first-ui"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 description = "Let your AI agent hand you a real interface when a step needs a person — a window opens, values can stay live in both directions, and the session ends with one typed outcome."
 license = "MIT"
@@ -130,7 +130,7 @@ hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 # The shell page is a template, not a Rust string, because a person has to be
 # able to replace it — the same engine every Provider page in this kit uses
 # rather than a second one for this crate's own page.
-minijinja = { version = "2", optional = true }
+minijinja = { version = "3", features = ["serde"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Browser-grade parsing keeps the script guard and UiPage's structural

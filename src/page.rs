@@ -24,7 +24,7 @@
 use std::collections::HashSet;
 
 use minijinja::functions::Function;
-use minijinja::value::{FunctionArgs, FunctionResult, Value};
+use minijinja::value::{FunctionArgs, FunctionResult, Serde, Value};
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 use scraper::{Html, Node};
 use serde::Serialize;
@@ -161,7 +161,7 @@ impl UiPageSerializedValue {
             )
             .with_source(error)
         })?;
-        Ok(Self(Value::from_serialize(value)))
+        Ok(Self(Value::from(Serde(value))))
     }
 
     /// Preserve a filter's “not found” result without exposing raw `Value`.
@@ -597,7 +597,7 @@ impl<'a> UiPageBuilder<'a> {
         let template = environment
             .get_template(&entry)
             .map_err(|error| render_error(frontend, &entry, &error))?;
-        let value = minijinja::Value::from_serialize(document);
+        let value = Value::from(Serde(document));
         let page = if self.document_at_root {
             template.render(value)
         } else {

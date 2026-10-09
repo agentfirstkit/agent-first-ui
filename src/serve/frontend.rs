@@ -333,7 +333,7 @@ fn render_source(source: &str, frontend_id: Option<&str>) -> Result<String> {
         .map_err(|error| broken(frontend_id, &error.to_string()))?;
     let page = template
         .render(minijinja::context! {
-            document => minijinja::Value::from_serialize(shell_document()),
+            document => minijinja::Value::from(minijinja::value::Serde(shell_document())),
         })
         .map_err(|error| broken(frontend_id, &error.to_string()))?;
 
