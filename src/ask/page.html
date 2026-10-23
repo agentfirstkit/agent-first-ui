@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Answer a question</title>
+  <link rel="icon" href="__afui/app-icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="__afui/base.css">
+  <link rel="stylesheet" href="ask.css">
+</head>
+<body>
+  <main>
+    <header id="heading"><h1 id="title">Answer a question</h1></header>
+    <p id="connection" role="status"></p>
+    <form id="answer-form">
+      <section id="context" hidden></section>
+      <div id="questions"></div>
+      <p id="status" role="status" aria-live="polite"></p>
+      <div class="actions">
+        <button id="cancel" type="button" disabled>Cancel</button>
+        <button id="submit" type="submit" disabled>Submit answer</button>
+      </div>
+    </form>
+    <noscript>This question needs JavaScript to connect to its local session.</noscript>
+  </main>
+  <!-- afui:trusted-runtime -->
+</body>
+</html>

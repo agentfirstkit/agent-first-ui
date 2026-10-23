@@ -7,6 +7,10 @@ use crate::frontend::SAFE_MODE_HINT;
 /// An AFUI delivery or lifecycle error.
 #[derive(Debug)]
 pub enum Error {
+    /// A standard question violates its bounded input contract.
+    InvalidAsk {
+        reason: &'static str,
+    },
     InvalidIdentifier {
         field: &'static str,
         value: String,
@@ -153,6 +157,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidAsk { reason } => write!(formatter, "invalid question: {reason}"),
             Self::InvalidIdentifier { field, value } => {
                 write!(
                     formatter,
@@ -483,7 +488,8 @@ impl Error {
         // it is classified as, and `tests/error_kinds.rs` is the other half —
         // it fails if that decision invents a code nobody wrote down.
         match self {
-            Self::InvalidIdentifier { .. }
+            Self::InvalidAsk { .. }
+            | Self::InvalidIdentifier { .. }
             | Self::InvalidBaseUrl { .. }
             | Self::InvalidUpstreamUrl { .. }
             | Self::InvalidSessionOriginHost { .. }
@@ -568,7 +574,8 @@ impl std::error::Error for Error {
             Self::AttentionConfigInvalid { source, .. } => Some(source),
             Self::WindowLaunch { source, .. } => Some(source),
             Self::LinkAddressUnavailable(error) => Some(error),
-            Self::InvalidIdentifier { .. }
+            Self::InvalidAsk { .. }
+            | Self::InvalidIdentifier { .. }
             | Self::InvalidBaseUrl { .. }
             | Self::InvalidUpstreamUrl { .. }
             | Self::UpstreamDeliveryRequiresHttp { .. }

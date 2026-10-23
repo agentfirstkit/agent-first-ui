@@ -24,6 +24,11 @@ use tokio::process::Command;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message};
 
+use agent_first_ui::ask::{
+    AskAnswer, AskBlock, AskOption, AskQuestion, AskRequest, AskResponse, AskSelection,
+};
+use agent_first_ui::{Outcome, UiDeliveryMode, UiDeliveryPlan, list_sessions};
+
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Starting Chrome is setup, not behaviour under test. A cold start on a fresh
 /// CI runner, right after a release build, has taken longer than a page step
@@ -100,6 +105,247 @@ impl Cdp {
             assert!(Instant::now() < deadline, "browser did not {description}");
             sleep(Duration::from_millis(100)).await;
         }
+    }
+}
+
+/// The standard page must work as an interaction, including native controls,
+/// text-only rendering and the small viewport used by this browser fixture.
+async fn check_standard_questions(cdp: &mut Cdp, browser_session: &str) {
+    let option = |id: &str, label: &str, recommended: bool| AskOption {
+        id: id.into(),
+        label: label.into(),
+        description: (id == "retry").then(|| "重新运行操作".into()),
+        recommended,
+    };
+    for mode in ["note", "custom", "cancel", "several"] {
+        let question = "接下来怎么处理？ <script>globalThis.askInjection = true</script>";
+        let first = AskQuestion {
+            id: "next".into(),
+            question: question.into(),
+            options: vec![
+                option("retry", "重试 <b>一次</b>", true),
+                option("details", "查看详情", false),
+                option("stop", "结束测试", false),
+            ],
+            multiple: false,
+            allow_custom: mode != "cancel",
+        };
+        let request = if mode == "several" {
+            AskRequest {
+                context: vec![
+                    AskBlock::Paragraph {
+                        text: "背景 <i>说明</i>".into(),
+                    },
+                    AskBlock::List {
+                        items: vec!["第一点".into(), "第二点".into()],
+                    },
+                    AskBlock::Code {
+                        text: "afui ask --detach".into(),
+                    },
+                ],
+                questions: vec![
+                    first,
+                    AskQuestion {
+                        id: "scope".into(),
+                        question: "修哪些？".into(),
+                        options: vec![
+                            option("readme", "README", false),
+                            option("subject", "Subject", false),
+                        ],
+                        multiple: true,
+                        allow_custom: true,
+                    },
+                ],
+            }
+        } else {
+            AskRequest::single(first)
+        };
+        let active = request
+            .start(UiDeliveryPlan::resolve(Some(UiDeliveryMode::Session)).expect("session plan"))
+            .await
+            .expect("start question");
+        let id = active.facts().session_id;
+        let url = list_sessions()
+            .expect("registry")
+            .into_iter()
+            .find(|entry| entry.session_id == id)
+            .expect("question registered")
+            .access_url_secret;
+        let ending = tokio::spawn(active.wait());
+        cdp.command("Page.navigate", json!({"url": url}), Some(browser_session))
+            .await;
+        cdp.wait_for(
+            browser_session,
+            "document.querySelector('fieldset.question') && !document.querySelector('fieldset.question').disabled",
+            "connect the question runtime",
+        )
+        .await;
+        assert_eq!(cdp.evaluate(browser_session, "document.querySelector('input:checked') === null && document.getElementById('submit').disabled").await, true);
+        assert_eq!(
+            cdp.evaluate(
+                browser_session,
+                "document.querySelector('fieldset.question legend').textContent"
+            )
+            .await,
+            question
+        );
+        assert_eq!(
+            cdp.evaluate(
+                browser_session,
+                "!globalThis.askInjection && !document.querySelector('fieldset b, #context i') && document.querySelectorAll('.badge').length === 1"
+            )
+            .await,
+            true
+        );
+        assert_eq!(cdp.evaluate(browser_session, "document.documentElement.scrollWidth <= innerWidth && document.getElementById('submit').getBoundingClientRect().height >= 44").await, true);
+        let first = "document.querySelector('fieldset[data-question=next]')";
+        match mode {
+            "note" => {
+                cdp.evaluate(
+                    browser_session,
+                    &format!("{first}.querySelector('.choice-head').click()"),
+                )
+                .await;
+                assert!(!ending.is_finished(), "selection alone must not submit");
+                // The note appears inside the chosen card, and only there.
+                let card =
+                    format!("{first}.querySelector('input[data-option=retry]').closest('.choice')");
+                assert_eq!(
+                    cdp.evaluate(browser_session, &format!("const note1 = {first}.querySelector('textarea.note'); !note1.hidden && {card}.contains(note1) && {first}.querySelectorAll('textarea.note').length === 1")).await,
+                    true
+                );
+                cdp.evaluate(browser_session, &format!("const t = {first}.querySelector('textarea.note'); t.value = '先看日志'; t.dispatchEvent(new Event('input', {{bubbles:true}}));")).await;
+                // Switching away and back moves the note with the selection and keeps the draft.
+                cdp.evaluate(
+                    browser_session,
+                    &format!("{first}.querySelectorAll('.choice-head')[1].click()"),
+                )
+                .await;
+                assert_eq!(
+                    cdp.evaluate(browser_session, &format!("const note2 = {first}.querySelector('textarea.note'); note2.value === '先看日志' && {first}.querySelector('input[data-option=details]').closest('.choice').contains(note2)")).await,
+                    true
+                );
+                cdp.evaluate(
+                    browser_session,
+                    &format!("{first}.querySelector('.choice-head').click()"),
+                )
+                .await;
+                assert_eq!(
+                    cdp.evaluate(browser_session, &format!("{first}.querySelector('input[data-option=retry]').checked && !{first}.querySelector('input[data-custom]').checked && !document.getElementById('submit').disabled")).await,
+                    true
+                );
+                cdp.evaluate(browser_session, "document.getElementById('submit').click()")
+                    .await;
+            }
+            "custom" => {
+                // The written answer lives inside the "write your own" card and,
+                // like a note, appears only once that card is chosen.
+                assert_eq!(
+                    cdp.evaluate(
+                        browser_session,
+                        &format!("{first}.querySelector('textarea.answer-text').hidden")
+                    )
+                    .await,
+                    true
+                );
+                cdp.evaluate(browser_session, &format!("{first}.querySelector('input[data-custom]').closest('.choice-head').click()")).await;
+                assert_eq!(cdp.evaluate(browser_session, &format!("const a = {first}.querySelector('textarea.answer-text'); !a.hidden && document.activeElement === a")).await, true);
+                cdp.evaluate(browser_session, &format!("const t = {first}.querySelector('textarea.answer-text'); t.value = '  我想试试另一种办法\\n'; t.dispatchEvent(new Event('input', {{bubbles:true}}));")).await;
+                assert_eq!(cdp.evaluate(browser_session, &format!("{first}.querySelector('input[data-custom]').checked && {first}.querySelector('input[data-custom]').closest('.choice').contains({first}.querySelector('textarea.answer-text')) && !{first}.querySelector('textarea.note:not([hidden])') && !document.getElementById('submit').disabled")).await, true);
+                cdp.evaluate(browser_session, "document.getElementById('submit').click()")
+                    .await;
+            }
+            "several" => {
+                assert_eq!(
+                    cdp.evaluate(browser_session, "document.querySelectorAll('#context p, #context li, #context code').length === 4 && !document.getElementById('context').hidden").await,
+                    true
+                );
+                cdp.evaluate(
+                    browser_session,
+                    &format!("{first}.querySelector('.choice-head').click()"),
+                )
+                .await;
+                assert_eq!(
+                    cdp.evaluate(
+                        browser_session,
+                        "document.getElementById('submit').disabled"
+                    )
+                    .await,
+                    true,
+                    "the second question is still unanswered"
+                );
+                // Each checked option of a multiple-choice question carries its own note.
+                cdp.evaluate(browser_session, "for (const box of document.querySelectorAll('fieldset[data-question=scope] input[data-option]')) box.click();").await;
+                assert_eq!(
+                    cdp.evaluate(browser_session, "[...document.querySelectorAll('fieldset[data-question=scope] textarea.note')].filter(n => !n.hidden).length").await,
+                    2
+                );
+                cdp.evaluate(browser_session, "const note3 = document.querySelector('fieldset[data-question=scope] input[data-option=subject]').closest('.choice').querySelector('textarea.note'); note3.value = '顺手'; note3.dispatchEvent(new Event('input', {bubbles:true})); document.getElementById('submit').click()").await;
+            }
+            _ => {
+                assert_eq!(
+                    cdp.evaluate(
+                        browser_session,
+                        "document.querySelector('textarea') === null"
+                    )
+                    .await,
+                    true
+                );
+                cdp.evaluate(browser_session, "document.getElementById('cancel').click()")
+                    .await;
+            }
+        }
+        let outcome = timeout(STEP_TIMEOUT, ending)
+            .await
+            .expect("question completed")
+            .expect("question task")
+            .expect("question outcome");
+        let selection = |id: &str, label: &str, note: Option<&str>| AskSelection {
+            option_id: id.into(),
+            label: label.into(),
+            note: note.map(str::to_owned),
+        };
+        let expected = match mode {
+            "note" => AskResponse::Answered {
+                answers: vec![AskAnswer {
+                    question_id: "next".into(),
+                    selected: vec![selection("retry", "重试 <b>一次</b>", Some("先看日志"))],
+                    text: None,
+                }],
+            },
+            "custom" => AskResponse::Answered {
+                answers: vec![AskAnswer {
+                    question_id: "next".into(),
+                    selected: vec![],
+                    text: Some("  我想试试另一种办法\n".into()),
+                }],
+            },
+            "several" => AskResponse::Answered {
+                answers: vec![
+                    AskAnswer {
+                        question_id: "next".into(),
+                        selected: vec![selection("retry", "重试 <b>一次</b>", None)],
+                        text: None,
+                    },
+                    AskAnswer {
+                        question_id: "scope".into(),
+                        selected: vec![
+                            selection("readme", "README", None),
+                            selection("subject", "Subject", Some("顺手")),
+                        ],
+                        text: None,
+                    },
+                ],
+            },
+            _ => AskResponse::Cancelled,
+        };
+        assert_eq!(outcome, Outcome::Completed(expected));
+        assert!(
+            !list_sessions()
+                .expect("registry after answer")
+                .iter()
+                .any(|entry| entry.session_id == id)
+        );
     }
 }
 
@@ -223,6 +469,8 @@ async fn headless_browser_smoke() {
         None,
     )
     .await;
+
+    check_standard_questions(&mut cdp, &session).await;
 
     let provider = UiSession::<()>::new("inspector", "browser_check")
         .expect("neutral provider")

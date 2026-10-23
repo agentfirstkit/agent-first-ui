@@ -4,6 +4,12 @@ Let your AI agent hand you a real interface when a step needs a person — a win
 
 > **Ask your agent:** "Show me that in a window and wait for my answer before you continue."
 
+## Ask a question without building a page
+
+`afui ask` puts a few questions with suggested answers in front of a person and
+returns one structured result, with room for their own words — no Provider or
+HTML needed. See [Standard questions](docs/ask.md).
+
 ## The problem: an agent that needs you has nowhere to put you
 
 An agent can ask a question in chat. What it cannot do in chat is show you

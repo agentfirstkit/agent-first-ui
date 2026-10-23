@@ -130,7 +130,7 @@ pub(crate) fn publish(
     access_url: &str,
     window_url: Option<&str>,
 ) -> RegistryHandle {
-    if opted_out() {
+    if registry_opted_out() {
         return RegistryHandle { path: None };
     }
     // Announcing is a convenience, never a precondition. A session that cannot
@@ -160,7 +160,7 @@ pub(crate) fn publish_strictly(
     waits_for_decision: bool,
     access_url: &str,
 ) -> Result<RegistryHandle> {
-    if opted_out() {
+    if registry_opted_out() {
         return Ok(RegistryHandle { path: None });
     }
     Ok(RegistryHandle {
@@ -319,7 +319,9 @@ pub fn sessions_directory() -> Result<PathBuf> {
     Ok(global_afui_root()?.join("sessions"))
 }
 
-fn opted_out() -> bool {
+/// Whether `AFUI_NO_REGISTRY` keeps this process's sessions out of the registry.
+#[must_use]
+pub fn registry_opted_out() -> bool {
     std::env::var_os(NO_REGISTRY_ENV).is_some_and(|value| {
         let value = value.to_string_lossy();
         !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")

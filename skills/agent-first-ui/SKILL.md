@@ -1,6 +1,6 @@
 ---
 name: agent-first-ui
-description: "Hand a person a real interface mid-task — a scoped window, an attention-bounded remote page, one typed live runtime, and one terminal outcome — instead of flattening a page-shaped interaction into chat or standing up an ad-hoc web server. Trigger when a step needs a human-facing page, when embedding a UI session in a Provider, or when managing `afui frontend` overrides."
+description: "Ask a person questions with suggested answers and room for their own words, or deliver a custom interface through a scoped window or attention-bounded remote page. Use when a person should answer through AFUI, a step needs a human-facing page, embedding a UI session in a Provider, or managing `afui frontend` overrides."
 allowed-tools: Bash, Read
 ---
 
@@ -13,7 +13,11 @@ that act on it. AFUI delivers one interface to one person, may carry live typed
 values in both directions, and returns one terminal outcome. It is delivery
 infrastructure: it never interprets the Provider's domain payloads.
 
-For flag-level detail, ask the command itself: `afui frontend --help` returns
+For a question that should be answered through AFUI, use the built-in `ask`
+page below instead of writing a Provider or HTML.
+
+For flag-level detail, ask the command itself: `afui ask --help` or
+`afui frontend --help` returns
 every legal shape of the call at once. This skill covers behavior, decisions,
 and recovery only.
 
@@ -41,13 +45,75 @@ and recovery only.
 - An HTTPS upstream is Window-only. Link and Session require a private HTTP
   source because the AFUI streaming proxy does not terminate upstream TLS.
 
-## Open a window only when the interaction is page-shaped
+## Standard questions: options plus the person's own words
 
-Chat already handles a yes/no. A window earns its interruption when the person
+When the interaction is a few questions with suggested answers, use `afui ask`.
+Do not create a temporary program, server, or page for this shape. Put
+everything the person needs to decide in the request: background goes in
+context blocks (paragraphs, lists, code), not crammed into the question
+sentence. Several related questions belong on one page with `--questions`, not
+in a series of windows.
+
+```bash
+afui ask --question 'What should happen next?' \
+  --options '[{"id":"retry","label":"Retry","recommended":true},{"id":"details","label":"Inspect details"},{"id":"stop","label":"Stop"}]'
+```
+
+Give each option a stable ID and a human label; use descriptions for
+tradeoffs. Mark your suggestion `recommended` rather than writing
+"(recommended)" into a label; the page shows it as a badge and still
+preselects nothing. Allow several choices only when the choices genuinely
+combine. The person's own words are available by default: do not add an
+"Other" option, and use `--no-custom` only when the task requires a closed
+choice.
+
+Only `result.code:"ask_answered"` carries `answers`, one per question in
+question order. For each, `selected` is the chosen options (act on
+`option_id`; `label` is for display), each with an optional `note`, and `text`
+is a written answer of the person's own. Read a note as part of the answer: it
+often qualifies or narrows the choice it sits on. In a multiple-choice question
+`text` beside selections is an answer the options did not cover.
+If written text does not settle what the question needed, ask again in fewer
+words rather than mapping it onto an option yourself.
+
+`ask_cancelled`, `ask_closed`, and `ask_expired` have no answers. Do not pick
+an option on the person's behalf, treat silence as approval, or immediately
+reopen a cancelled question. A runtime validation error keeps the page open
+for correction; an `ask_request_invalid` CLI error means fix the request first
+— its message names the flag and field.
+
+### Waiting when your commands have a time limit
+
+`afui ask` blocks until the question ends. If your command runner kills long
+commands, start the question with `--detach`, keep the `session_id` from
+`ask_started`, and collect the answer with `afui ask wait <session_id>
+--timeout-s N`, repeating while it returns `ask_pending`. A result is collected
+once; `ask_not_found` after a successful wait means it was already returned.
+
+`ask_pending` reports `waiting_s`. AFUI never reminds the person; that is your
+call, through the conversation or whatever channel already reaches them. A
+reminder is worth sending when the answer blocks work they expect done, not on
+every poll.
+
+`--mode` follows `AFUI_DELIVERY` and then defaults to `window`. In `session`
+mode, use the announced session ID with `afui session open` or the person's
+existing remote session page. In `link` mode, hand the readiness event's
+`link_url` (or `ask_started`'s, with `--detach`) only to the intended person;
+the existing attention policy applies.
+
+Use custom Provider pages for previews, multiple related objects, complex
+forms, or ongoing operations. The standard question does not execute commands
+or interpret what an option means. A Rust program can use `ask::AskRequest`
+with the same delivery plan and typed terminal outcome.
+
+## Choose the interaction that fits
+
+Chat already handles a yes/no while the person is at the conversation. Use the
+standard question when they asked for AFUI, when they may answer from another
+device, or when the choices need context the chat would bury. Otherwise a window earns its interruption when the person
 needs to see structure — compare items, scan a diff, fill a form that checks
-itself, or watch changing state while issuing commands against it. Reaching for
-one to ask a question you could have asked in text costs the user a context
-switch and buys nothing.
+itself, or watch changing state while issuing commands against it. Keep ordinary
+chat questions in chat when they do not need a separate interface.
 
 ## Use the AFUI runtime; do not define another UI transport
 

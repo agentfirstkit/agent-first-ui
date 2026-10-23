@@ -35,6 +35,7 @@ run_static() {
   # byte there, so this spore and its siblings cannot drift onto different rules.
   "$ROOT_PATH/scripts/install-shellcheck.sh" --check "$ROOT_PATH"
   afdata_run --quiet cargo fmt --all --check
+  afdata_run --quiet "${AFDATA_BIN:-afdata}" skill validate skills/agent-first-ui
   run_clippy --no-default-features
   # `page` is orthogonal to `session` — a build that renders and checks a
   # page but binds no port. Nothing else in this gate compiles it.

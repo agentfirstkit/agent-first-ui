@@ -2,7 +2,7 @@
   "$schema": "https://cmn.dev/schemas/v1/spore-core.json",
   "id": "agent-first-ui",
   "name": "Agent-First UI",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "domain": "agentfirstkit.com",
   "key": "ed25519.BwbSzqdDYyMN1pPW5snRk3afrJAovHn8aueMvDpfNKVw",
   "synopsis": "Let your AI agent hand you a real interface when a step needs a person — a window opens, values can stay live in both directions, and the session ends with one typed outcome.",
@@ -14,7 +14,13 @@
   ],
   "license": "MIT",
   "mutations": [
-    "Build pages on minijinja 3, so page filters and globals take minijinja 3 types"
+    "Add `afui ask`: questions with suggested answers and room for the person's own words, returned as one result",
+    "Put several questions on one page, with single or multiple choice and typed context blocks",
+    "Attach a note to the chosen option; a written answer is a card of its own",
+    "Add `--detach` and `afui ask wait` for callers whose commands time out",
+    "Shorten a question's registry subject to its first line",
+    "Name the field, never the value, in JSON argument errors",
+    "Add `Error::InvalidAsk` and `registry_opted_out()`"
   ],
   "bonds": [],
   "tree": {

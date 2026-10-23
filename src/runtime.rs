@@ -19,7 +19,7 @@ use getrandom::fill;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 
 use crate::reserved::SESSION_BLOB_PATH_PREFIX;
 use crate::serving::UiBlobPolicy;
@@ -205,6 +205,23 @@ where
         Ok(())
     }
 
+    /// Give the terminal call reply a bounded chance to reach the surface
+    /// before ending its whole session. Ordinary calls retain their existing
+    /// non-blocking finish semantics. An absent peer cannot hold completion up.
+    pub(crate) async fn finish_before_session_end(self, reply: &Reply) -> Result<()> {
+        let (acknowledged, receipt) = oneshot::channel();
+        {
+            let mut records = self.shared.call_records.lock().await;
+            let record = records
+                .get_mut(&self.key)
+                .ok_or(Error::SessionRuntimeCallClosed)?;
+            record.acknowledged = Some(acknowledged);
+        }
+        self.finish(reply).await?;
+        let _bounded_delivery = tokio::time::timeout(RUNTIME_CLOSE_TIMEOUT, receipt).await;
+        Ok(())
+    }
+
     /// Complete this call with a caller-safe error.
     pub async fn fail(mut self, failure: UiCallError) -> Result<()> {
         self.shared.fail_call(&self.key, failure).await?;
@@ -278,6 +295,7 @@ struct CallRecord {
     frames: VecDeque<Arc<str>>,
     terminal: bool,
     cancel: watch::Sender<bool>,
+    acknowledged: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Clone)]
@@ -674,6 +692,7 @@ impl RuntimeShared {
                 frames: VecDeque::new(),
                 terminal: false,
                 cancel: cancel_tx,
+                acknowledged: None,
             },
         );
         drop(records);
@@ -724,8 +743,11 @@ impl RuntimeShared {
 
     async fn acknowledge_call(&self, key: &CallKey) {
         let mut records = self.call_records.lock().await;
-        if records.get(key).is_some_and(|record| record.terminal) {
-            records.remove(key);
+        if records.get(key).is_some_and(|record| record.terminal)
+            && let Some(record) = records.remove(key)
+            && let Some(acknowledged) = record.acknowledged
+        {
+            let _observer_gone_is_normal = acknowledged.send(());
         }
     }
 }
@@ -1666,6 +1688,41 @@ mod tests {
         assert_eq!(value["call_result"]["request_id"], "r1");
         assert_eq!(value["call_result"]["payload"]["answer"], "done");
         assert!(value["call_result"]["payload"].get("request_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn final_reply_waits_for_acknowledgement_but_not_forever() {
+        for acknowledge in [true, false] {
+            let (runtime, mount) = UiSessionRuntime::<Action, (), ()>::bounded(2, 2).unwrap();
+            let shared = mount.endpoint.shared.clone();
+            let key = CallKey {
+                client_id: "client".into(),
+                request_id: "final".into(),
+            };
+            shared
+                .register_call(key.clone(), json!({"command":"inspect"}))
+                .await
+                .unwrap();
+            let call = runtime.recv().await.unwrap().unwrap();
+            let mut responses = shared.responses.subscribe();
+            let reply = tokio::spawn(call.finish_before_session_end(&()));
+            responses.recv().await.unwrap();
+            assert!(!reply.is_finished(), "queued reply is not yet acknowledged");
+            if acknowledge {
+                shared.acknowledge_call(&key).await;
+                tokio::time::timeout(RUNTIME_CLOSE_TIMEOUT, reply)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            } else {
+                tokio::time::timeout(RUNTIME_CLOSE_TIMEOUT * 4, reply)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+        }
     }
 
     #[tokio::test]

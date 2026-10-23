@@ -5,6 +5,9 @@
 //! completed result.
 
 mod app_icon;
+/// AFUI's standard single-question page: choose an option or write an answer.
+#[cfg(feature = "session")]
+pub mod ask;
 /// Which of the three ways a session reaches a person. The word list is a
 /// parse over three strings and one environment variable, so it costs nothing
 /// to keep available in a build with no session at all — a Provider whose
@@ -70,9 +73,9 @@ mod host;
 mod lease;
 #[cfg(feature = "page")]
 mod page;
-/// The building material a Provider's page runtime is made of. Behind `page`
-/// because it produces source a page splices in, and needs no server to do it.
-#[cfg(feature = "page")]
+/// The building material for custom pages and AFUI's standard question page.
+/// Available in `page` without a server, and in `session` for the built-in UI.
+#[cfg(any(feature = "page", feature = "session"))]
 mod page_runtime;
 #[cfg(feature = "session")]
 mod registry;
@@ -145,11 +148,12 @@ pub use page::{
     UiPage, UiPageBuilder, UiPageEnvironment, UiPageFilterResult, UiPageSerializedValue,
     UiPageValue,
 };
-#[cfg(feature = "page")]
+#[cfg(any(feature = "page", feature = "session"))]
 pub use page_runtime::page_kernel_source;
 #[cfg(feature = "session")]
 pub use registry::{
-    NO_REGISTRY_ENV, UiSessionEntry, find_session, list_sessions, sessions_directory,
+    NO_REGISTRY_ENV, UiSessionEntry, find_session, list_sessions, registry_opted_out,
+    sessions_directory,
 };
 #[cfg(feature = "session")]
 pub use runtime::{

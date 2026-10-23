@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use walkdir::WalkDir;
 
+#[path = "support/ask.rs"]
+mod ask;
+
 fn output() -> OutputSpec {
     OutputSpec::protocol_finite(
         ["json", "yaml", "plain"],
@@ -63,10 +66,12 @@ const EVERY_AGENT: &str = "all";
 fn cli_spec() -> Result<BuiltCliSpec, CliSpecError> {
     let mut spec = CliSpec::new("afui", env!("CARGO_PKG_VERSION"))
         .display_name(env!("DISPLAY_NAME"))
-        .about("Create, validate, trust, inspect, and compare Provider-owned UI frontends.")
+        .about("Ask a person questions, deliver UI sessions, and manage Provider-owned frontends.")
         .lifecycle_output(output())
         .command(CommandSpec::root())
-        .command(init_command());
+        .command(init_command())
+        .command(ask::ask_command())
+        .command(ask::wait_command());
     for (name, about) in [
         ("check", "Validate one frontend and report its trust state."),
         (
@@ -288,6 +293,8 @@ fn main() -> ExitCode {
         ("session_open", run_session_open),
         ("session_close", run_session_close),
         ("session_serve", run_session_serve),
+        ("ask", ask::run),
+        ("ask_wait", ask::run_wait),
         ("frontend_check", run_check),
         ("frontend_dev", run_dev),
         ("frontend_preview", run_preview),
