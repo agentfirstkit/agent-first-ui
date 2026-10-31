@@ -449,27 +449,41 @@ fn take_result(path: &std::path::Path) -> std::io::Result<Option<Value>> {
     if !path.try_exists()? {
         return Ok(None);
     }
-    let directory = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "answer path has no parent",
-        )
-    })?;
-    let claimed = tempfile::NamedTempFile::new_in(directory)?.into_temp_path();
-    // Only one collector can rename the result, even if several waiters read
-    // it at once. The private claim is removed on every return path.
-    match std::fs::rename(path, &claimed) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    // Only one collector may take the result, even if several waiters read it
+    // at once. The claim is the creation of a marker beside it: `create_new`
+    // has exactly one winner on every platform. A rename is not enough — on
+    // Windows it renames through an open handle, so a second collector that
+    // opened the result before the first renamed it moves the claimed file
+    // out from under the first.
+    let mut marker = path.as_os_str().to_owned();
+    marker.push(".claim");
+    let marker = std::path::PathBuf::from(marker);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(_claim) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
         Err(error) => return Err(error),
     }
-    let bytes = std::fs::read(&claimed)?;
-    serde_json::from_slice(&bytes).map(Some).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "the stored question result is unreadable",
-        )
-    })
+    let taken = (|| {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            // Collected by a claimant that finished before this one began.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        std::fs::remove_file(path)?;
+        serde_json::from_slice(&bytes).map(Some).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the stored question result is unreadable",
+            )
+        })
+    })();
+    let _released = std::fs::remove_file(&marker);
+    taken
 }
 
 fn emit_record(record: &Value, format: OutputFormat, output_to: OutputTo) -> ExitCode {

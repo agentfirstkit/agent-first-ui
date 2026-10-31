@@ -453,6 +453,20 @@ mod tests {
         unsafe { std::env::remove_var(crate::DELIVERY_ENV) };
     }
 
+    /// A `session` delivery fails when its registry entry cannot be written,
+    /// so a test of one needs a registry it owns, not whatever directory an
+    /// earlier test pointed the process at and has since removed.
+    fn own_registry() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+        let guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        // SAFETY: serialised by `TEST_LOCK`, held by the caller for the test.
+        unsafe {
+            std::env::set_var(crate::CONFIG_DIR_ENV, root.path());
+            std::env::remove_var(crate::NO_REGISTRY_ENV);
+        }
+        (guard, root)
+    }
+
     /// The executor resolves through the same call as the bare word list, so a
     /// Provider that hands its page over and one that keeps its own listener
     /// cannot end up reading the flag and the variable in two different
@@ -504,6 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_start_returns_before_the_session_is_finished() {
+        let _registry = own_registry();
         let session = UiSession::<u8>::new("console", "terminal").unwrap();
         let completion = session.completion();
         let active = UiDeliveryPlan::resolve(Some(UiDeliveryMode::Session))
@@ -521,6 +536,7 @@ mod tests {
     /// says so by leaving those fields out rather than by reporting zero.
     #[tokio::test]
     async fn a_local_delivery_reports_only_the_facts_it_has() {
+        let _registry = own_registry();
         let session = UiSession::<()>::new("console", "terminal").unwrap();
         let active = UiDeliveryPlan::resolve(Some(UiDeliveryMode::Session))
             .unwrap()
