@@ -1,5 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use tempfile::TempDir;
@@ -15,24 +19,49 @@ const WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MACOS_OSACOMPILE: &str = "/usr/bin/osacompile";
 
 #[cfg(target_os = "macos")]
-const MACOS_WINDOW_APP_NAME: &str = "AFUI Review.app";
+const MACOS_WINDOW_APP_NAME: &str = "AFUI.app";
 
 #[cfg(target_os = "macos")]
 const MACOS_WINDOW_SCRIPT: &str = r#"
 ObjC.import("AppKit");
 ObjC.import("WebKit");
 
-let reviewWindow = null;
-let reviewWebView = null;
+let uiWindow = null;
+let uiWebView = null;
 
-function showReviewWindow() {
-    if (reviewWindow === null) {
+function installWindowMenu(app) {
+    let mainMenu = app.mainMenu;
+    if (!mainMenu) {
+        mainMenu = $.NSMenu.alloc.initWithTitle("AFUI");
+        app.mainMenu = mainMenu;
+    }
+    const fileIndex = mainMenu.indexOfItemWithTitle("File");
+    let fileMenu;
+    if (fileIndex >= 0) {
+        fileMenu = mainMenu.itemAtIndex(fileIndex).submenu;
+    } else {
+        fileMenu = $.NSMenu.alloc.initWithTitle("File");
+        const fileItem = $.NSMenuItem.alloc.initWithTitleActionKeyEquivalent("File", null, "");
+        fileItem.submenu = fileMenu;
+        mainMenu.insertItemAtIndex(fileItem, Math.min(1, mainMenu.numberOfItems));
+    }
+    const closeItem = fileMenu.addItemWithTitleActionKeyEquivalent(
+        "Close Window", $.NSSelectorFromString("performClose:"), "w"
+    );
+    closeItem.keyEquivalentModifierMask = $.NSEventModifierFlagCommand;
+    // Each applet owns one window. Target it directly so web-view focus cannot
+    // divert the close action through the applet's responder chain.
+    closeItem.target = uiWindow;
+}
+
+function showUiWindow() {
+    if (uiWindow === null) {
         return;
     }
-    if (reviewWindow.miniaturized) {
-        reviewWindow.deminiaturize(null);
+    if (uiWindow.miniaturized) {
+        uiWindow.deminiaturize(null);
     }
-    reviewWindow.makeKeyAndOrderFront(null);
+    uiWindow.makeKeyAndOrderFront(null);
     $.NSApplication.sharedApplication.activateIgnoringOtherApps(true);
 }
 
@@ -64,29 +93,30 @@ function run() {
     const configuration = $.WKWebViewConfiguration.alloc.init;
     configuration.websiteDataStore = $.WKWebsiteDataStore.nonPersistentDataStore;
 
-    reviewWebView = $.WKWebView.alloc.initWithFrameConfiguration(frame, configuration);
-    reviewWindow = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer(
+    uiWebView = $.WKWebView.alloc.initWithFrameConfiguration(frame, configuration);
+    uiWindow = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer(
         frame,
         styleMask,
         $.NSBackingStoreBuffered,
         false
     );
-    reviewWindow.title = "AFUI";
-    reviewWindow.releasedWhenClosed = false;
-    reviewWindow.contentView = reviewWebView;
+    uiWindow.title = "AFUI";
+    uiWindow.releasedWhenClosed = false;
+    uiWindow.contentView = uiWebView;
+    installWindowMenu(app);
 
     const url = $.NSURL.URLWithString(AFUI_WINDOW_URL);
-    reviewWebView.loadRequest($.NSURLRequest.requestWithURL(url));
-    reviewWindow.center;
-    showReviewWindow();
+    uiWebView.loadRequest($.NSURLRequest.requestWithURL(url));
+    uiWindow.center;
+    showUiWindow();
 }
 
 function reopen() {
-    showReviewWindow();
+    showUiWindow();
 }
 
 function idle() {
-    if (reviewWindow === null || !reviewWindow.visible) {
+    if (uiWindow === null || !uiWindow.visible) {
         $.NSApplication.sharedApplication.terminate(null);
         return 0;
     }
@@ -101,8 +131,8 @@ function idle() {
 }
 
 function quit() {
-    if (reviewWindow !== null) {
-        reviewWindow.close;
+    if (uiWindow !== null) {
+        uiWindow.close;
     }
     return true;
 }
@@ -110,6 +140,14 @@ function quit() {
 
 /// Names the Chromium-family browser binary AFUI launches instead of the
 /// platform's default window runtime.
+///
+/// The binary is not handed the session URL. It gets `--app=file://…/launch.html`,
+/// a private page in the window's temporary directory that moves on to the
+/// session URL with `location.replace`, so the credential never appears in the
+/// browser's process arguments. A stand-in binary that needs the session URL
+/// reads it out of that page, as `test_support::stub_browser` does. The one
+/// exception is a browser confined to a snap or Flatpak, which cannot see this
+/// machine's temporary directory and is given the URL itself.
 pub const BROWSER_BINARY_ENV: &str = "AFUI_BROWSER_BINARY";
 
 #[derive(Debug, Clone, Default)]
@@ -128,6 +166,7 @@ impl UiWindowConfig {
 /// One isolated desktop window process and its disposable runtime resources.
 pub struct UiWindow {
     child: Child,
+    arrived: Option<Arc<AtomicBool>>,
     _resources_dir: TempDir,
 }
 
@@ -158,26 +197,135 @@ impl UiWindow {
 
         Ok(Self {
             child,
+            arrived: None,
             _resources_dir: resources_dir,
         })
+    }
+
+    pub(crate) fn track_arrival(mut self, arrived: Arc<AtomicBool>) -> Self {
+        self.arrived = Some(arrived);
+        self
     }
 
     pub async fn wait_closed(&mut self) -> Result<()> {
         loop {
             match self.child.try_wait().map_err(Error::WindowWait)? {
-                Some(_) => return Ok(()),
+                Some(status) => {
+                    if !status.success() {
+                        return Err(Error::WindowWait(std::io::Error::other(format!(
+                            "UI window exited with {status}"
+                        ))));
+                    }
+                    if self
+                        .arrived
+                        .as_ref()
+                        .is_some_and(|arrived| !arrived.load(Ordering::Acquire))
+                    {
+                        return Err(Error::WindowPageNotReached);
+                    }
+                    return Ok(());
+                }
                 None => sleep(WINDOW_POLL_INTERVAL).await,
             }
         }
     }
 }
 
+/// The page a Chromium window is launched on, written beside the window's own
+/// profile.
+pub(crate) const LAUNCH_PAGE: &str = "launch.html";
+
+/// Write the page that sends the window on to `url`, and return its address.
+///
+/// The window URL carries the session's credential, and a process's arguments
+/// are readable by every user on the machine (`ps`, `/proc/<pid>/cmdline`).
+/// So the browser is given a file in the window's private directory instead,
+/// and only that file holds the URL. `location.replace` keeps the launch page
+/// out of the window's history, and the fragment — the window key — arrives
+/// with it.
+fn write_launch_page(url: &str, resources_dir: &Path) -> Result<String> {
+    // JSON is a JavaScript string literal; `<` is escaped so the URL cannot
+    // close the script element it sits in.
+    let target = serde_json::to_string(url)
+        .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?
+        .replace('<', "\\u003c");
+    let page = resources_dir.join(LAUNCH_PAGE);
+    let source = format!(
+        "<!doctype html>\n<meta charset=\"utf-8\">\n<script>location.replace({target});</script>\n"
+    );
+    write_private(&page, source.as_bytes())?;
+    Ok(file_url(&page))
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(Error::Io)?;
+    std::io::Write::write_all(&mut file, bytes).map_err(Error::Io)
+}
+
+/// `path` as a `file://` URL, percent-encoding everything a path may hold
+/// that a URL would read as something else.
+fn file_url(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let mut url = String::from(if text.starts_with('/') {
+        "file://"
+    } else {
+        "file:///"
+    });
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~:".contains(&byte) {
+            url.push(char::from(byte));
+        } else {
+            url.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    url
+}
+
+/// Whether `binary` is a browser confined to a sandbox of its own (snap,
+/// Flatpak), which has a private `/tmp` and cannot read a launch page written
+/// to this machine's.
+///
+/// Such a browser is still given its URL as an argument, as before the launch
+/// page existed: a window that never reaches its page would cost the person
+/// the session outright. Recognised by where the binary resolves to, or by a
+/// wrapper script that hands off to one — Ubuntu's `chromium-browser` is such
+/// a script.
+fn is_confined_browser(binary: &Path) -> bool {
+    let confined = |text: &str| text.contains("/snap/") || text.contains("flatpak");
+    let resolved = std::fs::canonicalize(binary).unwrap_or_else(|_| binary.to_path_buf());
+    if confined(&binary.to_string_lossy())
+        || confined(&resolved.to_string_lossy())
+        || resolved.file_name().is_some_and(|name| name == "snap")
+    {
+        return true;
+    }
+    // A wrapper script: read only its head, which is where it names what it
+    // runs, and never a binary's bytes as text.
+    let mut head = [0_u8; 4096];
+    let read = std::fs::File::open(&resolved)
+        .and_then(|mut file| std::io::Read::read(&mut file, &mut head))
+        .unwrap_or(0);
+    head.starts_with(b"#!") && confined(&String::from_utf8_lossy(&head[..read]))
+}
+
 fn launch_chromium_window(url: &str, binary: &Path, resources_dir: &Path) -> Result<Child> {
+    let launch = if is_confined_browser(binary) {
+        url.to_owned()
+    } else {
+        write_launch_page(url, resources_dir)?
+    };
     Command::new(binary)
         // `--app` is what makes this a window rather than a browser: no
         // address bar, no tabs, and nothing the person can navigate away
         // to. `--new-window` would hand them a whole browser instead.
-        .arg(format!("--app={url}"))
+        .arg(format!("--app={launch}"))
         .arg(format!(
             "--user-data-dir={}",
             resources_dir.to_string_lossy()
@@ -204,9 +352,14 @@ fn launch_chromium_window(url: &str, binary: &Path, resources_dir: &Path) -> Res
 
 #[cfg(target_os = "macos")]
 fn launch_macos_window(url: &str, resources_dir: &Path) -> Result<Child> {
+    launch_macos_window_script(&macos_window_script(url), resources_dir)
+}
+
+#[cfg(target_os = "macos")]
+fn launch_macos_window_script(source: &str, resources_dir: &Path) -> Result<Child> {
     let source_path = resources_dir.join("window.js");
     let app_bundle = resources_dir.join(MACOS_WINDOW_APP_NAME);
-    std::fs::write(&source_path, macos_window_script(url)).map_err(Error::Io)?;
+    std::fs::write(&source_path, source).map_err(Error::Io)?;
 
     let output = Command::new(MACOS_OSACOMPILE)
         .args(["-l", "JavaScript", "-s", "-o"])
@@ -446,7 +599,7 @@ mod tests {
         assert!(source.contains("setIconForFileOptions"), "{source}");
         assert!(source.contains("setApplicationIconImage"), "{source}");
         assert!(
-            !source.contains("reviewWebView.title"),
+            !source.contains("uiWebView.title"),
             "the stay-open applet must not poll a WebKit object property: {source}"
         );
     }
@@ -463,6 +616,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_confined_browser_is_recognised_by_where_it_runs_from() {
+        let scripts = tempfile::tempdir().unwrap();
+        let wrapper = scripts.path().join("chromium-browser");
+        std::fs::write(&wrapper, "#!/bin/sh\nexec /snap/bin/chromium \"$@\"\n").unwrap();
+        let plain = scripts.path().join("chrome");
+        std::fs::write(&plain, "#!/bin/sh\nexec /opt/google/chrome/chrome \"$@\"\n").unwrap();
+        assert!(is_confined_browser(Path::new("/snap/bin/chromium")));
+        assert!(is_confined_browser(Path::new(
+            "/var/lib/flatpak/exports/bin/org.chromium.Chromium"
+        )));
+        assert!(is_confined_browser(&wrapper));
+        assert!(!is_confined_browser(&plain));
+        assert!(!is_confined_browser(Path::new(
+            "/nonexistent/google-chrome"
+        )));
+    }
+
+    #[test]
+    fn a_window_is_launched_on_a_private_page_rather_than_its_credentialed_url() {
+        let resources = tempfile::tempdir().unwrap();
+        let url = "http://127.0.0.1:8080/secret/?afui_launch_id=x#afui-window=key</script>";
+        let launch = write_launch_page(url, resources.path()).unwrap();
+        assert!(launch.starts_with("file://"), "{launch}");
+        assert!(!launch.contains("secret"), "{launch}");
+        let page = std::fs::read_to_string(resources.path().join(LAUNCH_PAGE)).unwrap();
+        assert!(
+            page.contains(r#"location.replace("http://127.0.0.1:8080/secret/?afui_launch_id=x#afui-window=key\u003c/script>")"#),
+            "{page}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(resources.path().join(LAUNCH_PAGE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(
+            file_url(Path::new("/tmp/a b/launch.html")),
+            "file:///tmp/a%20b/launch.html"
+        );
+        assert_eq!(
+            file_url(Path::new(r"C:\Users\x\launch.html")),
+            "file:///C:/Users/x/launch.html"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_window_source_compiles_to_a_stay_open_application() {
@@ -471,7 +673,7 @@ mod tests {
         let app_bundle = resources.path().join(MACOS_WINDOW_APP_NAME);
         std::fs::write(
             &source_path,
-            macos_window_script("http://127.0.0.1:8080/review/"),
+            macos_window_script("http://127.0.0.1:8080/panel/"),
         )
         .unwrap();
 
@@ -487,5 +689,189 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(app_bundle.join("Contents/MacOS/applet").is_file());
+    }
+
+    /// Exercise AppKit's actual menu dispatch while the web view is the first
+    /// responder. Compiling the applet alone cannot catch a missing shortcut.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[ignore = "requires a desktop; run scripts/test.sh window-shortcuts"]
+    async fn macos_window_close_shortcut() {
+        let resources = tempfile::tempdir().unwrap();
+        let result_path = resources.path().join("shortcut-result.txt");
+        let result_literal = serde_json::to_string(&result_path).unwrap();
+        let source = format!(
+            r#"
+const AFUI_WINDOW_URL = "data:text/html,<textarea autofocus></textarea>";
+const AFUI_APP_ICON_URL = "file:///dev/null";
+{MACOS_WINDOW_SCRIPT}
+let probeStep = 0;
+function recordProbe(result) {{
+    $.NSString.alloc.initWithUTF8String(result).writeToFileAtomicallyEncodingError(
+        {result_literal}, true, $.NSUTF8StringEncoding, null
+    );
+}}
+ObjC.registerSubclass({{
+    name: "AFUIShortcutProbe",
+    superclass: "NSObject",
+    methods: {{
+        "probe:": {{
+            types: ["void", ["id"]],
+            implementation: function(timer) {{
+                try {{
+                    if (!uiWindow.visible) throw new Error("window closed before Command+W");
+                    showUiWindow();
+                    uiWindow.makeKeyWindow;
+                    if (probeStep === 0) uiWindow.makeFirstResponder(uiWebView);
+                    const modifiers = [0, $.NSEventModifierFlagControl, $.NSEventModifierFlagCommand][probeStep];
+                    const event = $.NSEvent.keyEventWithTypeLocationModifierFlagsTimestampWindowNumberContextCharactersCharactersIgnoringModifiersIsARepeatKeyCode(
+                        $.NSEventTypeKeyDown, $.NSMakePoint(0, 0), modifiers, 0,
+                        uiWindow.windowNumber, null, "w", "w", false, 13
+                    );
+                    // Queue input for AppKit to dispatch after this callback
+                    // returns, when the applet is no longer executing script.
+                    $.NSApplication.sharedApplication.postEventAtStart(event, false);
+                    probeStep++;
+                    if (probeStep === 3) {{
+                        recordProbe("Command+W posted");
+                        timer.invalidate;
+                    }}
+                }} catch (error) {{
+                    recordProbe(String(error));
+                    timer.invalidate;
+                    uiWindow.close;
+                }}
+            }}
+        }}
+    }}
+}});
+const originalRun = run;
+let shortcutProbe = null;
+run = function() {{
+    originalRun();
+    shortcutProbe = $.AFUIShortcutProbe.alloc.init;
+    $.NSTimer.scheduledTimerWithTimeIntervalTargetSelectorUserInfoRepeats(
+        0.5, shortcutProbe, $.NSSelectorFromString("probe:"), null, true
+    );
+}};
+"#
+        );
+        let child = launch_macos_window_script(&source, resources.path()).unwrap();
+        let mut window = UiWindow {
+            arrived: None,
+            child,
+            _resources_dir: resources,
+        };
+        tokio::time::timeout(Duration::from_secs(10), window.wait_closed())
+            .await
+            .expect("applet exits after Command+W")
+            .unwrap();
+        assert!(window.child.try_wait().unwrap().unwrap().success());
+        assert_eq!(
+            std::fs::read_to_string(result_path).unwrap(),
+            "Command+W posted"
+        );
+    }
+
+    /// Use desktop input rather than a page's synthetic KeyboardEvent: browser
+    /// accelerators and the window manager own these shortcuts.
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    #[ignore = "requires a desktop; run scripts/test.sh window-shortcuts"]
+    async fn chromium_window_close_shortcuts() {
+        let binary = std::env::var_os("AFUI_TEST_BROWSER_BINARY")
+            .expect("fixed script selects Chrome or Chromium");
+        let config = UiWindowConfig::default().with_browser_binary(binary);
+        // A file rather than a `data:` URL: the window is launched on a page
+        // that moves on to its target, and a browser refuses a page-initiated
+        // top-level navigation to `data:`.
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let fixture = fixture_dir.path().join("fixture.html");
+        std::fs::write(
+            &fixture,
+            "<title>AFUI shortcut fixture</title><textarea autofocus></textarea>",
+        )
+        .unwrap();
+        let fixture_url = file_url(&fixture);
+        for shortcut in ["ctrl+w", "alt+F4"] {
+            let mut window = UiWindow::launch(&fixture_url, &config).unwrap();
+            // Also catches a launcher that exits before its window closes.
+            sleep(Duration::from_secs(2)).await;
+            assert!(window.child.try_wait().unwrap().is_none());
+            let driver = desktop_shortcut_driver(window.child.id(), shortcut);
+            let output = tokio::time::timeout(Duration::from_secs(15), driver)
+                .await
+                .expect("desktop input driver finishes")
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{shortcut}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            tokio::time::timeout(Duration::from_secs(10), window.wait_closed())
+                .await
+                .expect("shortcut closes the browser process")
+                .unwrap();
+            assert!(window.child.try_wait().unwrap().unwrap().success());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn desktop_shortcut_driver(
+        process_id: u32,
+        shortcut: &str,
+    ) -> std::io::Result<std::process::Output> {
+        let mut command = tokio::process::Command::new("xdotool");
+        let activated = command
+            .args(["search", "--sync", "--onlyvisible", "--pid"])
+            .arg(process_id.to_string())
+            .args([
+                "--name",
+                "AFUI shortcut fixture",
+                "windowactivate",
+                "--sync",
+            ])
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        if !activated.status.success() {
+            return Ok(activated);
+        }
+        // Send through XTest to the focused window. Sending to the saved X11
+        // window ID races the key-up against a window closed by the key-down.
+        tokio::process::Command::new("xdotool")
+            .args(["key", "--clearmodifiers", shortcut])
+            .kill_on_drop(true)
+            .output()
+            .await
+    }
+
+    #[cfg(windows)]
+    async fn desktop_shortcut_driver(
+        process_id: u32,
+        shortcut: &str,
+    ) -> std::io::Result<std::process::Output> {
+        let keys = if shortcut == "ctrl+w" { "^w" } else { "%{F4}" };
+        let script = format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+if (-not [Environment]::UserInteractive) {{
+    throw 'window shortcut tests require an interactive Windows desktop'
+}}
+$shell = New-Object -ComObject WScript.Shell
+$deadline = [DateTime]::UtcNow.AddSeconds(10)
+while (-not $shell.AppActivate({process_id})) {{
+    if ([DateTime]::UtcNow -ge $deadline) {{ throw 'fixture window did not become active' }}
+    Start-Sleep -Milliseconds 100
+}}
+Start-Sleep -Milliseconds 300
+$shell.SendKeys('{keys}')
+"#
+        );
+        tokio::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .kill_on_drop(true)
+            .output()
+            .await
     }
 }

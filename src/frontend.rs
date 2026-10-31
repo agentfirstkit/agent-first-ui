@@ -72,20 +72,39 @@ pub fn discover_frontend(
         return Ok(None);
     }
     for scope in [FrontendScope::Workspace, FrontendScope::Global] {
-        let root = frontend_root(scope, workspace_root, provider_id, ui_kind)?;
-        if root.join("frontend.json").is_file() {
-            if scope == FrontendScope::Workspace
-                && !workspace_frontend_is_enabled(&root, provider_id, ui_kind)?
-            {
-                continue;
-            }
-            return load_frontend(scope, root).map(Some);
+        if let Some(location) =
+            discover_frontend_in_scope(scope, workspace_root, provider_id, ui_kind)?
+        {
+            return Ok(Some(location));
         }
     }
     Ok(None)
 }
 
+fn discover_frontend_in_scope(
+    scope: FrontendScope,
+    workspace_root: &Path,
+    provider_id: &str,
+    ui_kind: &str,
+) -> Result<Option<FrontendLocation>> {
+    let root = frontend_root(scope, workspace_root, provider_id, ui_kind)?;
+    if !root.join("frontend.json").is_file()
+        || (scope == FrontendScope::Workspace
+            && !workspace_frontend_is_enabled(&root, provider_id, ui_kind)?)
+    {
+        return Ok(None);
+    }
+    load_frontend(scope, root).map(Some)
+}
+
 fn workspace_frontend_is_enabled(root: &Path, provider_id: &str, ui_kind: &str) -> Result<bool> {
+    let Some(expected) = workspace_trusted_fingerprint(provider_id, ui_kind)? else {
+        return Ok(false);
+    };
+    Ok(expected == frontend_fingerprint(root)?)
+}
+
+fn workspace_trusted_fingerprint(provider_id: &str, ui_kind: &str) -> Result<Option<String>> {
     #[derive(Deserialize)]
     struct TrustStore {
         #[serde(default)]
@@ -97,7 +116,7 @@ fn workspace_frontend_is_enabled(root: &Path, provider_id: &str, ui_kind: &str) 
     }
     let trust_path = global_afui_root()?.join("trust.json");
     if !trust_path.is_file() {
-        return Ok(false);
+        return Ok(None);
     }
     let bytes = fs::read(trust_path).map_err(Error::Io)?;
     let trust: TrustStore =
@@ -105,28 +124,47 @@ fn workspace_frontend_is_enabled(root: &Path, provider_id: &str, ui_kind: &str) 
             message: format!("invalid trust.json: {error}"),
         })?;
     let key = format!("workspace:{provider_id}:{ui_kind}");
-    let Some(entry) = trust.frontends.get(&key) else {
-        return Ok(false);
-    };
-    Ok(entry.fingerprint == frontend_fingerprint(root)?)
+    Ok(trust
+        .frontends
+        .get(&key)
+        .map(|entry| entry.fingerprint.clone()))
 }
 
+/// Why a symlink in a frontend is refused rather than skipped, worded once for
+/// every place that reads a frontend's files.
+pub(crate) const SYMLINK_REFUSAL: &str =
+    "it is a symlink, and a trusted fingerprint covers files rather than the places they point at";
+
+/// The trust fingerprint of the frontend at `root`.
+///
+/// Refuses a symlink exactly as [`FrontendSnapshot`] does: a fingerprint that
+/// skipped one would record trust in a frontend that then fails to load.
 pub(crate) fn frontend_fingerprint(root: &Path) -> Result<String> {
     let mut files = BTreeMap::new();
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry.map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
         let relative = entry
             .path()
             .strip_prefix(root)
             .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?
             .to_string_lossy()
             .replace('\\', "/");
+        if entry.file_type().is_symlink() {
+            return Err(Error::FrontendFileName {
+                name: relative,
+                reason: SYMLINK_REFUSAL,
+            });
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let bytes = fs::read(entry.path()).map_err(Error::Io)?;
         files.insert(relative, blake3::hash(&bytes).to_hex().to_string());
     }
+    Ok(fingerprint_hashes(files))
+}
+
+fn fingerprint_hashes(files: BTreeMap<String, String>) -> String {
     let mut hasher = blake3::Hasher::new();
     for (path, hash) in files {
         hasher.update(path.as_bytes());
@@ -134,13 +172,22 @@ pub(crate) fn frontend_fingerprint(root: &Path) -> Result<String> {
         hasher.update(hash.as_bytes());
         hasher.update(&[0]);
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    hasher.finalize().to_hex().to_string()
 }
 
 pub fn load_frontend(scope: FrontendScope, root: PathBuf) -> Result<FrontendLocation> {
     let bytes = fs::read(root.join("frontend.json")).map_err(Error::Io)?;
+    let manifest = parse_frontend_manifest(&bytes)?;
+    Ok(FrontendLocation {
+        scope,
+        root,
+        manifest,
+    })
+}
+
+fn parse_frontend_manifest(bytes: &[u8]) -> Result<FrontendManifest> {
     let manifest: FrontendManifest =
-        serde_json::from_slice(&bytes).map_err(|error| Error::FrontendManifest {
+        serde_json::from_slice(bytes).map_err(|error| Error::FrontendManifest {
             message: error.to_string(),
         })?;
     validate_frontend_identifier("frontend_id", &manifest.frontend_id)?;
@@ -149,11 +196,7 @@ pub fn load_frontend(scope: FrontendScope, root: PathBuf) -> Result<FrontendLoca
             message: "ui_api_version must not be empty".to_owned(),
         });
     }
-    Ok(FrontendLocation {
-        scope,
-        root,
-        manifest,
-    })
+    Ok(manifest)
 }
 
 pub fn global_afui_root() -> Result<PathBuf> {
@@ -230,12 +273,11 @@ const SCRIPT_EXTENSIONS: [&str; 5] = ["js", "mjs", "cjs", "wasm", "jsx"];
 /// one-page customisation would silently delete i18n.
 /// Every trusted file, read once, at the moment trust was decided.
 ///
-/// The fingerprint is computed over the whole directory at resolve; serving
-/// then used to `fs::read` the path again per request, so a long-running
-/// process kept serving templates, CSS and assets that had been edited *after*
-/// the check — while the documentation said any later edit revoked trust. It
-/// also meant `reject_frontend_symlinks` checked one object and the read opened
-/// another.
+/// The fingerprint is computed over the whole directory at resolve. Serving
+/// that read the path again per request would let a long-running process
+/// serve templates, CSS and assets edited *after* the check, although any later
+/// edit revokes trust — and `reject_frontend_symlinks` would check one object
+/// while the read opened another.
 ///
 /// Holding the bytes settles both: what is served is exactly what was
 /// fingerprinted, and there is no second path lookup to race. A frontend is
@@ -248,6 +290,20 @@ pub(crate) struct FrontendSnapshot {
 }
 
 impl FrontendSnapshot {
+    fn fingerprint(&self) -> String {
+        fingerprint_hashes(
+            self.files
+                .iter()
+                .map(|(path, bytes)| (path.clone(), blake3::hash(bytes).to_hex().to_string()))
+                .collect(),
+        )
+    }
+
+    fn is_workspace_trusted(&self, provider_id: &str, ui_kind: &str) -> Result<bool> {
+        Ok(workspace_trusted_fingerprint(provider_id, ui_kind)?
+            .is_some_and(|expected| expected == self.fingerprint()))
+    }
+
     fn read(root: &Path) -> Result<Self> {
         let mut files = BTreeMap::new();
         for entry in WalkDir::new(root).follow_links(false) {
@@ -265,7 +321,7 @@ impl FrontendSnapshot {
             if entry.file_type().is_symlink() {
                 return Err(Error::FrontendFileName {
                     name: relative,
-                    reason: "it is a symlink, and a trusted fingerprint covers files rather than the places they point at",
+                    reason: SYMLINK_REFUSAL,
                 });
             }
             if !entry.file_type().is_file() {
@@ -349,14 +405,42 @@ impl UiFrontend {
             location,
             snapshot,
         };
-        let location = discover_frontend(workspace_root, provider_id, ui_kind, safe_mode).map_err(
-            |error| Error::FrontendUnreadable {
-                provider_id: provider_id.to_owned(),
-                ui_kind: ui_kind.to_owned(),
-                message: error.to_string(),
-            },
-        )?;
-        let Some(location) = location else {
+        if safe_mode {
+            return Ok(built_in(None, None));
+        }
+        let captured = (|| {
+            for scope in [FrontendScope::Workspace, FrontendScope::Global] {
+                let Some(mut location) =
+                    discover_frontend_in_scope(scope, workspace_root, provider_id, ui_kind)?
+                else {
+                    continue;
+                };
+                let snapshot = FrontendSnapshot::read(&location.root)?;
+                // The earlier directory hash was only discovery. Trust must
+                // authorize the retained bytes, including this manifest.
+                if scope == FrontendScope::Workspace
+                    && !snapshot.is_workspace_trusted(provider_id, ui_kind)?
+                {
+                    continue;
+                }
+                let manifest =
+                    snapshot
+                        .get("frontend.json")
+                        .ok_or_else(|| Error::FrontendManifest {
+                            message: "frontend.json is missing from the captured frontend"
+                                .to_owned(),
+                        })?;
+                location.manifest = parse_frontend_manifest(manifest)?;
+                return Ok(Some((location, snapshot)));
+            }
+            Ok(None)
+        })()
+        .map_err(|error: Error| Error::FrontendUnreadable {
+            provider_id: provider_id.to_owned(),
+            ui_kind: ui_kind.to_owned(),
+            message: error.to_string(),
+        })?;
+        let Some((location, snapshot)) = captured else {
             return Ok(built_in(None, None));
         };
         if location.manifest.ui_api_version != ui_api_version {
@@ -368,14 +452,6 @@ impl UiFrontend {
                 implemented: ui_api_version.to_owned(),
             });
         }
-        // Read here, while the fingerprint that authorized it is still the
-        // truth about this directory.
-        let snapshot =
-            FrontendSnapshot::read(&location.root).map_err(|error| Error::FrontendUnreadable {
-                provider_id: provider_id.to_owned(),
-                ui_kind: ui_kind.to_owned(),
-                message: error.to_string(),
-            })?;
         Ok(built_in(Some(location), Some(snapshot)))
     }
 
@@ -796,6 +872,62 @@ mod tests {
             assert!(error.to_string().contains(needle), "{name}: {error}");
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_trust_covers_the_captured_bytes_after_discovery() {
+        let _guard = CONFIG_DIR.lock().unwrap_or_else(|error| error.into_inner());
+        let config = temp_root("snapshot-trust");
+        let workspace = temp_root("snapshot-workspace");
+        fs::create_dir_all(&config).unwrap();
+        let directory = global_frontend(&workspace.join(".afui"), "reviewer", "console", "1");
+        fs::write(directory.join("style.css"), "approved").unwrap();
+        let fingerprint = frontend_fingerprint(&directory).unwrap();
+        fs::write(
+            config.join("trust.json"),
+            serde_json::json!({
+                "frontends": {"workspace:reviewer:console": {"fingerprint": fingerprint}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // SAFETY: CONFIG_DIR serializes AFUI configuration access in tests.
+        unsafe { std::env::set_var(CONFIG_DIR_ENV, &config) };
+        let discovered =
+            discover_frontend_in_scope(FrontendScope::Workspace, &workspace, "reviewer", "console")
+                .unwrap()
+                .unwrap();
+        let approved = FrontendSnapshot::read(&discovered.root).unwrap();
+        assert_eq!(approved.fingerprint(), fingerprint);
+        assert!(
+            approved
+                .is_workspace_trusted("reviewer", "console")
+                .unwrap()
+        );
+
+        // This edit occurs after discovery's hash check and before capture.
+        fs::write(directory.join("style.css"), "changed before capture").unwrap();
+        let changed = FrontendSnapshot::read(&discovered.root).unwrap();
+        assert!(!changed.is_workspace_trusted("reviewer", "console").unwrap());
+        assert!(
+            approved
+                .is_workspace_trusted("reviewer", "console")
+                .unwrap()
+        );
+        let global = global_frontend(&config, "reviewer", "console", "1");
+        fs::write(global.join("style.css"), "global fallback").unwrap();
+        let frontend =
+            UiFrontend::resolve_with_safe_mode(&workspace, "reviewer", "console", "1", false)
+                .unwrap();
+        assert_eq!(frontend.location().unwrap().scope, FrontendScope::Global);
+        assert_eq!(
+            frontend.text("style.css").unwrap().as_deref(),
+            Some("global fallback")
+        );
+        // SAFETY: CONFIG_DIR still holds exclusive configuration access.
+        unsafe { std::env::remove_var(CONFIG_DIR_ENV) };
+        fs::remove_dir_all(workspace).unwrap();
+        fs::remove_dir_all(config).unwrap();
     }
 
     #[test]

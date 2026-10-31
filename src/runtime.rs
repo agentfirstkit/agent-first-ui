@@ -21,15 +21,37 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 
-use crate::reserved::SESSION_BLOB_PATH_PREFIX;
+mod events;
+use events::{EventFrame, EventHistory, EventReplay};
+
+mod blob;
+
 use crate::serving::UiBlobPolicy;
 use crate::{Error, Result};
+use blob::RuntimeBlobStore;
 
 /// The protocol spoken by [`UiSessionRuntime`] and `afui.connect()`.
 pub(crate) const UI_RUNTIME_PROTOCOL: &str = "afui-session-v1";
 
 /// Default number of unacknowledged calls one runtime admits.
+///
+/// Calls still in flight count fully. A call that has finished but whose
+/// surface never acknowledged it (a page reloaded between the reply and the
+/// ack takes a new client id with it) is only a replay cache: when the bound
+/// is reached the oldest such cache gives way to new work, so a runtime that
+/// outlives many surfaces never wedges into `ui_runtime_busy` for good. A
+/// surface that later resends an evicted call is answered `ui_call_expired`
+/// rather than having it run again.
 pub const DEFAULT_UI_RUNTIME_CALL_CAPACITY: usize = 32;
+
+/// How many evicted calls a runtime still recognises.
+///
+/// An evicted reply is gone, but the call it answered already ran. A surface
+/// that reconnects and resends it must be told it is over rather than have it
+/// registered, and run, a second time. Bounded so a runtime that outlives many
+/// surfaces does not grow without end; a key older than this is a reload's
+/// worth of history nobody is coming back for.
+const EVICTED_CALL_MEMORY: usize = 256;
 
 /// Default number of ordered events AFUI retains for reconnecting surfaces.
 pub const DEFAULT_UI_RUNTIME_EVENT_CAPACITY: usize = 128;
@@ -40,9 +62,6 @@ pub const MAX_UI_RUNTIME_MESSAGE_BYTES: usize = 1024 * 1024;
 const RESPONSE_BROADCAST_CAPACITY: usize = 256;
 const MAX_RETAINED_CALL_FRAMES: usize = 64;
 const MAX_ID_BYTES: usize = 128;
-const DEFAULT_RUNTIME_BLOB_CAPACITY: usize = 16;
-const RUNTIME_BLOB_TOTAL_MULTIPLIER: u64 = 4;
-const BLOB_ID_BYTES: usize = 16;
 const RUNTIME_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const RUNTIME_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const RUNTIME_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
@@ -294,49 +313,40 @@ struct IncomingCall {
 struct CallRecord {
     frames: VecDeque<Arc<str>>,
     terminal: bool,
+    /// When the terminal frame was retained; what decides which finished
+    /// record yields first when the call bound is reached.
+    finished_at: Option<std::time::Instant>,
     cancel: watch::Sender<bool>,
     acknowledged: Option<oneshot::Sender<()>>,
+}
+
+impl CallRecord {
+    fn retain_frame(&mut self, encoded: &Arc<str>, terminal: bool) {
+        if self.frames.len() == MAX_RETAINED_CALL_FRAMES {
+            self.frames.pop_front();
+        }
+        self.frames.push_back(Arc::clone(encoded));
+        self.terminal = terminal;
+        if terminal && self.finished_at.is_none() {
+            self.finished_at = Some(std::time::Instant::now());
+        }
+    }
+}
+
+/// The finished, unacknowledged record that has waited longest for an ack
+/// that may never come.
+fn oldest_finished_call(records: &HashMap<CallKey, CallRecord>) -> Option<CallKey> {
+    records
+        .iter()
+        .filter_map(|(key, record)| record.finished_at.map(|at| (at, key)))
+        .min_by_key(|(at, _)| *at)
+        .map(|(_, key)| key.clone())
 }
 
 #[derive(Clone)]
 struct TargetFrame {
     client_id: String,
     encoded: Arc<str>,
-}
-
-#[derive(Clone)]
-struct EventFrame {
-    sequence: u64,
-    encoded: Arc<str>,
-}
-
-struct EventHistory {
-    frames: VecDeque<EventFrame>,
-    last_sequence: u64,
-}
-
-struct EventReplay {
-    frames: Vec<EventFrame>,
-    reset: Option<(u64, u64)>,
-}
-
-struct StoredBlob {
-    media_type: String,
-    bytes: Vec<u8>,
-}
-
-#[derive(Default)]
-struct StoredBlobs {
-    values: HashMap<String, StoredBlob>,
-    order: VecDeque<String>,
-    total_bytes: u64,
-}
-
-struct RuntimeBlobStore {
-    policy: UiBlobPolicy,
-    blobs: StdMutex<StoredBlobs>,
-    max_blobs: usize,
-    max_total_bytes: u64,
 }
 
 struct RuntimeShared {
@@ -346,9 +356,11 @@ struct RuntimeShared {
     responses: broadcast::Sender<TargetFrame>,
     call_records: Mutex<HashMap<CallKey, CallRecord>>,
     call_capacity: usize,
+    /// Calls whose finished record was evicted, oldest first. See
+    /// [`EVICTED_CALL_MEMORY`].
+    evicted_calls: StdMutex<VecDeque<CallKey>>,
     events: broadcast::Sender<EventFrame>,
     event_history: StdMutex<EventHistory>,
-    event_capacity: usize,
     blobs: Option<RuntimeBlobStore>,
     shutdown: watch::Receiver<bool>,
     /// Proof that a surface is the local window AFUI itself opened. Only a
@@ -396,20 +408,10 @@ impl<Action, Reply, SurfaceState> UiSessionRuntime<Action, Reply, SurfaceState> 
             responses: response_tx,
             call_records: Mutex::new(HashMap::new()),
             call_capacity,
+            evicted_calls: StdMutex::new(VecDeque::new()),
             events: event_tx,
-            event_history: StdMutex::new(EventHistory {
-                frames: VecDeque::with_capacity(event_capacity),
-                last_sequence: 0,
-            }),
-            event_capacity,
-            blobs: blob_policy.map(|policy| RuntimeBlobStore {
-                max_blobs: DEFAULT_RUNTIME_BLOB_CAPACITY,
-                max_total_bytes: policy
-                    .max_bytes()
-                    .saturating_mul(RUNTIME_BLOB_TOTAL_MULTIPLIER),
-                policy,
-                blobs: StdMutex::new(StoredBlobs::default()),
-            }),
+            event_history: StdMutex::new(EventHistory::new(event_capacity)),
+            blobs: blob_policy.map(RuntimeBlobStore::new),
             shutdown: shutdown_rx.clone(),
             window_key: random_window_key()?,
         });
@@ -485,7 +487,7 @@ impl<Action, Reply, SurfaceState> UiSessionRuntime<Action, Reply, SurfaceState> 
             .lock()
             .map_err(|_| Error::SessionRuntimeBusy)?;
         self.shared.ensure_open()?;
-        let sequence = history.last_sequence.saturating_add(1);
+        let sequence = history.next_sequence();
         let encoded = encode(
             "event",
             json!({
@@ -494,11 +496,7 @@ impl<Action, Reply, SurfaceState> UiSessionRuntime<Action, Reply, SurfaceState> 
             }),
         )?;
         let frame = EventFrame { sequence, encoded };
-        if history.frames.len() == self.shared.event_capacity {
-            history.frames.pop_front();
-        }
-        history.frames.push_back(frame.clone());
-        history.last_sequence = sequence;
+        history.retain(frame.clone());
         let _no_surface_is_normal = self.shared.events.send(frame);
         drop(history);
         Ok(sequence)
@@ -632,11 +630,7 @@ impl RuntimeShared {
         if record.terminal {
             return Err(Error::SessionRuntimeCallClosed);
         }
-        if record.frames.len() == MAX_RETAINED_CALL_FRAMES {
-            record.frames.pop_front();
-        }
-        record.frames.push_back(Arc::clone(&encoded));
-        record.terminal = terminal;
+        record.retain_frame(&encoded, terminal);
         let _no_surface_is_normal = self.responses.send(TargetFrame {
             client_id: key.client_id.clone(),
             encoded,
@@ -656,11 +650,7 @@ impl RuntimeShared {
         if record.terminal {
             return Err(Error::SessionRuntimeCallClosed);
         }
-        if record.frames.len() == MAX_RETAINED_CALL_FRAMES {
-            record.frames.pop_front();
-        }
-        record.frames.push_back(Arc::clone(&encoded));
-        record.terminal = true;
+        record.retain_frame(&encoded, true);
         let _no_surface_is_normal = self.responses.send(TargetFrame {
             client_id: key.client_id.clone(),
             encoded,
@@ -675,15 +665,47 @@ impl RuntimeShared {
         if let Some(record) = records.get(&key) {
             return Ok(record.frames.iter().cloned().collect());
         }
-        if records.len() >= self.call_capacity {
+        if self
+            .evicted_calls
+            .lock()
+            .map_err(|_| Error::SessionRuntimeBusy)?
+            .contains(&key)
+        {
             return Ok(vec![call_error_frame(
                 &key.request_id,
                 &UiCallError::new(
-                    "ui_runtime_busy",
-                    "the UI runtime has reached its unacknowledged call bound",
-                )
-                .retryable(true),
+                    "ui_call_expired",
+                    "this action already ran, and its reply is no longer kept",
+                ),
             )?]);
+        }
+        if records.len() >= self.call_capacity {
+            // Only live work is allowed to refuse new work. A finished reply
+            // waiting on an ack is kept for a surface that may reconnect; it
+            // yields to a surface that is here now.
+            match oldest_finished_call(&records) {
+                Some(evicted) => {
+                    records.remove(&evicted);
+                    let mut remembered = self
+                        .evicted_calls
+                        .lock()
+                        .map_err(|_| Error::SessionRuntimeBusy)?;
+                    if remembered.len() >= EVICTED_CALL_MEMORY {
+                        remembered.pop_front();
+                    }
+                    remembered.push_back(evicted);
+                }
+                None => {
+                    return Ok(vec![call_error_frame(
+                        &key.request_id,
+                        &UiCallError::new(
+                            "ui_runtime_busy",
+                            "the UI runtime has reached its unacknowledged call bound",
+                        )
+                        .retryable(true),
+                    )?]);
+                }
+            }
         }
         let (cancel_tx, cancel_rx) = watch::channel(false);
         records.insert(
@@ -691,6 +713,7 @@ impl RuntimeShared {
             CallRecord {
                 frames: VecDeque::new(),
                 terminal: false,
+                finished_at: None,
                 cancel: cancel_tx,
                 acknowledged: None,
             },
@@ -723,17 +746,21 @@ impl RuntimeShared {
         )?;
         let mut records = self.call_records.lock().await;
         let Some(record) = records.get_mut(key) else {
+            // A call this runtime never received — sent on a wire that dropped
+            // before it arrived, then cancelled. Nothing ran, and saying so is
+            // what lets the surface stop resending the cancel on every
+            // reconnect. Not retained: there is no record to acknowledge.
+            let _no_surface_is_normal = self.responses.send(TargetFrame {
+                client_id: key.client_id.clone(),
+                encoded,
+            });
             return Ok(());
         };
         let _ignored = record.cancel.send(true);
         if record.terminal {
             return Ok(());
         }
-        if record.frames.len() == MAX_RETAINED_CALL_FRAMES {
-            record.frames.pop_front();
-        }
-        record.frames.push_back(Arc::clone(&encoded));
-        record.terminal = true;
+        record.retain_frame(&encoded, true);
         let _no_surface_is_normal = self.responses.send(TargetFrame {
             client_id: key.client_id.clone(),
             encoded,
@@ -749,85 +776,6 @@ impl RuntimeShared {
         {
             let _observer_gone_is_normal = acknowledged.send(());
         }
-    }
-}
-
-impl RuntimeBlobStore {
-    fn store(&self, media_type: String, bytes: Vec<u8>) -> Result<UiBlobRef> {
-        let size_bytes = bytes.len();
-        if !self.policy.admits(&media_type)
-            || size_bytes as u64 > self.policy.max_bytes()
-            || size_bytes as u64 > self.max_total_bytes
-        {
-            return Err(Error::SessionRuntimeBlobRejected {
-                media_type,
-                size_bytes,
-                max_bytes: self.policy.max_bytes(),
-            });
-        }
-        let id = random_blob_id()?;
-        let mut blobs = self.blobs.lock().map_err(|_| Error::SessionRuntimeBusy)?;
-        while blobs.values.len() >= self.max_blobs
-            || blobs.total_bytes.saturating_add(size_bytes as u64) > self.max_total_bytes
-        {
-            let Some(oldest) = blobs.order.pop_front() else {
-                break;
-            };
-            if let Some(removed) = blobs.values.remove(&oldest) {
-                blobs.total_bytes = blobs.total_bytes.saturating_sub(removed.bytes.len() as u64);
-            }
-        }
-        // A collision is vanishingly unlikely, but replacement would corrupt
-        // a reference already handed to the page. Treat it as entropy failure.
-        if blobs.values.contains_key(&id) {
-            return Err(Error::Random(std::io::Error::other(
-                "generated a duplicate UI blob identifier",
-            )));
-        }
-        blobs.total_bytes = blobs.total_bytes.saturating_add(size_bytes as u64);
-        blobs.order.push_back(id.clone());
-        blobs.values.insert(
-            id.clone(),
-            StoredBlob {
-                media_type: media_type.clone(),
-                bytes,
-            },
-        );
-        Ok(UiBlobRef {
-            blob_url: format!("{SESSION_BLOB_PATH_PREFIX}{id}"),
-            media_type,
-            size_bytes,
-        })
-    }
-
-    fn response(&self, id: &str) -> Response {
-        let Some((media_type, bytes)) = self.blobs.lock().ok().and_then(|blobs| {
-            blobs
-                .values
-                .get(id)
-                .map(|blob| (blob.media_type.clone(), blob.bytes.clone()))
-        }) else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        self.policy.respond(&media_type, bytes)
-    }
-
-    fn release_url(&self, blob_url: &str) -> bool {
-        let Some(id) = blob_url.strip_prefix(SESSION_BLOB_PATH_PREFIX) else {
-            return false;
-        };
-        if id.is_empty() || id.contains('/') {
-            return false;
-        }
-        let Ok(mut blobs) = self.blobs.lock() else {
-            return false;
-        };
-        let Some(removed) = blobs.values.remove(id) else {
-            return false;
-        };
-        blobs.total_bytes = blobs.total_bytes.saturating_sub(removed.bytes.len() as u64);
-        blobs.order.retain(|candidate| candidate != id);
-        true
     }
 }
 
@@ -853,16 +801,6 @@ pub(crate) fn window_url(access_url: &str, endpoint: &UiSessionRuntimeEndpoint) 
         "{access_url}#{WINDOW_KEY_FRAGMENT}={}",
         endpoint.shared.window_key
     )
-}
-
-fn random_blob_id() -> Result<String> {
-    let mut bytes = [0_u8; BLOB_ID_BYTES];
-    fill(&mut bytes).map_err(|error| {
-        Error::Random(std::io::Error::other(format!(
-            "could not generate UI blob identifier: {error}"
-        )))
-    })?;
-    Ok(format!("b{}", hex::encode(bytes)))
 }
 
 impl UiSessionRuntimeEndpoint {
@@ -1071,28 +1009,7 @@ impl UiSessionRuntimeEndpoint {
             .event_history
             .lock()
             .map_err(|_| Error::SessionRuntimeBusy)?;
-        let Some(oldest) = history.frames.front().map(|frame| frame.sequence) else {
-            return Ok(EventReplay {
-                frames: Vec::new(),
-                reset: (after > 0).then_some((0, 0)),
-            });
-        };
-        let latest = history.frames.back().map_or(oldest, |frame| frame.sequence);
-        if after > latest || after.saturating_add(1) < oldest {
-            return Ok(EventReplay {
-                frames: Vec::new(),
-                reset: Some((oldest, latest)),
-            });
-        }
-        Ok(EventReplay {
-            frames: history
-                .frames
-                .iter()
-                .filter(|frame| frame.sequence > after)
-                .cloned()
-                .collect(),
-            reset: None,
-        })
+        Ok(history.replay(after))
     }
 
     async fn handle_surface_frame(
@@ -1800,8 +1717,12 @@ mod tests {
         assert!(*mount.endpoint.shutdown.borrow());
     }
 
+    /// The bound refuses new work only while live work fills it. A reply that
+    /// finished and was never acknowledged is replay cache, and the oldest
+    /// one yields: a surface reloaded between reply and ack must not cost the
+    /// runtime one slot forever.
     #[tokio::test]
-    async fn call_capacity_bounds_every_unacknowledged_call() {
+    async fn call_capacity_bounds_live_calls_and_finished_replies_yield_to_new_work() {
         let (runtime, mount) =
             UiSessionRuntime::<Action, Reply<'static>, SurfaceState<'static>>::bounded(1, 2)
                 .unwrap();
@@ -1810,8 +1731,12 @@ mod tests {
             request_id: "r1".to_string(),
         };
         let second = CallKey {
-            client_id: "client-1".to_string(),
+            client_id: "client-2".to_string(),
             request_id: "r2".to_string(),
+        };
+        let third = CallKey {
+            client_id: "client-2".to_string(),
+            request_id: "r3".to_string(),
         };
         mount
             .endpoint
@@ -1827,11 +1752,56 @@ mod tests {
             .finish(&Reply { answer: "done" })
             .await
             .unwrap();
-
+        // `client-1` is gone without acknowledging; its finished reply gives
+        // way to the next surface's call.
+        assert!(
+            mount
+                .endpoint
+                .shared
+                .register_call(second.clone(), json!({"command": "second"}))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            mount
+                .endpoint
+                .shared
+                .call_records
+                .lock()
+                .await
+                .get(&first)
+                .is_none(),
+            "the finished, unacknowledged reply was not evicted"
+        );
+        // The reply that yielded is gone, but the call it answered ran. A
+        // surface that comes back and resends it is told so, rather than
+        // having it registered and run a second time.
+        let replayed = mount
+            .endpoint
+            .shared
+            .register_call(first.clone(), json!({"command": "first"}))
+            .await
+            .unwrap();
+        assert_eq!(replayed.len(), 1);
+        let replayed: Value = serde_json::from_str(&replayed[0]).unwrap();
+        assert_eq!(replayed["call_error"]["code"], "ui_call_expired");
+        assert!(
+            mount
+                .endpoint
+                .shared
+                .call_records
+                .lock()
+                .await
+                .get(&first)
+                .is_none(),
+            "a replayed evicted call must not be registered again"
+        );
+        // Meanwhile `second` is live, so the bound now refuses.
         let busy = mount
             .endpoint
             .shared
-            .register_call(second.clone(), json!({"command": "second"}))
+            .register_call(third.clone(), json!({"command": "third"}))
             .await
             .unwrap();
         assert_eq!(busy.len(), 1);
@@ -1839,12 +1809,20 @@ mod tests {
         assert_eq!(busy["call_error"]["code"], "ui_runtime_busy");
         assert_eq!(busy["call_error"]["retryable"], true);
 
-        mount.endpoint.shared.acknowledge_call(&first).await;
+        let call = runtime.recv().await.unwrap().unwrap();
+        assert_eq!(
+            call.action(),
+            &Action {
+                command: "second".to_string()
+            }
+        );
+        call.finish(&Reply { answer: "done" }).await.unwrap();
+        mount.endpoint.shared.acknowledge_call(&second).await;
         assert!(
             mount
                 .endpoint
                 .shared
-                .register_call(second, json!({"command": "second"}))
+                .register_call(third, json!({"command": "third"}))
                 .await
                 .unwrap()
                 .is_empty()
@@ -1852,7 +1830,7 @@ mod tests {
         assert_eq!(
             runtime.recv().await.unwrap().unwrap().action(),
             &Action {
-                command: "second".to_string()
+                command: "third".to_string()
             }
         );
     }
@@ -1879,6 +1857,28 @@ mod tests {
             r#"{"kind":"open_external","open_external":{"request_id":"o3","url":"https://x","target":"_self"}}"#,
         );
         assert!(extra.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_call_that_never_arrived_answers_it_without_keeping_it() {
+        let (_runtime, mount) =
+            UiSessionRuntime::<Action, Reply<'static>, SurfaceState<'static>>::bounded(2, 2)
+                .unwrap();
+        let mut responses = mount.endpoint.shared.responses.subscribe();
+        let never = CallKey {
+            client_id: "client-1".to_string(),
+            request_id: "r9".to_string(),
+        };
+        mount.endpoint.shared.cancel_call(&never).await.unwrap();
+        let frame = responses.recv().await.unwrap();
+        assert_eq!(frame.client_id, "client-1");
+        let frame: Value = serde_json::from_str(&frame.encoded).unwrap();
+        assert_eq!(frame["call_error"]["code"], "ui_call_cancelled");
+        assert_eq!(frame["call_error"]["request_id"], "r9");
+        assert!(
+            mount.endpoint.shared.call_records.lock().await.is_empty(),
+            "nothing is retained for a call that never ran"
+        );
     }
 
     #[tokio::test]

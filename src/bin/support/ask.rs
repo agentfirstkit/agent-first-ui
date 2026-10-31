@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
@@ -6,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_first_data::{
     ArgSpec, CliEmitter, CliValue, Combination, CommandSpec, OutputFormat, OutputTo,
-    ResolvedInvocation,
+    ResolvedInvocation, SourceScheme, SourceSet,
 };
 use agent_first_ui::Outcome;
 use agent_first_ui::ask::{AskBlock, AskOption, AskQuestion, AskRequest, AskResponse};
@@ -23,10 +22,13 @@ const WAIT_POLL: Duration = Duration::from_millis(250);
 pub(super) fn ask_command() -> CommandSpec {
     CommandSpec::new(["ask"])
         .about("Ask a person one or more questions with options and written answers; wait for the answer.")
+        .arg(ArgSpec::option("--request", "SOURCE")
+            .sources(request_sources())
+            .about("Complete JSON request: context blocks and questions; accepts a whole file or stream"))
         .arg(ArgSpec::option("--question", "TEXT")
             .about("The question, displayed as plain text; its answer has question_id `question`"))
         .arg(ArgSpec::option("--options", "JSON").about(
-            "JSON array of 1–32 options: unique id, label, optional description, optional recommended",
+            "JSON array of 0–32 options: unique id, label, optional description, optional recommended",
         ))
         .arg(ArgSpec::flag("--multiple").about("Allow choosing several options"))
         .arg(
@@ -37,12 +39,20 @@ pub(super) fn ask_command() -> CommandSpec {
             "JSON array of 1–8 questions: unique id, question, options, optional multiple, optional allow_custom",
         ))
         .arg(ArgSpec::option("--context", "JSON").about(
-            "JSON array of background blocks shown above the questions: paragraph {text}, list {items}, or code {text}",
+            "JSON array of background blocks shown above the questions: paragraph/code/diff {text}, list {items}, image {path,title}, table {columns,rows}",
         ))
         .arg(UiDeliveryOffer::WithLink.arg("--mode"))
         .arg(ArgSpec::flag("--detach").about(
             "Return once the question is ready; collect the answer later with `afui ask wait`",
         ))
+        .combination(
+            Combination::new("ask-request")
+                .action("ask")
+                .about("Complete request from a value source")
+                .required(["request"])
+                .optional(["mode", "detach"])
+                .output(super::output()),
+        )
         .combination(
             Combination::new("ask")
                 .action("ask")
@@ -68,7 +78,7 @@ pub(super) fn wait_command() -> CommandSpec {
             ArgSpec::positional("session_id", 0, "SESSION_ID")
                 .about("Session identifier from the `ask_started` result"),
         )
-        .arg(ArgSpec::option_i64("--timeout-s", "SECONDS").about(
+        .arg(ArgSpec::option_i64("--timeout-s", "SECONDS").range(0, i64::MAX).about(
             "Stop waiting after this long and report `ask_pending`; the question stays open. Absent or `0` waits until it ends",
         ))
         .combination(
@@ -128,7 +138,26 @@ fn parse<T: serde::de::DeserializeOwned>(
         .transpose()
 }
 
+fn request_sources() -> SourceSet {
+    SourceSet::new([
+        SourceScheme::Env,
+        SourceScheme::File,
+        SourceScheme::Stdin,
+        SourceScheme::Fd,
+    ])
+}
+
 fn request(invocation: &ResolvedInvocation) -> Result<AskRequest, String> {
+    if let Some(source) = super::optional(invocation, "request") {
+        let text = request_sources()
+            .parse(&source)
+            .and_then(|source| source.read())
+            .map_err(|error| error.to_string())?;
+        let request: AskRequest =
+            serde_json::from_str(&text).map_err(|error| json_problem("--request", &error))?;
+        request.validate().map_err(|error| error.to_string())?;
+        return Ok(request);
+    }
     let context: Vec<AskBlock> = parse(invocation, "context", "--context")?.unwrap_or_default();
     let questions = match parse::<Vec<AskQuestion>>(invocation, "questions", "--questions")? {
         Some(questions) => questions,
@@ -168,8 +197,22 @@ pub(super) fn run(invocation: &ResolvedInvocation) -> ExitCode {
             );
         }
     };
+    // A `session` delivery is reached only through the registry, so without one
+    // the question would wait for an answer nobody can open.
+    if plan.mode() == agent_first_ui::UiDeliveryMode::Session
+        && agent_first_ui::registry_opted_out()
+    {
+        return super::emit_error(
+            "ask_delivery_invalid",
+            "--mode session needs the session registry; unset AFUI_NO_REGISTRY or use \
+             --mode window",
+            format,
+            output_to,
+            1,
+        );
+    }
     if super::flag(invocation, "detach") {
-        return detach(format, output_to);
+        return detach(&request, plan.mode(), format, output_to);
     }
     let detached = std::env::var_os(DETACHED_ENV).is_some();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -189,12 +232,19 @@ pub(super) fn run(invocation: &ResolvedInvocation) -> ExitCode {
     };
     let mut emitter = CliEmitter::from_output_to(output_to, format).with_strict_protocol();
     let mut session_id = None;
+    let mut pending_result = None;
     let outcome = runtime.block_on(async {
-        let active = request
-            .start(plan)
-            .await
-            .map_err(|error| error.to_string())?;
+        let active = request.start(plan).await.map_err(ask_error)?;
         session_id = Some(active.facts().session_id);
+        if detached {
+            let path = results_directory()
+                .map_err(|message| ("ask_failed".to_owned(), message))?
+                .join(format!("{}.pending", active.facts().session_id));
+            pending_result = Some(
+                PendingResult::new(path)
+                    .map_err(|error| ("ask_failed".to_owned(), error.to_string()))?,
+            );
+        }
         emitter
             .emit(
                 agent_first_data::json_progress(ready_event_revealing_link(
@@ -203,12 +253,8 @@ pub(super) fn run(invocation: &ResolvedInvocation) -> ExitCode {
                 ))
                 .build(),
             )
-            .map_err(|error| error.to_string())?;
-        active
-            .wait()
-            .await
-            .map(result)
-            .map_err(|error| error.to_string())
+            .map_err(|error| ("ask_failed".to_owned(), error.to_string()))?;
+        active.wait().await.map(result).map_err(ask_error)
     });
     if detached {
         // Nobody reads this process's output any more; the result file is
@@ -216,14 +262,15 @@ pub(super) fn run(invocation: &ResolvedInvocation) -> ExitCode {
         if let Some(id) = session_id {
             let record = match &outcome {
                 Ok(result) => json!({"result": result}),
-                Err(message) => json!({"error": {"code": "ask_failed", "message": message}}),
+                Err((code, message)) => json!({"error": {"code": code, "message": message}}),
             };
             let _unrecorded_is_reported_by_wait = store_result(&id, &record);
         }
     }
+    drop(pending_result);
     let (emitted, exit_code) = match outcome {
         Ok(result) => (emitter.emit_result(result), 0),
-        Err(message) => (emitter.emit_error("ask_failed", &message), 1),
+        Err((code, message)) => (emitter.emit_error(&code, &message), 1),
     };
     match emitted {
         Ok(()) => ExitCode::from(exit_code),
@@ -231,9 +278,18 @@ pub(super) fn run(invocation: &ResolvedInvocation) -> ExitCode {
     }
 }
 
-/// Re-run this same question in a background process and return once it is
-/// ready, so a caller whose commands time out never has to hold one open.
-fn detach(format: OutputFormat, output_to: OutputTo) -> ExitCode {
+/// Preserve the AFUI recovery category across both foreground and worker waits.
+fn ask_error(error: agent_first_ui::Error) -> (String, String) {
+    (format!("ask_{}", error.kind().as_str()), error.to_string())
+}
+
+/// Send the resolved request to a worker and wait for its readiness event.
+fn detach(
+    request: &AskRequest,
+    mode: agent_first_ui::UiDeliveryMode,
+    format: OutputFormat,
+    output_to: OutputTo,
+) -> ExitCode {
     let fail = |code: &str, message: &str| super::emit_error(code, message, format, output_to, 1);
     if agent_first_ui::registry_opted_out() {
         return fail(
@@ -246,10 +302,10 @@ fn detach(format: OutputFormat, output_to: OutputTo) -> ExitCode {
     };
     let mut command = Command::new(program);
     command
-        .args(background_args(std::env::args_os().skip(1)))
+        .args(["ask", "--request", "stdin", "--mode", mode.as_str()])
         .args(["--output", "json", "--output-to", "split"])
         .env(DETACHED_ENV, "1")
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     // Out of the caller's process group, so a caller that kills its command's
@@ -272,6 +328,19 @@ fn detach(format: OutputFormat, output_to: OutputTo) -> ExitCode {
             "could not start the background question",
         );
     };
+    let sent = child
+        .stdin
+        .take()
+        .ok_or(())
+        .and_then(|mut stdin| serde_json::to_writer(&mut stdin, request).map_err(|_| ()));
+    if sent.is_err() {
+        let _stopped = child.kill();
+        let _reaped = child.wait();
+        return fail(
+            "ask_detach_failed",
+            "could not send the request to the background question",
+        );
+    }
     let mut line = String::new();
     let read = child
         .stderr
@@ -313,30 +382,6 @@ fn detach(format: OutputFormat, output_to: OutputTo) -> ExitCode {
     }
 }
 
-/// The caller's own arguments, minus the ones the background run must not see.
-fn background_args(args: impl Iterator<Item = OsString>) -> Vec<OsString> {
-    let mut kept = Vec::new();
-    let mut skip_value = false;
-    for arg in args {
-        if std::mem::take(&mut skip_value) {
-            continue;
-        }
-        let text = arg.to_string_lossy();
-        if text == "--detach" {
-            continue;
-        }
-        if text == "--output" || text == "--output-to" {
-            skip_value = true;
-            continue;
-        }
-        if text.starts_with("--output=") || text.starts_with("--output-to=") {
-            continue;
-        }
-        kept.push(arg);
-    }
-    kept
-}
-
 fn results_directory() -> Result<PathBuf, String> {
     let directory = agent_first_ui::global_afui_root()
         .map_err(|error| error.to_string())?
@@ -362,11 +407,69 @@ fn store_result(session_id: &str, record: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Keep the detached owner observable until its ending is atomically handed off.
+/// The OS releases the lock on a crash, so an abandoned marker never waits forever.
+struct PendingResult {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl PendingResult {
+    fn new(path: PathBuf) -> std::io::Result<Self> {
+        let pending = Self {
+            file: std::fs::File::create_new(&path)?,
+            path,
+        };
+        pending.file.lock()?;
+        Ok(pending)
+    }
+}
+
+impl Drop for PendingResult {
+    fn drop(&mut self) {
+        let _removed = std::fs::remove_file(&self.path);
+    }
+}
+
+fn result_is_pending(path: &std::path::Path) -> std::io::Result<bool> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match file.try_lock_shared() {
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
 /// Read a stored ending once. Collecting it removes it.
-fn take_result(path: &std::path::Path) -> Option<Value> {
-    let bytes = std::fs::read(path).ok()?;
-    let _removed = std::fs::remove_file(path);
-    serde_json::from_slice(&bytes).ok()
+fn take_result(path: &std::path::Path) -> std::io::Result<Option<Value>> {
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let directory = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "answer path has no parent",
+        )
+    })?;
+    let claimed = tempfile::NamedTempFile::new_in(directory)?.into_temp_path();
+    // Only one collector can rename the result, even if several waiters read
+    // it at once. The private claim is removed on every return path.
+    match std::fs::rename(path, &claimed) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let bytes = std::fs::read(&claimed)?;
+    serde_json::from_slice(&bytes).map(Some).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the stored question result is unreadable",
+        )
+    })
 }
 
 fn emit_record(record: &Value, format: OutputFormat, output_to: OutputTo) -> ExitCode {
@@ -408,6 +511,7 @@ pub(super) fn run_wait(invocation: &ResolvedInvocation) -> ExitCode {
         Err(message) => return fail("ask_wait_failed", message),
     };
     let path = directory.join(format!("{session_id}.json"));
+    let pending_path = directory.join(format!("{session_id}.pending"));
     let timeout = invocation
         .optional("timeout_s")
         .and_then(CliValue::as_i64)
@@ -416,17 +520,25 @@ pub(super) fn run_wait(invocation: &ResolvedInvocation) -> ExitCode {
         .map(Duration::from_secs);
     let started = Instant::now();
     loop {
-        if let Some(record) = take_result(&path) {
-            return emit_record(&record, format, output_to);
+        match take_result(&path) {
+            Ok(Some(record)) => return emit_record(&record, format, output_to),
+            Ok(None) => {}
+            Err(error) => return fail("ask_wait_failed", error.to_string()),
         }
         let entry = match agent_first_ui::find_session(&session_id) {
             Ok(entry) => entry.filter(|e| e.provider_id == "afui" && e.ui_kind == "ask"),
             Err(error) => return fail("ask_wait_failed", error.to_string()),
         };
-        let Some(entry) = entry else {
+        let pending = match result_is_pending(&pending_path) {
+            Ok(pending) => pending,
+            Err(error) => return fail("ask_wait_failed", error.to_string()),
+        };
+        if entry.is_none() && !pending {
             // The question may have ended between the two reads.
-            if let Some(record) = take_result(&path) {
-                return emit_record(&record, format, output_to);
+            match take_result(&path) {
+                Ok(Some(record)) => return emit_record(&record, format, output_to),
+                Ok(None) => {}
+                Err(error) => return fail("ask_wait_failed", error.to_string()),
             }
             return fail(
                 "ask_not_found",
@@ -434,12 +546,15 @@ pub(super) fn run_wait(invocation: &ResolvedInvocation) -> ExitCode {
                     "no open question `{session_id}` and no stored answer; it was already collected, or its process ended"
                 ),
             );
-        };
+        }
         if timeout.is_some_and(|limit| started.elapsed() >= limit) {
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| since.as_millis());
-            let waiting_s = now_ms.saturating_sub(u128::from(entry.announced_at_epoch_ms)) / 1000;
+            let waiting_s = entry.map_or_else(
+                || started.elapsed().as_secs() as u128,
+                |entry| now_ms.saturating_sub(u128::from(entry.announced_at_epoch_ms)) / 1000,
+            );
             return super::emit_result(
                 json!({"code": "ask_pending", "session_id": session_id, "waiting_s": waiting_s}),
                 format,
@@ -454,6 +569,53 @@ pub(super) fn run_wait(invocation: &ResolvedInvocation) -> ExitCode {
 mod tests {
     use super::*;
     use agent_first_ui::ask::{AskAnswer, AskSelection};
+
+    #[test]
+    fn pending_results_require_a_live_lock_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("question.pending");
+        assert!(!result_is_pending(&path).unwrap());
+        let pending = PendingResult::new(path.clone()).unwrap();
+        assert!(result_is_pending(&path).unwrap());
+        drop(pending);
+        assert!(!result_is_pending(&path).unwrap());
+        let _abandoned = std::fs::File::create_new(&path).unwrap();
+        assert!(!result_is_pending(&path).unwrap());
+    }
+
+    #[test]
+    fn a_corrupt_result_is_an_error_without_echoing_its_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("question.json");
+        std::fs::write(&path, "TOPSECRET-invalid-json").unwrap();
+        let error = take_result(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!error.to_string().contains("TOPSECRET"));
+    }
+
+    #[test]
+    fn simultaneous_collectors_claim_an_answer_only_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("question.json");
+        std::fs::write(&path, r#"{"result":{"code":"ask_answered"}}"#).unwrap();
+        let ready = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            let collectors: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        ready.wait();
+                        take_result(&path)
+                    })
+                })
+                .collect();
+            ready.wait();
+            let collected = collectors
+                .into_iter()
+                .filter_map(|thread| thread.join().unwrap().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(collected, [json!({"result": {"code": "ask_answered"}})]);
+        });
+    }
 
     #[test]
     fn only_an_answered_question_carries_answers() {
@@ -477,27 +639,6 @@ mod tests {
         assert_eq!(result["code"], "ask_answered");
         assert_eq!(result["answers"][0]["selected"][0]["option_id"], "retry");
         assert_eq!(result["answers"][0]["selected"][0]["note"], "note");
-    }
-
-    #[test]
-    fn the_background_run_drops_detach_and_the_callers_output_choice() {
-        let args = [
-            "ask",
-            "--detach",
-            "--output",
-            "yaml",
-            "--question",
-            "--output",
-            "--output-to=stdout",
-            "--options",
-            "[]",
-        ]
-        .map(OsString::from);
-        let kept = background_args(args.into_iter());
-        assert_eq!(
-            kept,
-            ["ask", "--question", "--options", "[]"].map(OsString::from)
-        );
     }
 
     #[test]

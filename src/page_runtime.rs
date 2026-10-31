@@ -1,12 +1,10 @@
 //! The building material a Provider's page runtime is made of.
 //!
-//! Measured across the pages in this kit, roughly seven hundred lines were the
-//! same work done again: deriving the session root, maintaining the typed AFUI
-//! runtime across reconnects, correlating calls, replacing retained state,
+//! Every page that talks to a live session has to do the same work: deriving
+//! the session root, maintaining the typed AFUI runtime across reconnects, correlating calls, replacing retained state,
 //! replaying ordered events, writing an aria-live region, disabling controls
-//! while something is in flight, debouncing a save around a base hash,
-//! surviving a reload through `location.hash`, and warning before leaving with
-//! an unsaved edit.
+//! while something is in flight, debouncing a save around a base hash, and
+//! warning before leaving with an unsaved edit.
 //!
 //! None of that is page behaviour. It is what page behaviour is written *in*,
 //! and the boundary is unchanged by moving it here: a frontend still cannot

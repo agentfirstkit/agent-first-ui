@@ -6,8 +6,10 @@
     cancel: '取消', submit: '提交回答', connecting: '正在连接…',
     live: '请选择，或写下你自己的回答。', closedChoice: '请选择。',
     reconnecting: '连接已断开，正在重连；草稿会保留。',
-    closed: '会话已结束。', sending: '正在提交…', finished: '已提交。',
+    closed: '会话已结束。', sending: '正在提交…', finished: '已提交。', cancelled: '已取消。',
     empty: '每个问题都需要选择一项，或写下你的回答。', tooLong: '文字不能超过 16384 字节。',
+    loadFailed: '无法加载问题，正在重试…',
+    invalidOption: '请从给出的选项中选择。', customDisabled: '这个问题不能填写自己的回答。',
     failed: '提交失败，请重试。'
   } : {
     title: 'Answer', custom: 'Write your own answer', answer: 'Your answer',
@@ -15,9 +17,12 @@
     cancel: 'Cancel', submit: 'Submit answer', connecting: 'Connecting…',
     live: 'Choose, or write your own answer.', closedChoice: 'Choose an option.',
     reconnecting: 'Reconnecting; your draft is preserved.',
-    closed: 'This session has ended.', sending: 'Submitting…', finished: 'Submitted.',
+    closed: 'This session has ended.', sending: 'Submitting…', finished: 'Submitted.', cancelled: 'Cancelled.',
     empty: 'Answer every question: choose an option or write an answer.',
     tooLong: 'Text must be at most 16384 bytes.',
+    loadFailed: 'Could not load the question. Retrying…',
+    invalidOption: 'Choose among the offered options.',
+    customDisabled: 'This question does not take a written answer.',
     failed: 'Could not submit. Please try again.'
   };
   document.documentElement.lang = zh ? 'zh-CN' : 'en';
@@ -30,6 +35,7 @@
   byId('title').textContent = words.title;
   submit.textContent = words.submit;
   cancel.textContent = words.cancel;
+  let pendingState = null, loading = false;
   let request = null, questions = [], connectionState = 'connecting', pending = false, finished = false;
   const frame = afui.frame({ onHead(head) { byId('heading').hidden = head; } });
 
@@ -51,6 +57,34 @@
       } else if (block.type === 'code') {
         const pre = element('pre');
         pre.appendChild(element('code', '', block.text));
+        contextSection.appendChild(pre);
+      } else if (block.type === 'image') {
+        const figure = element('figure');
+        const image = element('img');
+        image.src = block.blob.blob_url; image.alt = block.title;
+        figure.append(image, element('figcaption', '', block.title));
+        contextSection.appendChild(figure);
+      } else if (block.type === 'table') {
+        const wrap = element('div', 'table-scroll');
+        wrap.tabIndex = 0;
+        const table = element('table'), head = element('thead'), headings = element('tr');
+        for (const column of block.columns) {
+          const cell = element('th', '', column); cell.scope = 'col'; headings.appendChild(cell);
+        }
+        head.appendChild(headings); table.appendChild(head);
+        const body = element('tbody');
+        for (const row of block.rows) {
+          const tr = element('tr');
+          for (const value of row) tr.appendChild(element('td', '', value));
+          body.appendChild(tr);
+        }
+        table.appendChild(body); wrap.appendChild(table); contextSection.appendChild(wrap);
+      } else if (block.type === 'diff') {
+        const pre = element('pre', 'diff');
+        for (const line of block.text.split('\n')) {
+          const kind = line.startsWith('@@') ? 'hunk' : line.startsWith('+') ? 'added' : line.startsWith('-') ? 'removed' : '';
+          pre.appendChild(element('span', kind, line + '\n'));
+        }
         contextSection.appendChild(pre);
       }
     }
@@ -105,7 +139,11 @@
       box.classList.add('custom');
       // Like a note, the box appears only once its card is chosen.
       const text = element('textarea', 'answer-text');
-      text.rows = 1; text.maxLength = 16384; text.hidden = true;
+      const textOnly = spec.options.length === 0;
+      box.classList.toggle('text-only', textOnly);
+      input.checked = textOnly; input.hidden = textOnly;
+      if (textOnly) box.querySelector('.choice-head').hidden = true;
+      text.rows = textOnly ? 3 : 1; text.maxLength = 16384; text.hidden = !textOnly;
       text.placeholder = words.answer;
       text.setAttribute('aria-label', words.answer);
       text.addEventListener('input', update);
@@ -152,14 +190,37 @@
     submit.disabled = !available || !questions.every(answered);
   }
 
-  function showRequest(state) {
+  async function showRequest(state) {
     // Opening state is repeated on reconnect. Keeping the nodes keeps the draft.
+    pendingState = state;
+    if (request || loading) return;
+    if (state.request_url) {
+      loading = true;
+      try {
+        const response = await fetch(state.request_url);
+        if (!response.ok) throw new Error(String(response.status));
+        state = await response.json();
+      } catch (_) {
+        status.set(words.loadFailed, 'error');
+        setTimeout(() => { if (!request && !finished && connectionState !== 'closed') showRequest(pendingState); }, 1000);
+        return;
+      } finally {
+        loading = false;
+      }
+    }
     if (request) return;
     request = state;
+    status.set('');
     showContext(state.context || []);
     questions = state.questions.map(showQuestion);
     frame.title(state.questions[0].question);
     update();
+    // A request fetched by URL can arrive after the connection went live, and
+    // the guidance written then did not yet know whether writing is allowed.
+    if (connectionState === 'live') {
+      byId('connection').textContent = guidance();
+      frame.status(byId('connection').textContent, connectionState);
+    }
   }
 
   function guidance() {
@@ -178,15 +239,31 @@
   });
   form.addEventListener('change', update);
 
-  async function send(action) {
+  /* The server's reasons are English; the page speaks the person's language,
+   * so a known reason is said in its words and anything else as a plain
+   * failure. */
+  function failureWords(error) {
+    switch (error && error.code) {
+      case 'ask_text_invalid': return words.tooLong;
+      case 'ask_answer_missing': return words.empty;
+      case 'ask_option_invalid':
+      case 'ask_question_invalid': return words.invalidOption;
+      case 'ask_custom_disabled': return words.customDisabled;
+      case 'ui_runtime_closed':
+      case 'ui_call_cancelled': return words.closed;
+      default: return words.failed;
+    }
+  }
+
+  async function send(action, done) {
     if (pending || finished || connectionState !== 'live') return;
     pending = true; update(); status.set(words.sending);
     try {
       await client.call(action);
       finished = true;
-      status.set(words.finished);
+      status.set(done);
     } catch (error) {
-      status.set(error && error.message ? error.message : words.failed, 'error');
+      status.set(failureWords(error), 'error');
     } finally {
       pending = false; update();
     }
@@ -209,7 +286,7 @@
       }
       answers.push({ question_id: question.spec.id, choices, text: ownWords(text) });
     }
-    send({ type: 'submit', answers });
+    send({ type: 'submit', answers }, words.finished);
   });
-  cancel.addEventListener('click', () => send({ type: 'cancel' }));
+  cancel.addEventListener('click', () => send({ type: 'cancel' }, words.cancelled));
 })();

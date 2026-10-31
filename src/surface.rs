@@ -2,14 +2,13 @@
 //!
 //! Everything under this crate composes: a page, a policy, a session, a
 //! delivery, the facts to report, the outcome to wait for. Composing them is
-//! nine steps, and every Provider here wrote the same nine — resolve a
-//! stylesheet, build a router, construct a session, attach a subject and an
-//! icon and a policy, start the delivery, read the facts, wait, and turn the
-//! outcome into whatever it says next.
+//! the same sequence for any page of this shape — resolve a stylesheet, build
+//! a router, construct a session, attach a subject and an icon and a policy,
+//! start the delivery, read the facts, wait, and turn the outcome into
+//! whatever it says next.
 //!
-//! Measured on the thinnest watch panel in this kit, that came to a hundred
-//! lines of which about eighty had nothing to do with the panel. This is those
-//! eighty.
+//! For a thin page, such as a panel that only watches, that sequence is most
+//! of the code and none of it is about the panel. This is that sequence.
 //!
 //! It is deliberately the *last* layer, not the first. Everything it does is
 //! reachable directly, and a Provider whose page does not fit this shape should

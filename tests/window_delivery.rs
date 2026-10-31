@@ -36,20 +36,23 @@ fn write_script(path: &Path, body: &str) -> io::Result<PathBuf> {
 /// Exiting is what a person closing the window looks like to AFUI, so this
 /// exercises the `Outcome::Closed` path as well as the serving path.
 fn stub_browser(script_dir: &Path, capture: &Path) -> io::Result<PathBuf> {
-    // AFUI passes the URL inside `--app=<url>`, exactly as Chromium expects it.
+    // AFUI launches `--app=file://…` on a private page that moves on to the
+    // session URL, so the credential never appears in the browser's arguments.
     let body = format!(
         r#"#!/bin/sh
 for arg in "$@"; do
   case "$arg" in
-    --app=*) url="${{arg#--app=}}" ;;
+    --app=file://*) url="$(sed -n 's/.*location\.replace("\(.*\)");.*/\1/p' "${{arg#--app=file://}}")" ;;
+    --app=*) printf 'credential in arguments\n' > "{capture}"; exit 1 ;;
   esac
 done
-noslash="${{url%/}}"
+base="${{url%%\?*}}"
+noslash="${{base%/}}"
 origin="${{noslash%/*}}"
 {{
   printf 'URL %s\n' "$url"
   printf 'advertised %s\n' "$(curl -sS -o /dev/null -w '%{{http_code}}' "$url")"
-  printf 'asset %s\n' "$(curl -sS -o /dev/null -w '%{{http_code}}' "${{url}}style.css")"
+  printf 'asset %s\n' "$(curl -sS -o /dev/null -w '%{{http_code}}' "${{base}}style.css")"
   printf 'wrong_credential %s\n' "$(curl -sS -o /dev/null -w '%{{http_code}}' \
     "$origin/0000000000000000000000000000000000000000000000000000000000000000/")"
   printf 'body %s\n' "$(curl -sS "$url")"
@@ -132,4 +135,49 @@ async fn a_window_session_survives_longer_than_the_old_fixed_ttl() {
             .is_err(),
         "a window session ended on its own while the window was still open"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn window_exit_failure_and_unreached_page_are_distinct_errors() {
+    for (binary, kind) in [
+        (
+            "/usr/bin/false",
+            agent_first_ui::UiErrorKind::WindowWaitFailed,
+        ),
+        (
+            "/usr/bin/true",
+            agent_first_ui::UiErrorKind::WindowUnavailable,
+        ),
+    ] {
+        let session = UiSession::<()>::new("reviewer", "panel").unwrap();
+        let error = session
+            .window(
+                panel_router(),
+                &UiWindowConfig::default().with_browser_binary(binary),
+            )
+            .await
+            .expect_err("unusable window must be an error");
+        assert_eq!(error.kind(), kind);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unmarked_page_request_is_not_window_arrival() {
+    let directory = tempfile::tempdir().unwrap();
+    let browser = write_script(&directory.path().join("unmarked.sh"), r#"#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in --app=file://*) url="$(sed -n 's/.*location\.replace("\(.*\)");.*/\1/p' "${arg#--app=file://}")"; url="${url%%\?*}"; curl -fsS "$url" >/dev/null || exit 1 ;; esac
+done
+"#).unwrap();
+    let error = UiSession::<()>::new("reviewer", "panel")
+        .unwrap()
+        .window(
+            panel_router(),
+            &UiWindowConfig::default().with_browser_binary(browser),
+        )
+        .await
+        .expect_err("only the launch-marked request counts");
+    assert_eq!(error.kind(), agent_first_ui::UiErrorKind::WindowUnavailable);
 }

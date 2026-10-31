@@ -26,3 +26,16 @@ legend, .choice, #status { overflow-wrap: anywhere; white-space: pre-wrap; }
 .actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 12px; }
 button { min-height: 44px; padding: 10px 20px; border: 1px solid var(--afui-line); border-radius: var(--afui-radius); background: var(--afui-panel); cursor: pointer; }
 #submit { background: var(--afui-accent); color: var(--afui-accent-ink); border-color: var(--afui-accent); }
+
+#context figure { margin: 1rem 0; }
+#context img { display: block; max-width: 100%; max-height: 60vh; object-fit: contain; }
+#context figcaption { margin-top: .4rem; font-weight: 600; }
+.table-scroll { max-width: 100%; overflow-x: auto; }
+#context table { border-collapse: collapse; min-width: 100%; }
+#context th, #context td { padding: .5rem; border: 1px solid var(--afui-line); text-align: start; white-space: pre-wrap; }
+.diff span { display: block; min-height: 1em; white-space: pre; }
+.diff .added { background: light-dark(#e6ffed, #173923); }
+.diff .removed { background: light-dark(#ffeef0, #481f26); }
+.diff .hunk { color: var(--afui-accent); }
+
+.choice.text-only textarea { width: calc(100% - 28px); margin: 14px; }

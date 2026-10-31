@@ -1,7 +1,8 @@
 [package]
 name = "agent-first-ui"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
+rust-version = "1.98"
 description = "Let your AI agent hand you a real interface when a step needs a person — a window opens, values can stay live in both directions, and the session ends with one typed outcome."
 license = "MIT"
 repository = "https://github.com/agentfirstkit/agent-first-ui"
@@ -46,6 +47,8 @@ session = [
     "cli",
     "dep:agent-first-data",
     "dep:axum",
+    "dep:cap-fs-ext",
+    "dep:cap-std",
     "dep:getrandom",
     "dep:hex",
     "dep:hyper",
@@ -85,8 +88,8 @@ page = ["dep:minijinja"]
 # default set and never in a release binary — a consumer adds it under
 # `[dev-dependencies]`.
 #
-# It exists because the alternative was each consumer reimplementing AFUI's
-# trust fingerprint or its WebSocket envelope. Both agree with AFUI right up
+# It exists because a test that reimplements AFUI's trust fingerprint or its
+# WebSocket envelope holds a copy of AFUI internals. Such a copy agrees with AFUI right up
 # until AFUI changes, then fail a domain test for a reason that test is not
 # about.
 test-support = [
@@ -110,12 +113,17 @@ required-features = ["session"]
 
 [dependencies]
 # The CLI's argument parsing, event stream and skill installer. Only the binary
-# uses it, and the binary is a `session` build.
-agent-first-data = { version = "0.35.0", default-features = false, features = ["cli", "skill-admin"], optional = true }
+# uses it, and the binary is a `session` build. `yaml` and `toml` because a
+# `file+FORMAT:` value source is part of the CLI contract: a build that refused
+# `file+toml:` for want of a parser would make the source a lottery. The YAML
+# parser already arrives with `skill-admin`.
+agent-first-data = { version = "0.36.0", default-features = false, features = ["cli", "skill-admin", "yaml", "toml"], optional = true }
 # A `provider_id` and a `ui_kind` are path segments in a frontend directory
 # before they are anything else, so the grammar is checked in the guard tier.
 agent-first-slug = { version = "0.8.0", default-features = false }
 axum = { version = "0.8", features = ["ws"], optional = true }
+cap-fs-ext = { version = "4.0.3", optional = true }
+cap-std = { version = "4.0.3", optional = true }
 blake3 = "1"
 dirs = "7"
 getrandom = { version = "0.4", optional = true }
@@ -128,8 +136,8 @@ futures-util = { version = "0.3", default-features = false, optional = true }
 hyper = { version = "1", features = ["client", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 # The shell page is a template, not a Rust string, because a person has to be
-# able to replace it — the same engine every Provider page in this kit uses
-# rather than a second one for this crate's own page.
+# able to replace it — the same engine a Provider page is rendered with, so a
+# frontend override for this crate's own page is written the same way.
 minijinja = { version = "3", features = ["serde"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

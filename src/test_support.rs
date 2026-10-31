@@ -793,7 +793,8 @@ impl FrontendOnDisk {
     }
 }
 
-/// The global attention policy, written where AFUI reads it.
+/// Writes the idle and grace periods you pass as the global attention policy,
+/// where AFUI reads it.
 ///
 /// Reads `AFUI_CONFIG_DIR`. A test that wants a Link to lapse in a second
 /// writes it here rather than waiting fifteen minutes for the default.
@@ -817,26 +818,61 @@ pub fn write_attention_config(idle_timeout: Duration, grace_period: Duration) ->
     Ok(path)
 }
 
-/// A browser that records the URL it was told to open and does not open it.
+/// A browser that records the session URL it was told to open and does not
+/// open it.
 ///
-/// Every spore testing window delivery wrote one of these, and each wrote a
-/// slightly different script. Returns the path to point `AFUI_BROWSER_BINARY`
-/// at; the URL lands in `record_at`, one line per launch.
+/// Any test of window delivery needs one, and the script is easy to get
+/// subtly wrong per platform. Returns the path to point `AFUI_BROWSER_BINARY`
+/// at; the arguments land in `record_at`, one line per launch.
 ///
-/// On Unix this is a shell script; on Windows a batch file. A test asserting
-/// on the recorded URL does not have to know which.
+/// AFUI launches a window on a private page that moves on to the session URL,
+/// so the credential is never in the browser's arguments. The stub reads that
+/// page and records `--app=<the session URL>` in its place, which is what a
+/// test asserting on the URL means.
+///
+/// On Unix this is a shell script; on Windows a batch file that runs a
+/// PowerShell script beside it. A test asserting on the recorded URL does not
+/// have to know which.
 pub fn stub_browser(directory: &Path, record_at: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(directory).map_err(Error::Io)?;
     let record = record_at.display().to_string();
     #[cfg(windows)]
-    let (name, script) = (
-        "stub-browser.bat",
-        format!("@echo off\r\necho %*>>\"{record}\"\r\n"),
-    );
+    let (name, script) = {
+        let resolver = directory.join("stub-browser.ps1");
+        std::fs::write(
+            &resolver,
+            format!(
+                "$out = foreach ($arg in $args) {{\r\n\
+                 if ($arg -like '--app=file:*') {{\r\n\
+                 $page = [Uri]::new($arg.Substring(6)).LocalPath\r\n\
+                 $match = [regex]::Match((Get-Content -Raw $page), 'location\\.replace\\(\"(.*)\"\\);')\r\n\
+                 '--app=' + ($match.Groups[1].Value -replace '\\\\u003c', '<')\r\n\
+                 }} else {{ $arg }}\r\n\
+                 }}\r\n\
+                 Add-Content -LiteralPath '{record}' -Value ($out -join ' ')\r\n"
+            ),
+        )
+        .map_err(Error::Io)?;
+        (
+            "stub-browser.bat",
+            "@powershell -NoProfile -ExecutionPolicy Bypass -File \"%~dp0stub-browser.ps1\" %*\r\n"
+                .to_owned(),
+        )
+    };
     #[cfg(not(windows))]
     let (name, script) = (
         "stub-browser.sh",
-        format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{record}'\n"),
+        format!(
+            "#!/bin/sh\n\
+             line=''\n\
+             for arg in \"$@\"; do\n\
+             case \"$arg\" in\n\
+             --app=file://*) arg=\"--app=$(sed -n 's/.*location\\.replace(\"\\(.*\\)\");.*/\\1/p' \"${{arg#--app=file://}}\" | sed 's/\\\\u003c/</g')\" ;;\n\
+             esac\n\
+             line=\"$line${{line:+ }}$arg\"\n\
+             done\n\
+             printf '%s\\n' \"$line\" >> '{record}'\n"
+        ),
     );
     let path = directory.join(name);
     std::fs::write(&path, script).map_err(Error::Io)?;

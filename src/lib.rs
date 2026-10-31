@@ -5,7 +5,8 @@
 //! completed result.
 
 mod app_icon;
-/// AFUI's standard single-question page: choose an option or write an answer.
+/// AFUI's standard question page: one or more questions, each answered by
+/// choosing options or writing an answer, with optional context blocks.
 #[cfg(feature = "session")]
 pub mod ask;
 /// Which of the three ways a session reaches a person. The word list is a
@@ -40,27 +41,23 @@ mod page_style;
 /// same constants.
 mod reserved;
 
-/// Handing a UI to a person costs a server; keeping one honest does not.
-///
-/// Everything under `session` binds a port, mints a credential, or launches a
-/// browser, and that is where axum and tokio come from. The guard and the
-/// frontend overlay above need neither, so a Provider that only has templates
-/// to check — in a build with its human UI compiled out — takes this
-/// crate without them.
+// Handing a UI to a person costs a server; keeping one honest does not.
+//
+// Everything under `session` binds a port, mints a credential, or launches a
+// browser, and that is where axum and tokio come from. The guard and the
+// frontend overlay above need neither, so a Provider that only has templates
+// to check — in a build with its human UI compiled out — takes this
+// crate without them.
 #[cfg(feature = "session")]
 mod access_token;
 /// Declaring the delivery flag, reading it back, and getting the readiness
-/// facts into an event. The half of handing over a UI that happens on the
-/// command line, and the one every Provider had written for itself.
+/// facts into an event: the half of handing over a UI that happens on the
+/// command line, so a Provider's flags and readiness events read the same as
+/// every other's.
 #[cfg(feature = "cli")]
 pub mod cli;
-/// Assembling a frontend's templates into a page: the escaping policy, the
-/// render, the rendered-markup guard, and the element/runtime-marker
-/// contract check. Orthogonal to `session` — it renders and checks a page,
-/// it does not bind a port, so a build with a frontend but no server still
-/// gets it.
-/// Generating a Provider's decide-page runtime: the rules every decide page
-/// in this kit needs and every one of them was writing again. Behind `page`
+/// Generating a Provider's decide-page runtime: the rules any page that asks a
+/// person to decide needs, so a page does not write them again. Behind `page`
 /// because it produces source a page splices in, and needs no server to do it.
 #[cfg(feature = "page")]
 mod decision;
@@ -71,6 +68,11 @@ mod host;
 /// Provider's, because the endpoint it renews against is the Provider's.
 #[cfg(feature = "session")]
 mod lease;
+/// Assembling a frontend's templates into a page: the escaping policy, the
+/// render, the rendered-markup guard, and the element/runtime-marker
+/// contract check. Orthogonal to `session` — it renders and checks a page,
+/// it does not bind a port, so a build with a frontend but no server still
+/// gets it.
 #[cfg(feature = "page")]
 mod page;
 /// The building material for custom pages and AFUI's standard question page.
@@ -96,8 +98,8 @@ mod serve;
 mod serving;
 #[cfg(feature = "session")]
 mod session;
-/// One rendered page, handed to a person, waited on: the nine composition
-/// steps every Provider here wrote for itself. Deliberately the last layer —
+/// One rendered page, handed to a person, waited on: resolve, render, policy,
+/// routes, attach, deliver and wait in one call. Deliberately the last layer —
 /// everything it does is reachable directly, and a page that does not fit this
 /// shape should use the pieces instead of bending to it.
 #[cfg(feature = "session")]

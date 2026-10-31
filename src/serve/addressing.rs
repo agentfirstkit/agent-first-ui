@@ -1,6 +1,6 @@
 //! Where a session is reached, and what it is called there.
 //!
-//! Two shapes, and every string question either of them asks: a path under this
+//! Both shapes, and every string question either of them asks: a path under this
 //! listener's own origin, or a name one label under it. The awkward parts are
 //! here rather than spread through the listener — that a credential has to be
 //! spelled in base32 to fit a DNS label, that a spelling which is not the only

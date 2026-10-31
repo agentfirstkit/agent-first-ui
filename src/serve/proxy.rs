@@ -1,6 +1,6 @@
 //! Reverse-proxy one Provider UI, without learning anything about it.
 //!
-//! Four rules shape this file, and each of them is a rule about what does
+//! These rules shape this file, and each of them is a rule about what does
 //! *not* cross.
 //!
 //! **Nothing of the listener's goes up.** Request headers are copied by
@@ -41,8 +41,8 @@ use axum::extract::Request;
 use axum::http::header::{
     ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_SECURITY_POLICY,
     CONTENT_TYPE, COOKIE, HOST, HeaderName, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH,
-    LOCATION, ORIGIN, RANGE, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL,
-    SEC_WEBSOCKET_VERSION, SET_COOKIE, UPGRADE, USER_AGENT, VARY,
+    LOCATION, ORIGIN, RANGE, REFERRER_POLICY, SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_KEY,
+    SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_VERSION, SET_COOKIE, UPGRADE, USER_AGENT, VARY,
 };
 use axum::http::{HeaderMap, Method, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
@@ -124,9 +124,10 @@ static FORWARDED_UPGRADE_HEADERS: [HeaderName; 4] = [
 
 /// Response headers this listener answers for, so the Provider's own values are
 /// dropped rather than passed on.
-static REWRITTEN_RESPONSE_HEADERS: [HeaderName; 6] = [
-    // Rewritten: the Provider says `frame-ancestors 'none'`, which is right for
-    // a window and wrong for a page that is nothing but frames.
+static REWRITTEN_RESPONSE_HEADERS: [HeaderName; 8] = [
+    // Rewritten when the Provider sent one: it says `frame-ancestors 'none'`,
+    // which is right for a window and wrong for a page that is nothing but
+    // frames. AFUI's sandbox goes out as a policy of its own beside it.
     CONTENT_SECURITY_POLICY,
     CONTENT_SECURITY_POLICY_REPORT_ONLY,
     // Kept, not passed on: where every proxied UI shares one origin, a cookie
@@ -140,6 +141,13 @@ static REWRITTEN_RESPONSE_HEADERS: [HeaderName; 6] = [
     // Answered here, from the request that arrived.
     ACCESS_CONTROL_ALLOW_ORIGIN,
     VARY,
+    // Always `no-referrer`: in per-session mode the session's own origin is
+    // `s-<credential>.<host>`, and a Provider page that loads a third-party
+    // script would otherwise tell that third party its name.
+    REFERRER_POLICY,
+    // Dropped: it widens a service worker's scope past the path it was served
+    // from, and on a path that would be every session on this origin.
+    HeaderName::from_static("service-worker-allowed"),
 ];
 
 /// Connection-level headers, which belong to one hop and not the next.
@@ -190,9 +198,31 @@ impl Framing<'_> {
     fn frame_ancestors(&self) -> Cow<'static, str> {
         match self {
             Self::Path { .. } => Cow::Borrowed("'self'"),
+            // `'self'` too: a Provider UI that frames its own pages is their
+            // ancestor, and on its own origin that is this session and nothing
+            // else.
             Self::Origin { shell_authority } => Cow::Owned(format!(
-                "http://{shell_authority} https://{shell_authority}"
+                "'self' http://{shell_authority} https://{shell_authority}"
             )),
+        }
+    }
+
+    /// The sandbox a proxied response carries itself, when the frame's
+    /// `sandbox` attribute is not enough.
+    ///
+    /// On a path the attribute is the only thing keeping the UI off the page's
+    /// own origin, and an attribute stays behind when someone opens the frame's
+    /// URL as a page. Said in the response too, the same flags hold either way.
+    /// It is a policy of its own rather than a directive in the Provider's, so
+    /// that a `sandbox` the Provider wrote can narrow it but never widen it:
+    /// a browser enforces every policy it is given. A session on its own
+    /// origin is already kept apart by that origin.
+    fn sandbox(&self) -> Option<&'static str> {
+        match self {
+            Self::Path { .. } => Some(
+                "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox",
+            ),
+            Self::Origin { .. } => None,
         }
     }
 }
@@ -487,8 +517,8 @@ impl Upstream {
 
 /// Pass one request to a Provider UI and stream its answer back.
 ///
-/// `framing` is where the browser reaches this session, and it is here for two
-/// reasons. A Provider that redirects names its own address, and its own
+/// `framing` is where the browser reaches this session, which both redirects
+/// and framing depend on. A Provider that redirects names its own address, and its own
 /// address contains its own credential: sending that to the browser would both
 /// hand out a credential that never leaves this process and point a phone at a
 /// loopback port that, on a phone, is the phone. And a Provider that says
@@ -503,6 +533,9 @@ pub(super) async fn forward(
     mut request: Request,
 ) -> Response<Body> {
     let upstream = &proxied.upstream;
+    if has_dot_segment(remainder) {
+        return super::not_found();
+    }
     if !origin_allowed(request.headers()) {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -599,17 +632,10 @@ pub(super) async fn forward(
     for directive in response.headers().get_all(SET_COOKIE) {
         proxied.cookies.store(directive);
     }
-    let ancestors = framing.frame_ancestors();
     if response.status() == StatusCode::SWITCHING_PROTOCOLS
         && let Some(downstream) = downstream
     {
-        return splice(
-            &mut response,
-            downstream,
-            &ancestors,
-            unavailable,
-            connection,
-        );
+        return splice(&mut response, downstream, framing, unavailable, connection);
     }
     let (parts, incoming) = response.into_parts();
     // `Body::new` wraps rather than reads: the frames the Provider produces are
@@ -620,7 +646,7 @@ pub(super) async fn forward(
         connection: Some(connection),
     }));
     *response.status_mut() = parts.status;
-    copy_response_headers(&parts.headers, response.headers_mut(), &ancestors);
+    copy_response_headers(&parts.headers, response.headers_mut(), framing);
     relocate(response.headers_mut(), upstream, framing.mounted_at());
     allow_reading(response.headers_mut(), origin.as_ref());
     response
@@ -652,7 +678,7 @@ fn upgrade_requested(headers: &HeaderMap) -> Option<HeaderValue> {
 fn splice(
     response: &mut hyper::Response<hyper::body::Incoming>,
     downstream: OnUpgrade,
-    ancestors: &str,
+    framing: Framing<'_>,
     mut unavailable: Unavailable,
     connection: ConnectionTask,
 ) -> Response<Body> {
@@ -678,7 +704,7 @@ fn splice(
     let headers = switching.headers_mut();
     // `Sec-WebSocket-Accept` is among these: it is the Provider's answer to the
     // client's own key, and the client is the one that checks it.
-    copy_response_headers(response.headers(), headers, ancestors);
+    copy_response_headers(response.headers(), headers, framing);
     // Dropped as hop-by-hop on the way through, and this is the hop they
     // describe, so they are written rather than copied.
     headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
@@ -694,23 +720,91 @@ fn splice(
 /// base path. Rewritten, it names this listener and the proxy path instead; a
 /// `Location` that points somewhere else entirely is left alone, because a
 /// Provider sending someone off its own site is not this proxy's business.
+///
+/// A redirect that stays on the session also loses the announced query. A
+/// panel that keeps `?handoff_secret=…` on a trailing-slash redirect would
+/// otherwise put that credential in the browser's address bar and history, and
+/// [`Upstream::target`] adds it back on the next request anyway.
 fn relocate(headers: &mut HeaderMap, upstream: &Upstream, mounted_at: &str) {
     let Some(location) = headers.get(LOCATION).and_then(|value| value.to_str().ok()) else {
         return;
     };
     let absolute = format!("http://{}{}", upstream.authority, upstream.base_path);
-    let rewritten = if let Some(rest) = location.strip_prefix(&absolute) {
-        format!("{mounted_at}{}", rest.trim_start_matches('/'))
-    } else if let Some(rest) = location.strip_prefix(&upstream.base_path)
-        && (rest.is_empty() || rest.starts_with('/'))
-    {
-        format!("{mounted_at}{}", rest.trim_start_matches('/'))
-    } else {
-        return;
+    let rest = location.strip_prefix(&absolute).or_else(|| {
+        // A network-path reference names another authority, even when this
+        // upstream's base path is empty and would match every string.
+        if location.starts_with('/') && !location.starts_with("//") {
+            location.strip_prefix(&upstream.base_path)
+        } else {
+            None
+        }
+    });
+    let rewritten = match rest.filter(|rest| rest.is_empty() || rest.starts_with(['/', '?', '#'])) {
+        Some(rest) => format!("{mounted_at}{}", rest.strip_prefix('/').unwrap_or(rest)),
+        // Resolved against the address the browser is already at, which is
+        // this session's.
+        None if !names_an_authority(location) => location.to_owned(),
+        None => return,
+    };
+    let rewritten = match &upstream.base_query {
+        Some(base) => without_parameters(&rewritten, base),
+        None => rewritten,
     };
     if let Ok(value) = HeaderValue::from_str(&rewritten) {
         headers.insert(LOCATION, value);
     }
+}
+
+/// Whether a path climbs out of where it was mounted.
+///
+/// A browser resolves `.` and `..` before it asks, so only a hand-written
+/// request carries one — and an upstream that resolves it after this proxy
+/// joined the path onto its base would answer a path outside that base, with
+/// the session's announced query attached.
+fn has_dot_segment(path: &str) -> bool {
+    path.split(['/', '\\']).any(|segment| {
+        let segment = segment.to_ascii_lowercase().replace("%2e", ".");
+        segment == "." || segment == ".."
+    })
+}
+
+/// Whether a URL reference names a host of its own: `scheme:` or `//host`.
+fn names_an_authority(reference: &str) -> bool {
+    if reference.starts_with("//") {
+        return true;
+    }
+    reference.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.starts_with(|first: char| first.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
+}
+
+/// `reference` without any query parameter `announced` carries.
+fn without_parameters(reference: &str, announced: &str) -> String {
+    let (before_fragment, fragment) = match reference.split_once('#') {
+        Some((before, fragment)) => (before, Some(fragment)),
+        None => (reference, None),
+    };
+    let Some((path, query)) = before_fragment.split_once('?') else {
+        return reference.to_owned();
+    };
+    let announced: Vec<&str> = announced.split('&').collect();
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty() && !announced.contains(pair))
+        .collect();
+    let mut out = path.to_owned();
+    if !kept.is_empty() {
+        out.push('?');
+        out.push_str(&kept.join("&"));
+    }
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    out
 }
 
 /// Who may talk to a proxied UI at all.
@@ -772,7 +866,7 @@ fn allow_reading(headers: &mut HeaderMap, origin: Option<&HeaderValue>) {
     }
 }
 
-fn copy_response_headers(from: &HeaderMap, to: &mut HeaderMap, ancestors: &str) {
+fn copy_response_headers(from: &HeaderMap, to: &mut HeaderMap, framing: Framing<'_>) {
     for (name, value) in from {
         if REWRITTEN_RESPONSE_HEADERS.contains(name) || HOP_BY_HOP_HEADERS.contains(name) {
             continue;
@@ -785,14 +879,40 @@ fn copy_response_headers(from: &HeaderMap, to: &mut HeaderMap, ancestors: &str) 
         }
         to.append(name, value.clone());
     }
-    if let Some(policy) = from
-        .get(CONTENT_SECURITY_POLICY)
-        .and_then(|value| value.to_str().ok())
-        .map(|policy| framed_policy(policy, ancestors))
-        .and_then(|policy| HeaderValue::from_str(&policy).ok())
-    {
-        to.insert(CONTENT_SECURITY_POLICY, policy);
+    // Every policy the Provider sent, each rewritten on its own: a browser
+    // enforces all of them, so dropping any would loosen the page.
+    let mut provider_policies: Vec<String> = from
+        .get_all(CONTENT_SECURITY_POLICY)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .collect();
+    // `X-Frame-Options` is dropped because it cannot name the page in front;
+    // a Provider that limited framing only that way keeps a limit, written as
+    // the `frame-ancestors` it meant.
+    if provider_policies.is_empty() && from.contains_key(X_FRAME_OPTIONS) {
+        provider_policies.push(String::new());
     }
+    for policy in provider_policies {
+        if let Ok(policy) = HeaderValue::from_str(&framed_policy(&policy, framing)) {
+            to.append(CONTENT_SECURITY_POLICY, policy);
+        }
+    }
+    // Report-only policies block nothing, but a `frame-ancestors 'none'` in
+    // one would report every frame as a violation.
+    for policy in from
+        .get_all(CONTENT_SECURITY_POLICY_REPORT_ONLY)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+    {
+        if let Ok(policy) = HeaderValue::from_str(&framed_policy(policy, framing)) {
+            to.append(CONTENT_SECURITY_POLICY_REPORT_ONLY, policy);
+        }
+    }
+    if let Some(sandbox) = framing.sandbox() {
+        to.append(CONTENT_SECURITY_POLICY, HeaderValue::from_static(sandbox));
+    }
+    to.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
 }
 
 /// Let the page that framed this UI frame it, and nothing else.
@@ -804,7 +924,12 @@ fn copy_response_headers(from: &HeaderMap, to: &mut HeaderMap, ancestors: &str) 
 /// on the shape: `'self'` when the page and this session share an origin, and
 /// the page's own authority when they no longer do. Getting this wrong does not
 /// leak anything; it blanks every frame.
-fn framed_policy(policy: &str, ancestors: &str) -> String {
+///
+/// Only a policy the Provider sent is rewritten. One that sent none put no
+/// limit on framing, and adding one would blank the frames a Provider UI nests
+/// inside itself.
+fn framed_policy(policy: &str, framing: Framing<'_>) -> String {
+    let ancestors = framing.frame_ancestors();
     let mut directives: Vec<String> = Vec::new();
     let mut replaced = false;
     for directive in policy.split(';') {
@@ -894,44 +1019,157 @@ mod tests {
 
     #[test]
     fn framing_is_narrowed_to_the_page_in_front_rather_than_removed() {
-        let ancestors = Framing::Path {
+        let framing = Framing::Path {
             mounted_at: "/s/abc/",
-        }
-        .frame_ancestors();
+        };
         assert_eq!(
             framed_policy(
                 "default-src 'none'; frame-ancestors 'none'; connect-src 'self'",
-                &ancestors
+                framing
             ),
             "default-src 'none'; frame-ancestors 'self'; connect-src 'self'"
         );
         assert_eq!(
-            framed_policy("default-src 'self'", &ancestors),
+            framed_policy("default-src 'self'", framing),
             "default-src 'self'; frame-ancestors 'self'"
         );
         assert_eq!(
-            framed_policy("FRAME-ANCESTORS https://elsewhere.example", &ancestors),
+            framed_policy("FRAME-ANCESTORS https://elsewhere.example", framing),
             "frame-ancestors 'self'"
         );
     }
 
     #[test]
+    fn a_session_on_a_path_stays_sandboxed_when_opened_as_a_page() {
+        let framing = Framing::Path {
+            mounted_at: "/s/abc/",
+        };
+        // A Provider that sent no policy still gets the sandbox: opened
+        // top-level, the frame's `sandbox` attribute is gone and only the
+        // response says it. No `frame-ancestors` is added, so frames the
+        // Provider nests inside itself still load.
+        let mut headers = HeaderMap::new();
+        copy_response_headers(&HeaderMap::new(), &mut headers, framing);
+        let policies: Vec<_> = headers.get_all(CONTENT_SECURITY_POLICY).iter().collect();
+        assert_eq!(
+            policies,
+            ["sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"]
+        );
+        assert_eq!(headers[REFERRER_POLICY], "no-referrer");
+
+        // A Provider's own `sandbox` cannot widen AFUI's: it stays a policy of
+        // its own, and a browser enforces both.
+        let mut upstream = HeaderMap::new();
+        upstream.insert(
+            CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("sandbox allow-scripts allow-same-origin"),
+        );
+        upstream.insert(
+            HeaderName::from_static("service-worker-allowed"),
+            HeaderValue::from_static("/"),
+        );
+        let mut headers = HeaderMap::new();
+        copy_response_headers(&upstream, &mut headers, framing);
+        let policies: Vec<_> = headers.get_all(CONTENT_SECURITY_POLICY).iter().collect();
+        assert_eq!(
+            policies,
+            [
+                "sandbox allow-scripts allow-same-origin; frame-ancestors 'self'",
+                "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox",
+            ]
+        );
+        assert!(!headers.contains_key("service-worker-allowed"));
+
+        // A Provider that limited framing only with `X-Frame-Options` keeps a
+        // limit once that header is dropped.
+        let mut upstream = HeaderMap::new();
+        upstream.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+        let mut headers = HeaderMap::new();
+        copy_response_headers(&upstream, &mut headers, framing);
+        let policies: Vec<_> = headers.get_all(CONTENT_SECURITY_POLICY).iter().collect();
+        assert_eq!(policies[0], "frame-ancestors 'self'");
+        assert!(!headers.contains_key(X_FRAME_OPTIONS));
+
+        // Every policy a Provider sent survives, report-only ones included.
+        let mut upstream = HeaderMap::new();
+        upstream.append(
+            CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("img-src 'self'"),
+        );
+        upstream.append(
+            CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("script-src 'none'"),
+        );
+        upstream.insert(
+            CONTENT_SECURITY_POLICY_REPORT_ONLY,
+            HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+        );
+        let mut headers = HeaderMap::new();
+        copy_response_headers(&upstream, &mut headers, framing);
+        let policies: Vec<_> = headers.get_all(CONTENT_SECURITY_POLICY).iter().collect();
+        assert_eq!(
+            policies,
+            [
+                "img-src 'self'; frame-ancestors 'self'",
+                "script-src 'none'; frame-ancestors 'self'",
+                "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox",
+            ]
+        );
+        assert_eq!(
+            headers[CONTENT_SECURITY_POLICY_REPORT_ONLY],
+            "default-src 'none'; frame-ancestors 'self'"
+        );
+    }
+
+    #[test]
+    fn a_path_that_climbs_out_of_its_mount_is_not_forwarded() {
+        for path in [
+            "/../json/version",
+            "/a/..",
+            "/%2e%2E/x",
+            "/./x",
+            "/a\\..\\b",
+        ] {
+            assert!(has_dot_segment(path), "{path}");
+        }
+        for path in ["/", "/a/b", "/a..b", "/.well-known/x", "/v1.2/x"] {
+            assert!(!has_dot_segment(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_proxied_page_never_tells_a_third_party_the_sessions_name() {
+        let mut upstream = HeaderMap::new();
+        upstream.insert(REFERRER_POLICY, HeaderValue::from_static("unsafe-url"));
+        let mut headers = HeaderMap::new();
+        copy_response_headers(
+            &upstream,
+            &mut headers,
+            Framing::Origin {
+                shell_authority: "phone.example:8787",
+            },
+        );
+        assert_eq!(headers[REFERRER_POLICY], "no-referrer");
+        assert_eq!(headers.get_all(REFERRER_POLICY).iter().count(), 1);
+    }
+
+    #[test]
     fn a_session_on_its_own_origin_names_the_page_rather_than_itself() {
-        // The negative control is `'self'`: it is right in the other shape and
-        // catastrophic in this one, because here `'self'` is the session's own
-        // origin and the page is a different one, so every frame would blank.
+        // `'self'` alone is right in the other shape and catastrophic in this
+        // one: here `'self'` is the session's own origin and the page is a
+        // different one, so every frame would blank. It stays in the list only
+        // for frames the Provider UI nests inside itself.
         let framing = Framing::Origin {
             shell_authority: "phone.example:8787",
         };
-        let ancestors = framing.frame_ancestors();
         assert_eq!(
-            framed_policy("default-src 'none'; frame-ancestors 'none'", &ancestors),
-            "default-src 'none'; frame-ancestors http://phone.example:8787 \
+            framed_policy("default-src 'none'; frame-ancestors 'none'", framing),
+            "default-src 'none'; frame-ancestors 'self' http://phone.example:8787 \
              https://phone.example:8787"
         );
         assert_eq!(
-            framed_policy("default-src 'self'", &ancestors),
-            "default-src 'self'; frame-ancestors http://phone.example:8787 \
+            framed_policy("default-src 'self'", framing),
+            "default-src 'self'; frame-ancestors 'self' http://phone.example:8787 \
              https://phone.example:8787"
         );
         // And the session owns the root of its own origin, so a Provider's
@@ -1147,6 +1385,78 @@ mod tests {
         );
         relocate(&mut headers, &upstream, "/s/proxysecret/");
         assert_eq!(headers[LOCATION], "https://elsewhere.example/x");
+    }
+
+    #[test]
+    fn redirects_match_whole_base_paths_and_keep_queries_and_fragments() {
+        let upstream = Upstream::parse("http://127.0.0.1:8080/sessionsecret/").unwrap();
+        for (location, expected) in [
+            ("/sessionsecret?step=done", "/s/proxysecret/?step=done"),
+            ("/sessionsecret#done", "/s/proxysecret/#done"),
+            ("/sessionsecret//done", "/s/proxysecret//done"),
+            (
+                "http://127.0.0.1:8080/sessionsecret?step=done",
+                "/s/proxysecret/?step=done",
+            ),
+            (
+                "http://127.0.0.1:8080/sessionsecret#done",
+                "/s/proxysecret/#done",
+            ),
+            ("/sessionsecret-other/done", "/sessionsecret-other/done"),
+            (
+                "http://127.0.0.1:8080/sessionsecret-other/done",
+                "http://127.0.0.1:8080/sessionsecret-other/done",
+            ),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(LOCATION, HeaderValue::from_str(location).unwrap());
+            relocate(&mut headers, &upstream, "/s/proxysecret/");
+            assert_eq!(headers[LOCATION], expected, "{location}");
+        }
+        let root = Upstream::parse("http://127.0.0.1:8080/").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            LOCATION,
+            HeaderValue::from_static("//elsewhere.example/done"),
+        );
+        relocate(&mut headers, &root, "/s/proxysecret/");
+        assert_eq!(headers[LOCATION], "//elsewhere.example/done");
+    }
+
+    #[test]
+    fn a_redirect_never_hands_the_browser_the_announced_query() {
+        let upstream =
+            Upstream::parse("http://127.0.0.1:9222/takeover/panel?handoff_secret=X").unwrap();
+        for (location, expected) in [
+            (
+                "http://127.0.0.1:9222/takeover/panel/?handoff_secret=X",
+                "/s/proxysecret/",
+            ),
+            (
+                "/takeover/panel/?handoff_secret=X&autoconnect=1#top",
+                "/s/proxysecret/?autoconnect=1#top",
+            ),
+            (
+                "vnc.html?handoff_secret=X&autoconnect=1",
+                "vnc.html?autoconnect=1",
+            ),
+            // A parameter that only shares the name is the page's own.
+            ("vnc.html?handoff_secret=Y", "vnc.html?handoff_secret=Y"),
+            // Somewhere else entirely is still not this proxy's business.
+            (
+                "https://elsewhere.example/?handoff_secret=X",
+                "https://elsewhere.example/?handoff_secret=X",
+            ),
+            (
+                "//elsewhere.example/?handoff_secret=X",
+                "//elsewhere.example/?handoff_secret=X",
+            ),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(LOCATION, HeaderValue::from_str(location).unwrap());
+            relocate(&mut headers, &upstream, "/s/proxysecret/");
+            assert_eq!(headers[LOCATION], expected, "{location}");
+        }
     }
 
     #[test]

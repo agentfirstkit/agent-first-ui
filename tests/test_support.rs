@@ -134,13 +134,34 @@ fn the_stub_browser_records_the_url_instead_of_opening_it() {
     let binary = stub_browser(&root, &record).unwrap();
     assert!(binary.is_file());
 
+    // AFUI launches the window on a private page that moves on to the session
+    // URL; the stub records the session URL a test means.
+    let page = root.join("launch.html");
+    std::fs::write(
+        &page,
+        "<!doctype html>\n<script>location.replace(\"http://127.0.0.1:9/abc/#k\");</script>\n",
+    )
+    .unwrap();
+    let launch = format!(
+        "--app=file://{}",
+        page.display().to_string().replace('\\', "/")
+    );
+    let launch = if launch.starts_with("--app=file:///") || cfg!(not(windows)) {
+        launch
+    } else {
+        launch.replacen("file://", "file:///", 1)
+    };
     let status = std::process::Command::new(&binary)
-        .arg("http://127.0.0.1:9/abc/")
+        .arg(&launch)
+        .arg("--no-first-run")
         .status()
         .expect("the stub browser runs");
     assert!(status.success());
     let recorded = std::fs::read_to_string(&record).unwrap();
-    assert!(recorded.contains("http://127.0.0.1:9/abc/"), "{recorded}");
+    assert!(
+        recorded.contains("--app=http://127.0.0.1:9/abc/#k --no-first-run"),
+        "{recorded}"
+    );
 
     let _ = std::fs::remove_dir_all(root);
 }

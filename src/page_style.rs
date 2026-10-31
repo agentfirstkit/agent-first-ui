@@ -1,11 +1,10 @@
 //! The stylesheet every AFUI page is served on top of.
 //!
-//! Measured across the pages in this kit, the same two hundred lines were
-//! written again in every one of them: a palette, a box-sizing reset, a body
-//! type scale, a focus ring, and — in the pages that remembered — a `[hidden]`
-//! that actually hides and a phone's unreachable edges. The palettes had
-//! already been copied from one page to the next by hand, which is how one of
-//! them came to disagree about the focus colour with nothing to notice.
+//! Every page needs the same floor: a palette, a box-sizing reset, a body type
+//! scale, a focus ring, a `[hidden]` that actually hides, and room for a
+//! phone's unreachable edges. Written into each page, those are easy to forget
+//! and easy to let drift — a palette copied from one page to the next can come
+//! to disagree about the focus colour with nothing to notice.
 //!
 //! What is collected here is not a design system. It is the part of a page's
 //! appearance that either AFUI's own runtime decides — what a control looks

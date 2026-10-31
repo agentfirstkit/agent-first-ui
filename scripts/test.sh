@@ -245,6 +245,10 @@ run_release_smoke() {
 run_browser() {
   local browser_binary="${AFUI_TEST_BROWSER_BINARY:-}"
   local candidate config_root
+  local -a test_args=(--release --test browser_smoke headless_browser_smoke)
+  if [ "${1:-}" = window-shortcuts ]; then
+    test_args=(--lib window::tests::chromium_window_close_shortcuts)
+  fi
   if [ -n "$browser_binary" ]; then
     if [ ! -x "$browser_binary" ]; then
       afdata_error browser_unavailable \
@@ -259,7 +263,9 @@ run_browser() {
     if [ -z "$browser_binary" ]; then
       for candidate in \
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-        "/Applications/Chromium.app/Contents/MacOS/Chromium"; do
+        "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+        "${PROGRAMFILES:-/nonexistent}/Google/Chrome/Application/chrome.exe" \
+        "${LOCALAPPDATA:-/nonexistent}/Google/Chrome/Application/chrome.exe"; do
         if [ -x "$candidate" ]; then
           browser_binary="$candidate"
           break
@@ -268,6 +274,11 @@ run_browser() {
     fi
   fi
   if [ -z "$browser_binary" ]; then
+    if [ "${1:-}" = window-shortcuts ]; then
+      afdata_error browser_unavailable \
+        "window shortcut tests require Chrome or Chromium; set AFUI_TEST_BROWSER_BINARY" || :
+      return 1
+    fi
     afdata_log info \
       "browser smoke skipped: Chrome or Chromium is unavailable; set AFUI_TEST_BROWSER_BINARY to select it"
     return 0
@@ -280,23 +291,49 @@ run_browser() {
   fi
   AFUI_CONFIG_DIR="$config_root" AFUI_SAFE_MODE=1 AFUI_NO_REGISTRY=0 \
     AFUI_TEST_BROWSER_BINARY="$browser_binary" \
-    afdata_run --quiet cargo test --release \
-      --test browser_smoke headless_browser_smoke -- --ignored --exact
+    afdata_run --quiet cargo test "${test_args[@]}" -- --ignored --exact
+}
+
+# A desktop check is separate from the headless page check: native menu
+# dispatch, browser accelerators and Alt+F4 need a real desktop event loop.
+# Linux callers provide an X11 display with a window manager and xdotool.
+run_window_shortcuts() {
+  case "$(uname -s)" in
+    Darwin)
+      afdata_run --quiet cargo test --lib window::tests::macos_window_close_shortcut \
+        -- --ignored --exact
+      ;;
+    Linux)
+      if [ -z "${DISPLAY:-}" ] || ! command -v xdotool >/dev/null 2>&1; then
+        afdata_error desktop_unavailable \
+          "window shortcut tests require DISPLAY, an X11 window manager and xdotool" || :
+        return 1
+      fi
+      run_browser window-shortcuts
+      ;;
+    MINGW*|MSYS*|CYGWIN*) run_browser window-shortcuts ;;
+    *)
+      afdata_error desktop_unavailable "window shortcut tests do not support this platform" || :
+      return 1
+      ;;
+  esac
 }
 
 case "$MODE" in
   static)        run_static ;;
   unit)          run_unit ;;
+  kernel)        run_page_kernel ;;
   smoke)         run_smoke ;;
   release-smoke) run_release_smoke ;;
   browser)       run_browser ;;
+  window-shortcuts) run_window_shortcuts ;;
   release)       run_static; run_unit; run_smoke; run_release_smoke; run_browser ;;
   # Every push uses this portable gate. The release mode above adds the real
   # browser check without making Chrome a requirement of ordinary CI.
   all)           run_static; run_unit; run_smoke; run_release_smoke ;;
   *)
     afdata_error cli_error "unsupported test mode '$MODE'" \
-      "try: $0 static|unit|smoke|release-smoke|browser|release|all" || :
+      "try: $0 static|unit|kernel|smoke|release-smoke|browser|window-shortcuts|release|all" || :
     exit 2
     ;;
 esac

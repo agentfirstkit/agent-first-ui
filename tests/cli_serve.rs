@@ -28,6 +28,21 @@ fn assert_serve_failure(args: &[&str]) {
 }
 
 #[test]
+fn negative_attention_overrides_are_cli_errors_before_server_setup() {
+    for flag in ["--idle-minutes", "--grace-minutes"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_afui"))
+            .args(["session", "serve", flag, "-1", "--listen", "not-an-address"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{flag}: {output:?}");
+        assert!(output.stdout.is_empty());
+        let event: Value = serde_json::from_slice(&output.stderr).unwrap();
+        agent_first_data::assert_strict_event(&event).unwrap();
+        assert!(event["error"]["code"].as_str().unwrap().starts_with("cli_"));
+    }
+}
+
+#[test]
 fn invalid_origin_host_exits_with_domain_failure() {
     assert_serve_failure(&[
         "--listen",

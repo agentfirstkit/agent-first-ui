@@ -13,7 +13,7 @@
   and a frontend may not supply JavaScript at all.
 -#}
 <!doctype html>
-<html lang="en">
+<html lang="{{ document.lang }}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -27,8 +27,8 @@
   <header class="bar">
     <h1>{{ document.heading }}</h1>
     <p id="{{ document.elements.state_line }}" class="state">
-      <span id="{{ document.elements.count }}">0</span> open ·
-      <span id="{{ document.elements.state }}">connecting</span>
+      <span id="{{ document.elements.count }}">0</span> {{ document.words.open_count }} ·
+      <span id="{{ document.elements.state }}">{{ document.words.connecting }}</span>
     </p>
   </header>
 

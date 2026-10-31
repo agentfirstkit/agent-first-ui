@@ -7,7 +7,7 @@
 //! is not a new kind of session: the Provider is still the only thing that
 //! understands its own page, and the remote layer asks no domain field of it.
 //!
-//! Two things follow from the person not being at this machine.
+//! What follows from the person not being at this machine:
 //!
 //! **Loopback is not reachable.** `127.0.0.1` on a phone is the phone. So every
 //! session is reverse-proxied onto a path this listener answers, and the proxy
@@ -54,6 +54,7 @@ use crate::{Error, Result, UiAccessToken, UiExpiry, UiSecurityPolicy, UiSessionE
 mod addressing;
 mod attention;
 mod frontend;
+mod locale;
 mod mounts;
 mod proxy;
 pub(crate) use proxy::AFUI_REMOTE_VIEW;
@@ -78,28 +79,9 @@ use proxy::{Framing, Proxied};
 const NOT_FOUND_HTML: &str =
     "<!doctype html><meta charset=\"utf-8\"><title>Not Found</title><h1>Not Found</h1>";
 
-/// What this page's own credential renders after the page has lapsed.
-///
-/// Only somebody holding that credential ever sees it, which is what makes
-/// saying this much safe: they held the page, so being told it is over reveals
-/// nothing they did not already have. Everyone else keeps the 404 above,
-/// including anyone who arrives at this port without a credential — a listener
-/// that announced "an AFUI page expired here" to a passing scan would be
-/// answering the question the 404 exists to refuse.
-///
-/// Three facts, because arriving at a dead URL raises three questions and a
-/// bare 404 answers none of them: the address was right, the work is still
-/// there, and getting back to it is one command on the other machine.
-const GONE_HTML: &str = "<!doctype html><meta charset=\"utf-8\"><title>Page Expired</title>\
-     <h1>This page expired</h1>\
-     <p>Nobody was attending it, so it stopped answering and its credential was \
-     revoked. The address was correct — this is not a mistyped link, and \
-     reloading will not bring it back.</p>\
-     <p>The sessions themselves are untouched. They are still running on the \
-     machine that published them, and still listed there by \
-     <code>afui session list</code>.</p>\
-     <p>To reach them again, run <code>afui session serve</code> on that machine. \
-     It prints a new URL; this one will never work again.</p>";
+/// A direct link is a single-use delivery. Shared pages retain their entry URL.
+const GONE_HTML: &str = "<!doctype html><meta charset=\"utf-8\"><title>Link Expired</title>\
+    <h1>This link expired</h1><p>This delivery ended after being unattended.</p>";
 
 /// Serve the live sessions on this machine to a browser that is not on it.
 pub struct SessionServer {
@@ -259,8 +241,7 @@ impl SessionServer {
             None => Addressing::Path,
         };
         let authority = match self.advertised_host {
-            Some(host) if host.contains(':') => host,
-            Some(host) => format!("{host}:{}", local_addr.port()),
+            Some(host) => crate::lan::authority_with_port(&host, local_addr.port()),
             None => advertised_authority(local_addr),
         };
         // The page and its frames are one arrangement or they are nothing: a
@@ -344,6 +325,13 @@ impl ServedSessions {
         tokio::select! {
             result = served => result.map_err(Error::Io),
             () = shutdown => Ok(()),
+            () = async {
+                loop {
+                    self.state.attention.wait_until_dead(&self.state.attention_policy).await;
+                    self.state.shell_phase();
+                    self.state.attention.wait_until_resumed(&self.state.attention_policy).await;
+                }
+            } => Ok(()),
         }
     }
 
@@ -395,9 +383,8 @@ struct ServeState {
     /// never rendered, never in a URL a Provider UI can see.
     token: UiAccessToken,
     attention_policy: UiAttentionPolicy,
-    /// The page's own clock. Its ending is final: this URL stops answering, and
-    /// the way back is a new `session serve` URL from the machine, which is
-    /// exactly the property that makes it a deadman rather than a nuisance.
+    /// The view's clock. Registry pages may resume attendance with fresh mounts;
+    /// fixed-session links retain their terminal expiry.
     attention: Arc<AttentionClock>,
     /// The page this listener serves, resolved once before the port was bound.
     /// A replacement AFUI cannot use is an error at `bind`, never a listener
@@ -423,7 +410,7 @@ impl ServeState {
     /// addresses are built as names *under* it, so they have to be built from
     /// the authority the browser really used — port, or a TLS terminator's lack
     /// of one, included.
-    async fn sessions(&self, shell_authority: Option<&str>) -> Result<Vec<Value>> {
+    async fn sessions(&self, shell_authority: Option<&str>) -> Result<(Vec<Value>, Phase)> {
         let entries =
             match &self.source {
                 SessionSource::Registry => tokio::task::spawn_blocking(crate::list_sessions)
@@ -431,7 +418,7 @@ impl ServeState {
                     .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))??,
                 SessionSource::Fixed(entries) => entries.clone(),
             };
-        self.mount_live_sessions(&entries, shell_authority)
+        self.snapshot(&entries, shell_authority)
     }
 
     /// Bring the mount table in line with what is actually running, and
@@ -441,21 +428,46 @@ impl ServeState {
     /// page polls every couple of seconds whether or not a person is in front
     /// of it, so a poll that renewed what it reported would be a clock that
     /// never ran down.
+    fn snapshot(
+        &self,
+        entries: &[UiSessionEntry],
+        shell_authority: Option<&str>,
+    ) -> Result<(Vec<Value>, Phase)> {
+        let mut mounts = self.mounts.lock().map_err(|_| poisoned())?;
+        let phase = self.attention.phase(&self.attention_policy);
+        let cards = mounts.reconcile(
+            entries,
+            &self.attention_policy,
+            shell_authority,
+            phase == Phase::Dead,
+        )?;
+        Ok((cards, phase))
+    }
+
+    #[cfg(test)]
     fn mount_live_sessions(
         &self,
         entries: &[UiSessionEntry],
         shell_authority: Option<&str>,
     ) -> Result<Vec<Value>> {
-        self.mounts.lock().map_err(|_| poisoned())?.reconcile(
-            entries,
-            &self.attention_policy,
-            shell_authority,
-        )
+        self.snapshot(entries, shell_authority)
+            .map(|(cards, _)| cards)
     }
 
     /// The page's own clock, advanced.
     fn shell_phase(&self) -> Phase {
-        self.attention.phase(&self.attention_policy)
+        let Ok(mut mounts) = self.mounts.lock() else {
+            return Phase::Dead;
+        };
+        let phase = self.attention.phase(&self.attention_policy);
+        if phase == Phase::Dead {
+            mounts.lapse_all();
+        }
+        phase
+    }
+
+    fn is_link(&self) -> bool {
+        matches!(self.source, SessionSource::Fixed(_))
     }
 
     /// Somebody is at the page, and looking at these sessions.
@@ -465,8 +477,15 @@ impl ServeState {
     /// than revived — coming back is [`Self::reopen`], an act a person performs
     /// on one card, not something a heartbeat does to everything it can reach.
     fn attend(&self, session_ids: &[String]) {
-        self.attention.attend();
         if let Ok(mut mounts) = self.mounts.lock() {
+            if self.attention.phase(&self.attention_policy) == Phase::Dead {
+                mounts.lapse_all();
+                if !self.is_link() {
+                    self.attention.resume();
+                }
+            } else {
+                self.attention.attend();
+            }
             mounts.attend(session_ids, &self.attention_policy);
         }
     }
@@ -480,38 +499,46 @@ impl ServeState {
         // Mounting is `mount_live_sessions`' job — it is the only place that
         // knows the session is still running and where it answers. This only
         // takes the refusal away, and the next poll does the rest.
-        let removed = match self.mounts.lock() {
-            Ok(mut mounts) => mounts.revive(session_id),
-            Err(_) => false,
+        let Ok(mut mounts) = self.mounts.lock() else {
+            return false;
         };
+        if self.attention.phase(&self.attention_policy) == Phase::Dead {
+            mounts.lapse_all();
+            if self.is_link() {
+                return false;
+            }
+        }
+        let removed = mounts.revive(session_id);
         if removed {
-            self.attention.attend();
+            if self.is_link() {
+                self.attention.attend();
+            } else {
+                self.attention.resume();
+            }
         }
         removed
     }
 
     fn mount_session(&self, session_id: &str) -> Option<Arc<Proxied>> {
-        let proxied = self
-            .mounts
-            .lock()
-            .ok()?
-            .authorize_session(session_id, &self.attention_policy)?;
-        self.attention.attend();
-        Some(proxied)
+        self.authorize_mount(|mounts, policy| mounts.authorize_session(session_id, policy))
     }
 
-    /// The mount a proxy credential names, if it is still live.
-    ///
-    /// Traffic through a frame is the other half of attention: it is the only
-    /// evidence this listener has that somebody is using a Provider UI, since
-    /// what happens inside one is on an origin it cannot read. So a request
-    /// that authorizes here renews both this session and the page around it.
+    /// Traffic through a live frame renews both clocks. Crossing the page's
+    /// deadline revokes every mount before any credential can renew it.
     fn mount(&self, secret: &str) -> Option<Arc<Proxied>> {
-        let proxied = self
-            .mounts
-            .lock()
-            .ok()?
-            .authorize(secret, &self.attention_policy)?;
+        self.authorize_mount(|mounts, policy| mounts.authorize(secret, policy))
+    }
+
+    fn authorize_mount(
+        &self,
+        authorize: impl FnOnce(&mut Mounts, &UiAttentionPolicy) -> Option<Arc<Proxied>>,
+    ) -> Option<Arc<Proxied>> {
+        let mut mounts = self.mounts.lock().ok()?;
+        if self.attention.phase(&self.attention_policy) == Phase::Dead {
+            mounts.lapse_all();
+            return None;
+        }
+        let proxied = authorize(&mut mounts, &self.attention_policy)?;
         self.attention.attend();
         Some(proxied)
     }
@@ -523,14 +550,9 @@ impl ServeState {
 /// session host answers that way: there is nothing there to authenticate
 /// against, and saying otherwise would confirm that this port hosts something.
 ///
-/// The page's own lapse ends everything this listener answers, frames included.
-/// A page that stopped answering while the terminal it framed kept going would
-/// leave the part that shows a person's work as the one part that outlived them
-/// walking away. What the lapse changes is only what the *page's* credential is
-/// answered with — a `410` that says so, rather than a 404 indistinguishable
-/// from a typo. Everything else about a dead listener is unchanged.
+/// Shared-page attendance revokes mounts while retaining the entry credential.
 async fn dispatch(State(state): State<Arc<ServeState>>, request: Request) -> Response<Body> {
-    let lapsed = state.shell_phase() == Phase::Dead;
+    let lapsed = state.shell_phase() == Phase::Dead && state.is_link();
     match &state.addressing {
         Addressing::Path => on_one_origin(&state, lapsed, request).await,
         Addressing::PerSession { base_host } => {
@@ -648,17 +670,7 @@ fn not_found() -> Response<Body> {
     response
 }
 
-/// The page's own credential, after the page is over.
-///
-/// `410` rather than `404` because the two say different things and a person
-/// acts on the difference: gone is the address that was right and is finished,
-/// which is exactly the fact a lapsed page has to convey. The page's script
-/// reads the same status, so what a still-open tab reports and what a reload
-/// finds cannot drift apart.
-///
-/// Carries no stylesheet. Every route that could serve one belongs to a shell
-/// that is no longer answering, and a page whose whole content is three
-/// sentences does not need one badly enough to reopen a route for it.
+/// A terminal direct-link delivery, while its owner is closing the listener.
 fn gone() -> Response<Body> {
     let mut response = (StatusCode::GONE, Html(GONE_HTML)).into_response();
     UiSecurityPolicy::isolated().apply_headers(response.headers_mut());
@@ -941,10 +953,9 @@ mod tests {
         assert_eq!(lapsing.shell_phase(), Phase::Live);
         std::thread::sleep(IDLE + GRACE);
         assert_eq!(lapsing.shell_phase(), Phase::Dead);
-        // Final: attending a dead page does not bring it back, because the
-        // person who could attend it is the one who is no longer there.
+        // The entry remains usable; only individual mounts need Reopen.
         lapsing.attend(&[]);
-        assert_eq!(lapsing.shell_phase(), Phase::Dead);
+        assert_eq!(lapsing.shell_phase(), Phase::Live);
 
         let forever = state_with(UiAttentionPolicy::never()).unwrap();
         let live = [entry("one", "http://127.0.0.1:9/aabbccdd/")];

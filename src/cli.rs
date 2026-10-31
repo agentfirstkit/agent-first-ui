@@ -1,11 +1,11 @@
 //! The command-line half of handing a UI to a person.
 //!
-//! Everything here was written once per Provider before it was written here.
 //! The words are AFUI's, the environment variable is AFUI's, the readiness
-//! facts are AFUI's — but declaring the flag, reading it back, and getting the
-//! facts into an event were each a small pile of Provider code, and six piles
-//! of the same small code disagree the way six piles do: one spelled a typo as
-//! `window`, one published a URL nobody could read.
+//! facts are AFUI's — so declaring the flag, reading it back, and getting the
+//! facts into an event belong here too. Left to each Provider, that is small
+//! code written many times over, and independent copies of small code drift
+//! apart: one reads a typo as `window`, another publishes a URL nobody can
+//! read.
 //!
 //! What stays the Provider's is what it actually knows: which deliveries this
 //! particular command offers, what the flag is called when `--mode` is already
@@ -82,12 +82,12 @@ impl UiDeliveryOffer {
     /// exists rather than a documented convention: a default here is
     /// indistinguishable from a person having typed `--mode window`, so
     /// [`crate::DELIVERY_ENV`] would never be consulted and an unattended run
-    /// would always try to open a window. Every Provider wrote that comment;
-    /// now the code enforces it.
+    /// would always try to open a window. A comment can only ask for that; the
+    /// helper enforces it.
     ///
     /// `flag` is a name rather than a constant because `--mode` is a popular
-    /// word: Providers already use it for network exposure, for a REPL
-    /// frontend, and for a psql wire mode. The `about` text is AFUI's summary
+    /// word: a Provider may already use it for network exposure, a REPL
+    /// frontend, or a wire protocol. The `about` text is AFUI's summary
     /// of what each word means; a Provider with something domain-specific to
     /// add can call `.about(...)` on the result.
     #[must_use]

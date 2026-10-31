@@ -1,6 +1,6 @@
 //! What `UiSurface` promises beyond composing the pieces by hand.
 //!
-//! Two things, and they are the two that a hand-composed panel got wrong: a
+//! These, and they are what a hand-composed panel gets wrong: a
 //! submission completes the session with what the Provider's own parse made of
 //! the fields, and only the first one counts — the second person to press a
 //! button is told their answer arrived after the decision, rather than having

@@ -371,7 +371,15 @@ fn parse(raw: &str) -> Reply {
     let mut headers = HashMap::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+            // A repeated header is one list, as HTTP reads it: AFUI sends its
+            // sandbox as a policy of its own beside the Provider's.
+            headers
+                .entry(name.trim().to_ascii_lowercase())
+                .and_modify(|joined: &mut String| {
+                    joined.push_str(", ");
+                    joined.push_str(value.trim());
+                })
+                .or_insert_with(|| value.trim().to_owned());
         }
     }
     Reply {
@@ -793,20 +801,28 @@ in_both_shapes! {
         assert!(policy.contains("script-src 'self'"), "{policy}");
         assert!(!policy.contains("frame-ancestors 'none'"), "{policy}");
         // Which origin may frame this session is the one thing the two shapes
-        // disagree about, and getting it wrong blanks every frame. The negative
-        // control is the other shape's answer: `'self'` is this session's own
-        // origin once it has one, and the page is somewhere else.
+        // disagree about, and getting it wrong blanks every frame. `'self'`
+        // alone is the other shape's answer: once a session has an origin of
+        // its own, the page is somewhere else, so it has to be named.
         match shape {
-            Shape::OneOrigin => assert!(policy.contains("frame-ancestors 'self'"), "{policy}"),
+            Shape::OneOrigin => {
+                assert!(policy.contains("frame-ancestors 'self'"), "{policy}");
+                // On a path the frame's sandbox is also the response's, so a
+                // frame address opened by hand stays off the page's origin.
+                assert!(
+                    policy.contains(", sandbox allow-scripts allow-forms allow-popups"),
+                    "{policy}"
+                );
+            }
             Shape::OriginPerSession => {
                 assert!(
                     policy.contains(&format!(
-                        "frame-ancestors http://{host} https://{host}",
+                        "frame-ancestors 'self' http://{host} https://{host}",
                         host = shell.host
                     )),
                     "{policy}"
                 );
-                assert!(!policy.contains("frame-ancestors 'self'"), "{policy}");
+                assert!(!policy.contains("sandbox"), "{policy}");
             }
         }
         // A cookie the browser held for one session would be attached to the
@@ -1615,51 +1631,52 @@ in_both_shapes! {
 }
 
 in_both_shapes! {
-    /// The page's own ending, which takes its frames with it.
-    async fn the_page_stops_answering_for_everything_once_it_has_lapsed(shape: Shape) {
-        let session = provider_session(Router::new().route("/", get(|| async { "panel" }))).await;
-        let shell = serving_with(shape, lapsing()).await;
-        let framed = shell.framed(&session).await;
+    /// The original remote entry reaches questions created after walking away.
+    async fn unattended_page_keeps_its_entry_and_reopens_new_questions(shape: Shape) {
+        let (router, sender) = event_stream_router();
+        let old = provider_session(router).await;
+        let shell = serving_with(shape, UiAttentionPolicy::default()
+            .with_idle_timeout(Duration::from_secs(1))
+            .with_grace_period(Duration::ZERO)).await;
+        let old_id = old.metadata().session_id.as_str().to_owned();
+        let framed = shell.framed(&old).await;
+        let mut events = established_event_stream(&framed, &sender).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let mut rest = Vec::new();
+        let _closed = tokio::time::timeout(Duration::from_secs(2), events.read_to_end(&mut rest))
+            .await.expect("unattended streams must disconnect");
+        assert_eq!(framed.request("stream", &[], None).await.status, 404);
+        assert!(shell.card(&old_id).await["proxy_url_secret"].is_null());
 
-        tokio::time::sleep(IDLE + GRACE).await;
-        // Gone, not missing. Somebody arriving here holds the page's own
-        // credential — they had this page — so being told it is finished
-        // reveals nothing they did not already have, and it is the one thing
-        // that tells them apart from a person who mistyped a URL.
-        let refused = shell.page("sessions", &[], None).await;
-        assert_eq!(refused.status, 410, "{}", refused.body);
-        let landing = shell.page("", &[], None).await;
-        assert_eq!(landing.status, 410, "{}", landing.body);
-        // The three questions arriving at a dead URL raises, each answered:
-        // was the address wrong, is the work lost, and what do I do now.
-        assert!(landing.body.contains("expired"), "{}", landing.body);
-        assert!(
-            landing.body.contains("not a mistyped link"),
-            "a lapsed page must rule out the explanation a 404 implies: {}",
-            landing.body
-        );
-        assert!(
-            landing.body.contains("still running"),
-            "a lapsed page must say the sessions outlived it: {}",
-            landing.body
-        );
-        assert!(
-            landing.body.contains("afui session serve"),
-            "a lapsed page must name the way back: {}",
-            landing.body
-        );
-        assert_eq!(
-            framed.request("", &[], None).await.status,
-            404,
-            "a page that has stopped answering must not leave the frame showing \
-             a person's work to whoever picks the device up"
-        );
-        // And the page cannot talk its own way back: the person who could
-        // attend it is the one who is no longer there.
-        assert_eq!(shell.attend(&[]).await, 410);
-        assert_eq!(shell.page("sessions", &[], None).await.status, 410);
-
-        drop(session);
+        let session = UiSession::<u8>::new("reviewer", "question").unwrap();
+        let completion = session.completion();
+        let router = Router::new().route("/complete", get(move || {
+            let completion = completion.clone();
+            async move { completion.complete(7).await; "answered" }
+        }));
+        let active = session.serve(router, UiUrlDelivery::new(UiExpiry::Never)).await.unwrap();
+        let id = active.metadata().session_id.as_str().to_owned();
+        assert_eq!(shell.page("", &[], None).await.status, 200);
+        for _ in 0..2 {
+            let card = shell.card(&id).await;
+            assert_eq!(card["state"], "dead");
+            assert!(card["proxy_url_secret"].is_null());
+        }
+        let list = shell.page("sessions", &[], None).await;
+        let list: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+        assert_eq!(list["page"]["state"], "unattended");
+        assert_eq!(shell.attend(&[&old_id, &id]).await, 204);
+        assert!(shell.card(&id).await["proxy_url_secret"].is_null());
+        assert!(shell.card(&old_id).await["proxy_url_secret"].is_null());
+        // New arrivals after attendance resumes are automatically mounted again.
+        let arriving = provider_session(Router::new()).await;
+        assert!(shell.card(arriving.metadata().session_id.as_str()).await["proxy_url_secret"].is_string());
+        assert_eq!(shell.page(&format!("sessions/{id}/reopen"), &[], Some("")).await.status, 204);
+        let card = shell.card(&id).await;
+        let reopened = shell.frame_of(card["proxy_url_secret"].as_str().unwrap());
+        assert_eq!(reopened.request("complete", &[], None).await.status, 200);
+        assert_eq!(active.wait().await.unwrap(), Outcome::Completed(7));
+        assert_eq!(framed.request("stream", &[], None).await.status, 404);
         shell.handle.abort();
     }
 }
@@ -1736,7 +1753,8 @@ async fn a_window_still_opens_when_nothing_is_being_served() {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nfor arg in \"$@\"; do case \"$arg\" in --app=file://*) url=\"$(sed -n 's/.*location\\.replace(\"\\(.*\\)\");.*/\\1/p' \"${{arg#--app=file://}}\")\"; printf 'target %s\\n' \"$url\" >> {}; curl -fsS \"$url\" >/dev/null || exit 1 ;; esac; done\n",
+            log.to_string_lossy(),
             log.to_string_lossy()
         ),
     )
@@ -1754,8 +1772,12 @@ async fn a_window_still_opens_when_nothing_is_being_served() {
     assert!(matches!(outcome, Outcome::Closed));
     let launched = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(
-        launched.contains("--app=http://127.0.0.1:"),
+        launched.contains("target http://127.0.0.1:"),
         "a window must still be opened onto the session's own loopback URL: {launched:?}"
+    );
+    assert!(
+        !launched.lines().any(|line| line.starts_with("--app=http")),
+        "the credentialed URL must not be in the browser's arguments: {launched:?}"
     );
 }
 
@@ -1844,6 +1866,21 @@ in_both_shapes! {
 
         drop(announced);
         upstream.abort();
+        shell.handle.abort();
+    }
+}
+
+in_both_shapes! {
+    async fn sessions_controls_follow_accept_language(shape: Shape) {
+        let shell = serving(shape).await;
+        let chinese = shell.page("", &[("Accept-Language", "zh-CN")], None).await;
+        assert_eq!(chinese.status, 200);
+        for text in ["lang=\"zh-CN\"", "已打开的界面", "更多操作", "重新打开", "正在连接", "data-words="] {
+            assert!(chinese.body.contains(text), "missing {text}");
+        }
+        let english = shell.page("", &[("Accept-Language", "fr-FR")], None).await;
+        assert!(english.body.contains("lang=\"en\""));
+        assert!(english.body.contains("More actions"));
         shell.handle.abort();
     }
 }

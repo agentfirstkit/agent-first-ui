@@ -204,7 +204,7 @@ code {
   flex: none;
 }
 
-/* Two voices, kept apart. The first is the interface inside the frame saying
+/* Separate voices, kept apart. The first is the interface inside the frame saying
  * how what it is showing is going; the second is this page's own answer to a
  * control somebody just pressed. They are about different things, so they get
  * different slots rather than one that overwrites. */

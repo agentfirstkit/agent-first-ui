@@ -57,7 +57,9 @@ pub struct UiDeliveryPlan {
 /// seconds, a `_secret` suffix on a bearer capability — so a Provider that
 /// splices these straight into an event gets correct handling by default, and
 /// one that deliberately publishes the URL renames that single field itself.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// `Debug` prints `***` for [`Self::link_url_secret`].
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct UiDeliveryFacts {
     /// The resolved delivery, spelled the way a person types it.
     pub mode: UiDeliveryMode,
@@ -82,6 +84,22 @@ pub struct UiDeliveryFacts {
     /// exactly when this delivery has an attention clock.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grace_period_s: Option<u64>,
+}
+
+impl std::fmt::Debug for UiDeliveryFacts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UiDeliveryFacts")
+            .field("mode", &self.mode)
+            .field("session_id", &self.session_id)
+            .field(
+                "link_url_secret",
+                &self.link_url_secret.as_ref().map(|_| "***"),
+            )
+            .field("idle_timeout_s", &self.idle_timeout_s)
+            .field("grace_period_s", &self.grace_period_s)
+            .finish()
+    }
 }
 
 fn facts(
@@ -183,13 +201,10 @@ where
             return self.session.wait_with_window(window).await;
         }
         if let Some(mut remote) = self.remote.take() {
-            return tokio::select! {
-                outcome = self.session.wait() => outcome,
-                expired = remote.wait_until_expired() => {
-                    expired?;
-                    Ok(Outcome::Expired)
-                }
-            };
+            return self
+                .session
+                .wait_or_lapse(remote.wait_until_expired())
+                .await;
         }
         self.session.wait().await
     }
@@ -321,7 +336,7 @@ impl UiDeliveryPlan {
                 let active = session
                     .serve(router, UiUrlDelivery::new(UiExpiry::Never))
                     .await?;
-                let window = UiWindow::launch(active.window_url(), &self.window_config)?;
+                let window = active.launch_window(&self.window_config)?;
                 (active, Some(window), None)
             }
             UiDeliveryMode::Link => {
@@ -341,14 +356,15 @@ impl UiDeliveryPlan {
                 // Loopback, the default `UiUrlDelivery` bind: this mode
                 // advertises no address of its own. Reaching it is `afui
                 // session open` or `afui session serve`'s job, both of which
-                // find it through the registry `serve` already publishes to.
-                (
-                    session
-                        .serve(router, UiUrlDelivery::new(UiExpiry::Never))
-                        .await?,
-                    None,
-                    None,
-                )
+                // find it through the registry `serve` already publishes to —
+                // so a write that failed there is this delivery failing.
+                let mut active = session
+                    .serve(router, UiUrlDelivery::new(UiExpiry::Never))
+                    .await?;
+                if let Some(error) = active.take_listing_failure() {
+                    return Err(error);
+                }
+                (active, None, None)
             }
         };
         Ok(ActiveUiDelivery {

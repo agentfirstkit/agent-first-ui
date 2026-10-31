@@ -137,11 +137,11 @@ impl UiUpstream {
 
     /// Publish this session so other processes can see it.
     ///
-    /// Fails loudly when the entry cannot be written, unlike the announcement a
-    /// served session makes. There the announcement is a convenience — the
-    /// Provider still has its window and its URL — but here it is the entire
-    /// delivery, and an announcement nobody can see is not a degraded outcome,
-    /// it is no outcome. `AFUI_NO_REGISTRY` is still honoured: opting out is a
+    /// Fails loudly when the entry cannot be written, as a served session's
+    /// `session` delivery does. A window or a link would still reach the
+    /// person without the listing, but here it is the entire delivery, and an
+    /// announcement nobody can see is not a degraded outcome, it is no
+    /// outcome. `AFUI_NO_REGISTRY` is still honoured: opting out is a
     /// decision rather than a failure, so it succeeds and lists nothing.
     pub fn announce(self) -> Result<AnnouncedUiUpstream> {
         self.announce_for_delivery(crate::UiDeliveryMode::Session)
@@ -169,23 +169,20 @@ impl UiUpstream {
         // No signal here: an announced upstream has no `T` for the automatic
         // half of `waits_for_decision` to read and, unlike `UiSession`, no
         // builder to declare it explicitly. See docs/providers.md.
-        let announcement = if !publishable {
-            registry::unpublished()
-        } else if strict {
-            registry::publish_strictly(
-                &self.metadata,
-                self.subject.clone(),
-                false,
-                &self.access_url,
-            )?
-        } else {
-            registry::publish(
+        let announcement = if publishable {
+            match registry::publish(
                 &self.metadata,
                 self.subject.clone(),
                 false,
                 &self.access_url,
                 None,
-            )
+            ) {
+                Ok(announcement) => announcement,
+                Err(error) if strict => return Err(error),
+                Err(_) => registry::unpublished(),
+            }
+        } else {
+            registry::unpublished()
         };
         Ok(AnnouncedUiUpstream {
             metadata: self.metadata,
@@ -233,9 +230,7 @@ impl AnnouncedUiUpstream {
 /// prefix it prepends to every forwarded request. A URL with a query but no path
 /// would make the first of those read the query as part of the host.
 fn normalise_upstream_url(supplied: &str) -> Result<String> {
-    let invalid = || Error::InvalidUpstreamUrl {
-        value: supplied.to_owned(),
-    };
+    let invalid = || Error::InvalidUpstreamUrl;
     let (scheme, rest) = supplied
         .strip_prefix("http://")
         .map(|rest| ("http", rest))
@@ -250,11 +245,44 @@ fn normalise_upstream_url(supplied: &str) -> Result<String> {
     if authority.is_empty() || remainder.contains('#') {
         return Err(invalid());
     }
+    // Use the same URI grammar as the proxy, before creating a registry entry
+    // or a window. A non-empty authority alone also accepts spaces, broken
+    // IPv6 brackets and unusable ports, leaving an announced but unreachable UI.
+    let uri: axum::http::Uri = supplied.parse().map_err(|_| invalid())?;
+    let parsed = uri.authority().ok_or_else(invalid)?;
+    let host = parsed.host();
+    if host.is_empty() || authority.contains('@') {
+        return Err(invalid());
+    }
+    let port = &authority[host.len()..];
+    if !port.is_empty() && (!port.starts_with(':') || parsed.port_u16().is_none()) {
+        return Err(invalid());
+    }
+    if host.starts_with('[')
+        && host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .and_then(|host| host.parse::<std::net::Ipv6Addr>().ok())
+            .is_none()
+    {
+        return Err(invalid());
+    }
     let (path, query) = match remainder.split_once('?') {
         Some((path, query)) => (path, Some(query)),
         None => (remainder, None),
     };
     let path = if path.is_empty() { "/" } else { path };
+    // The port the scheme implies, written out: the registry's liveness probe
+    // and the proxy both connect to the authority as stored, and a socket
+    // address needs a port where a browser would assume one. Without it an
+    // announced `http://localhost/panel` reads as unreachable and is pruned
+    // the first time anyone lists sessions.
+    let default_port = if scheme == "http" { 80 } else { 443 };
+    let authority = if port.is_empty() {
+        crate::lan::authority_with_port(authority, default_port)
+    } else {
+        authority.to_owned()
+    };
     Ok(match query {
         Some(query) => format!("{scheme}://{authority}{path}?{query}"),
         None => format!("{scheme}://{authority}{path}"),
@@ -279,6 +307,22 @@ mod tests {
     }
 
     #[test]
+    fn a_url_without_a_port_names_the_one_its_scheme_implies() {
+        assert_eq!(
+            normalise_upstream_url("http://localhost/panel").unwrap(),
+            "http://localhost:80/panel"
+        );
+        assert_eq!(
+            normalise_upstream_url("https://[::1]/panel?k=v").unwrap(),
+            "https://[::1]:443/panel?k=v"
+        );
+        assert_eq!(
+            normalise_upstream_url("http://localhost:9222/panel").unwrap(),
+            "http://localhost:9222/panel"
+        );
+    }
+
+    #[test]
     fn a_url_with_no_path_still_has_one_before_its_query() {
         // Without this the registry's liveness probe would take
         // `127.0.0.1:9222?handoff_secret=deadbeef` for a host name.
@@ -297,6 +341,13 @@ mod tests {
         for supplied in [
             "http:///takeover/panel",
             "127.0.0.1:9222/takeover/panel",
+            "http://host name/panel",
+            "http://localhost:invalid/panel",
+            "http://localhost:65536/panel",
+            "http://localhost:/panel",
+            "http://[::1/panel",
+            "http://[not-an-ip]/panel",
+            "http://reader:password@localhost/panel",
             // Never sent to a server, so storing it would only mislead.
             "http://127.0.0.1:9222/takeover/panel#top",
         ] {
@@ -308,6 +359,7 @@ mod tests {
     fn an_upstream_is_identified_the_same_way_a_served_session_is() {
         assert!(UiUpstream::new("remote", "takeover", "http://127.0.0.1:9222/p").is_ok());
         assert!(UiUpstream::new("remote", "takeover", "https://example.test/p").is_ok());
+        assert!(UiUpstream::new("remote", "takeover", "http://[::1]:9222/p").is_ok());
         assert!(UiUpstream::new("Inspector", "takeover", "http://127.0.0.1:9222/p").is_err());
         assert!(UiUpstream::new("remote", "../panel", "http://127.0.0.1:9222/p").is_err());
     }

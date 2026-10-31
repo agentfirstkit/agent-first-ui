@@ -67,7 +67,13 @@ impl Mounts {
         entries: &[UiSessionEntry],
         attention_policy: &UiAttentionPolicy,
         shell_authority: Option<&str>,
+        unattended: bool,
     ) -> Result<Vec<Value>> {
+        if unattended {
+            self.lapse_all();
+            self.lapsed
+                .extend(entries.iter().map(|entry| entry.session_id.clone()));
+        }
         let Mounts {
             by_secret,
             by_session,
@@ -172,6 +178,13 @@ impl Mounts {
             cards.push(card);
         }
         Ok(cards)
+    }
+
+    /// Revoke every mount, including streams holding a clone of the proxy.
+    pub(super) fn lapse_all(&mut self) {
+        self.lapsed.extend(self.by_session.keys().cloned());
+        self.by_session.clear();
+        self.by_secret.clear();
     }
 
     /// Somebody is looking at these. A session already lapsed is skipped rather

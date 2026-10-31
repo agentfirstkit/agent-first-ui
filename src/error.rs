@@ -18,9 +18,9 @@ pub enum Error {
     InvalidBaseUrl {
         value: String,
     },
-    InvalidUpstreamUrl {
-        value: String,
-    },
+    /// Carries no value: the URL rejected is an access URL, credential
+    /// included, and `Debug` would print it.
+    InvalidUpstreamUrl,
     /// A remote shell can proxy plain HTTP upstreams only. HTTPS remains a
     /// valid source for a local window, where the browser talks to it directly.
     UpstreamDeliveryRequiresHttp {
@@ -152,6 +152,7 @@ pub enum Error {
         source: io::Error,
     },
     WindowWait(io::Error),
+    WindowPageNotReached,
 }
 
 impl fmt::Display for Error {
@@ -169,7 +170,7 @@ impl fmt::Display for Error {
                 "UI mount base URL `{value}` must be an absolute http:// URL with a host and no \
                  query or fragment, for example http://127.0.0.1:8080/ui/"
             ),
-            Self::InvalidUpstreamUrl { .. } => write!(
+            Self::InvalidUpstreamUrl => write!(
                 formatter,
                 "announced UI upstream URL must be an absolute http:// or https:// URL with a \
                  host and no fragment"
@@ -184,7 +185,10 @@ impl fmt::Display for Error {
                 "`{value}` cannot host one origin per session: {reason}; give a hostname that \
                  `*.<host>` resolves under, for example localhost"
             ),
-            Self::InvalidTtl => write!(formatter, "UI session TTL must be greater than zero"),
+            Self::InvalidTtl => write!(
+                formatter,
+                "UI session TTL must be greater than zero and fit the platform clock"
+            ),
             Self::InvalidDeliveryMode { value } => write!(
                 formatter,
                 "`{value}` is not a UI delivery mode; use one of `window`, `link`, `session`"
@@ -332,6 +336,9 @@ impl fmt::Display for Error {
                     "could not launch UI window with `{binary}`: {source}"
                 )
             }
+            Self::WindowPageNotReached => {
+                write!(formatter, "UI window exited without reaching its page")
+            }
             Self::WindowWait(error) => write!(formatter, "could not wait for UI window: {error}"),
         }
     }
@@ -346,16 +353,14 @@ const BROWSER_HINT: &str = "Install a Chromium-family browser, set `AFUI_BROWSER
 /// What went wrong, classified — the axis a Provider maps into its own error
 /// vocabulary.
 ///
-/// A closed enum rather than a string, for the reason the string version was
-/// replaced. [`Error`]'s variants are AFUI's business and change; this is the
-/// stable axis above them, and a Provider translating AFUI's failures into its
-/// own codes is doing the right thing — but it can only do that *completely*
-/// if the compiler can tell it when it has missed one. A `&'static str` made
-/// that impossible: nothing exhaustively matches a string, so every consumer
-/// was forced into a wildcard arm, and a wildcard is where a new AFUI
-/// classification goes to be mis-reported. Three Providers here defaulted
-/// theirs to "the frontend could not be read", which is what a closed session
-/// runtime and a machine with no browser were both reported as.
+/// A closed enum rather than a string. [`Error`]'s variants are AFUI's
+/// business and change; this is the stable axis above them, and a Provider
+/// translating AFUI's failures into its own codes is doing the right thing —
+/// but it can only do that *completely* if the compiler can tell it when it
+/// has missed one. A `&'static str` cannot be matched exhaustively, so a
+/// caller is forced into a wildcard arm, which is where a classification added
+/// later is mis-reported — a closed runtime and a missing browser both read as
+/// "the frontend could not be read".
 ///
 /// Deliberately not `#[non_exhaustive]`. Adding a classification *should*
 /// stop a Provider's build until someone decides what it means to them —
@@ -475,9 +480,9 @@ impl fmt::Display for UiErrorKind {
 impl Error {
     /// A stable, domain-free classification for this failure.
     ///
-    /// Consumers were writing 20-to-70-line matches over every variant only to
-    /// arrive at their own error code, and every new variant silently fell into
-    /// whichever arm was last. This turns that into a prefix — a Provider maps
+    /// Without this, a Provider maps every variant to its own code, and a new
+    /// variant silently falls into whichever arm is last. This turns that into
+    /// a prefix — a Provider maps
     /// [`UiErrorKind::FrontendUnreadable`] to `<provider>_frontend_unreadable`
     /// and stops caring which of several variants produced it — or into an
     /// exhaustive match that stops compiling when AFUI adds one.
@@ -491,7 +496,7 @@ impl Error {
             Self::InvalidAsk { .. }
             | Self::InvalidIdentifier { .. }
             | Self::InvalidBaseUrl { .. }
-            | Self::InvalidUpstreamUrl { .. }
+            | Self::InvalidUpstreamUrl
             | Self::InvalidSessionOriginHost { .. }
             | Self::InvalidTtl
             | Self::InvalidAppIcon { .. } => UiErrorKind::InvalidArgument,
@@ -525,7 +530,7 @@ impl Error {
             Self::ConfigDirectoryUnavailable | Self::AttentionConfigInvalid { .. } => {
                 UiErrorKind::ConfigUnreadable
             }
-            Self::WindowBinaryNotFound | Self::WindowLaunch { .. } => {
+            Self::WindowBinaryNotFound | Self::WindowLaunch { .. } | Self::WindowPageNotReached => {
                 UiErrorKind::WindowUnavailable
             }
             Self::WindowWait(_) => UiErrorKind::WindowWaitFailed,
@@ -560,7 +565,9 @@ impl Error {
             | Self::FrontendIncompatible { .. }
             | Self::FrontendScript { .. }
             | Self::FrontendFileName { .. } => Some(SAFE_MODE_HINT),
-            Self::WindowBinaryNotFound | Self::WindowLaunch { .. } => Some(BROWSER_HINT),
+            Self::WindowBinaryNotFound | Self::WindowLaunch { .. } | Self::WindowPageNotReached => {
+                Some(BROWSER_HINT)
+            }
             _ => None,
         }
     }
@@ -577,7 +584,7 @@ impl std::error::Error for Error {
             Self::InvalidAsk { .. }
             | Self::InvalidIdentifier { .. }
             | Self::InvalidBaseUrl { .. }
-            | Self::InvalidUpstreamUrl { .. }
+            | Self::InvalidUpstreamUrl
             | Self::UpstreamDeliveryRequiresHttp { .. }
             | Self::InvalidSessionOriginHost { .. }
             | Self::InvalidTtl
@@ -601,7 +608,8 @@ impl std::error::Error for Error {
             | Self::PageRender { .. }
             | Self::PageIncomplete { .. }
             | Self::ConfigDirectoryUnavailable
-            | Self::WindowBinaryNotFound => None,
+            | Self::WindowBinaryNotFound
+            | Self::WindowPageNotReached => None,
         }
     }
 }

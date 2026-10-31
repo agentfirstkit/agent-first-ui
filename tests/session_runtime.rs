@@ -269,9 +269,8 @@ async fn reconnect_replays_one_call_without_dispatching_it_twice() {
 /// Retained state is a value, but publishing one is an occurrence: nothing
 /// here compares a state to the last one. That is what lets a Provider whose
 /// page only needs to know *that* something changed publish one unit-like
-/// state as an invalidation and let the page pull what it needs — a shape two
-/// of the pages in this kit are built on, which until now was a property of
-/// the implementation rather than a promise anyone had made.
+/// state as an invalidation and let the page pull what it needs. Pinned here
+/// so that shape is a promise rather than a property of the implementation.
 #[tokio::test]
 async fn republishing_an_equal_state_still_reaches_the_page() {
     let session = UiSession::<()>::new("inspector", "live_state").unwrap();

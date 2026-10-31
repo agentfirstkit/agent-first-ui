@@ -68,9 +68,9 @@ pub enum UiPageScript {
 /// What one Provider page is allowed to load, as switches rather than a
 /// string.
 ///
-/// Every page in this kit denies everything by default and then names a small,
+/// A page of this shape denies everything by default and then names a small,
 /// closed set of exceptions. Written by hand, that is a `format!` over nine
-/// directives repeated per Provider, where a typo produces a policy that is
+/// directives in every Provider, where a typo produces a policy that is
 /// merely *different* rather than invalid — and where the `HeaderValue::from_str`
 /// at the end has a failure arm that is very easy to answer by quietly falling
 /// back to some other policy, which is the one outcome a security header must
@@ -290,7 +290,7 @@ impl UiSecurityPolicy {
     /// Replace the whole policy string with one the caller wrote.
     ///
     /// The escape hatch, for a page whose needs [`UiPagePolicy`] does not
-    /// cover. Two things follow from taking it. The string is yours, so
+    /// cover. Taking it has consequences. The string is yours, so
     /// getting it wrong is your error and must be reported as one — never
     /// answered by quietly serving some other policy, which turns a mistake in
     /// a security header into a page that looks like it worked. And AFUI can

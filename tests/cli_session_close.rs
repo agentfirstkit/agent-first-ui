@@ -19,7 +19,9 @@ use serde_json::Value;
 #[test]
 fn closing_a_session_that_never_answers_fails_within_its_budget() {
     let config = tempfile::tempdir().unwrap();
-    // SAFETY: this binary contains exactly one test, so nothing races here.
+    // SAFETY: the only test here that writes the process environment. The
+    // other reads it only through `Command`, which takes std's environment
+    // lock, and passes its own `AFUI_CONFIG_DIR` to the child either way.
     unsafe { std::env::set_var("AFUI_CONFIG_DIR", config.path()) };
 
     // Accepts every connection and answers none of them. Each is read to its
@@ -65,11 +67,28 @@ fn closing_a_session_that_never_answers_fails_within_its_budget() {
     assert!(output.stdout.is_empty(), "{output:?}");
     let event: Value = serde_json::from_slice(&output.stderr).expect("one JSON event");
     assert_eq!(event["kind"], "error");
-    assert_eq!(event["error"]["code"], "frontend_error");
+    assert_eq!(event["error"]["code"], "session_close_failed");
     assert_eq!(
         event["error"]["message"],
         "session close request timed out after 5 seconds"
     );
 
     drop(announced);
+}
+
+/// A session that is not running is its own code, not the verb's generic
+/// failure: an agent retries a failed close, but not a missing one.
+#[test]
+fn opening_or_closing_a_session_that_is_not_running_is_session_not_found() {
+    let config = tempfile::tempdir().unwrap();
+    for verb in ["open", "close"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_afui"))
+            .args(["session", verb, "0123456789abcdef0123456789abcdef"])
+            .env("AFUI_CONFIG_DIR", config.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{verb}: {output:?}");
+        let event: Value = serde_json::from_slice(&output.stderr).expect("one JSON event");
+        assert_eq!(event["error"]["code"], "session_not_found", "{verb}");
+    }
 }

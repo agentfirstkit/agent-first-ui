@@ -40,8 +40,7 @@ pub(crate) const SESSION_BLOB_PATH_PREFIX: &str = "__afui/blobs/";
 /// reason that decides it: a frontend override replaces the Provider's own
 /// stylesheet wholesale, and a baseline concatenated into that file would go
 /// with it. Answered here, the floor survives the replacement — an override
-/// can be one template and no CSS at all, and still open as a page that
-/// belongs to this kit.
+/// can be one template and no CSS at all, and still open as an AFUI page.
 ///
 /// Written without a leading slash for the same reason as the others: a page
 /// references it relative to its own session root.

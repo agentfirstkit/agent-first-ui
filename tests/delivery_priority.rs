@@ -26,10 +26,13 @@ fn write_script(path: &Path, body: &str) -> io::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-/// A "browser" that exits the instant it is launched — a person closing the
-/// window before doing anything else.
+/// A browser that reaches its page and then closes without an answer.
 fn stub_browser(script_dir: &Path) -> io::Result<PathBuf> {
-    write_script(&script_dir.join("stub-browser.sh"), "#!/bin/sh\nexit 0\n")
+    write_script(
+        &script_dir.join("stub-browser.sh"),
+        // AFUI launches on a private page that holds the session URL.
+        "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in --app=file://*) curl -fsS \"$(sed -n 's/.*location\\.replace(\"\\(.*\\)\");.*/\\1/p' \"${arg#--app=file://}\")\" >/dev/null || exit 1 ;; esac; done\n",
+    )
 }
 
 #[tokio::test]
@@ -50,7 +53,10 @@ async fn an_explicit_mode_wins_over_a_conflicting_environment_default() {
     // `UiSession::window`, which is what proves the priority actually held.
     let outcome = UiDeliveryPlan::resolve(Some(UiDeliveryMode::Window))
         .unwrap()
-        .deliver(session, Router::new())
+        .deliver(
+            session,
+            Router::new().route("/", axum::routing::get(|| async { "panel" })),
+        )
         .await
         .unwrap();
 

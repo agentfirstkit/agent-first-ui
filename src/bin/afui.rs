@@ -5,13 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use agent_first_data::skill::{
-    self, SkillAction, SkillAgentSelection, SkillOptions, SkillScope, SkillSpec,
+    self, SkillAction, SkillAgentSelection, SkillAsset, SkillOptions, SkillScope, SkillSpec,
 };
 use agent_first_data::{
     ArgSpec, BoundOutcome, BuiltCliSpec, CliEmitter, CliSpec, CliSpecError, CliValue, Combination,
     CommandSpec, OutputFormat, OutputPlan, OutputSpec, OutputTo, ResolvedInvocation,
-    build_afdata_cli, cli_error_event, cli_help_event, cli_parse_output, cli_version_event,
-    render_cli_reference,
+    build_afdata_cli, cli_error_event, cli_help_event, cli_version_event, render_cli_reference,
 };
 use agent_first_ui::{
     FrontendManifest, FrontendScope, SAFE_MODE_ENV, UiWindow, UiWindowConfig, frontend_root,
@@ -46,15 +45,32 @@ fn stream_output() -> OutputSpec {
 /// Loopback, because reaching this from another device is a decision.
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 
-/// The skill this binary installs. `assets` is empty because the skill is a
-/// single file: it points agents at `afui frontend --help` rather than shipping
-/// a reference tree that would have to be kept in step with the CLI.
+/// The skill's task-specific references travel with the binary so an installed
+/// skill can route to them without a checkout or network access. Exact flags
+/// still come from the CLI registry's help.
 const SKILL_SPEC: SkillSpec = SkillSpec {
     name: "agent-first-ui",
     source: include_str!("../../skills/agent-first-ui/SKILL.md"),
     title: "Agent-First UI",
     marker_slug: "afui",
-    assets: &[],
+    assets: &[
+        SkillAsset {
+            path: "references/ask.md",
+            contents: include_str!("../../skills/agent-first-ui/references/ask.md"),
+        },
+        SkillAsset {
+            path: "references/providers.md",
+            contents: include_str!("../../skills/agent-first-ui/references/providers.md"),
+        },
+        SkillAsset {
+            path: "references/sessions.md",
+            contents: include_str!("../../skills/agent-first-ui/references/sessions.md"),
+        },
+        SkillAsset {
+            path: "references/frontends.md",
+            contents: include_str!("../../skills/agent-first-ui/references/frontends.md"),
+        },
+    ],
 };
 
 /// The named agents, and the fan-out value that is not one of them. Both skill
@@ -69,6 +85,10 @@ fn cli_spec() -> Result<BuiltCliSpec, CliSpecError> {
         .about("Ask a person questions, deliver UI sessions, and manage Provider-owned frontends.")
         .lifecycle_output(output())
         .command(CommandSpec::root())
+        .command(
+            CommandSpec::new(["frontend"])
+                .about("Scaffold, check, preview, and trust Provider frontend replacements."),
+        )
         .command(init_command())
         .command(ask::ask_command())
         .command(ask::wait_command());
@@ -153,7 +173,12 @@ fn cli_spec() -> Result<BuiltCliSpec, CliSpecError> {
                      `%APPDATA%\\afui\\config.json` on Windows. `AFUI_CONFIG_DIR` replaces that \
                      file's parent directory. The same policy controls direct `link` delivery.\n\n\
                      The serving progress event reports the resolved values as `idle_timeout_s` \
-                     and `grace_period_s`; `idle_timeout_s` is `null` when expiry is disabled.",
+                     and `grace_period_s`; `idle_timeout_s` is `null` when expiry is disabled.\n\n\
+                     The shared entry URL stays valid until this process exits. Unattended \
+                     revokes all mounts and streams while the current session list remains \
+                     available. Heartbeat resumes attendance; lapsed cards need Reopen. \
+                     Direct links retain terminal Expired delivery. AFUI-owned controls \
+                     follow Accept-Language (English or Simplified Chinese, English fallback).",
                 )
                 .arg(
                     ArgSpec::option("--listen", "ADDRESS")
@@ -167,16 +192,24 @@ fn cli_spec() -> Result<BuiltCliSpec, CliSpecError> {
                     "Authority to put in the URL when the bound address is not one \
                          anybody can open",
                 ))
-                .arg(ArgSpec::option_i64("--idle-minutes", "MINUTES").about(
-                    "Stop answering this long after nobody is attending the page: no \
+                .arg(
+                    ArgSpec::option_i64("--idle-minutes", "MINUTES")
+                        .range(0, i64::MAX)
+                        .about(
+                            "Start the warning this long after nobody is attending the page: no \
                              visible tab, no traffic through a session. Overrides AFUI's global \
-                             `attention.idle_timeout_s`; `0` never stops",
-                ))
-                .arg(ArgSpec::option_i64("--grace-minutes", "MINUTES").about(
-                    "How long the page warns first, still fully working, with a button \
+                             `attention.idle_timeout_s`; `0` disables attention expiry",
+                        ),
+                )
+                .arg(
+                    ArgSpec::option_i64("--grace-minutes", "MINUTES")
+                        .range(0, i64::MAX)
+                        .about(
+                            "How long the page warns first, still fully working, with a button \
                              that renews it. Overrides AFUI's global `attention.grace_period_s`; \
                              `0` lapses without warning",
-                ))
+                        ),
+                )
                 .arg(ArgSpec::option("--session-origin-host", "HOST").about(
                     "Give every session an origin of its own, `s-<credential>.<HOST>`, so a \
                      framed UI keeps browser storage. Needs `*.<HOST>` to resolve here, and a \
@@ -225,6 +258,11 @@ fn cli_spec() -> Result<BuiltCliSpec, CliSpecError> {
 }
 
 fn base_frontend_command(path: &str, about: &str) -> CommandSpec {
+    let scopes: &[&str] = if matches!(path, "enable" | "disable") {
+        &["workspace"]
+    } else {
+        &["workspace", "global"]
+    };
     CommandSpec::new(["frontend", path])
         .about(about)
         .arg(
@@ -233,7 +271,7 @@ fn base_frontend_command(path: &str, about: &str) -> CommandSpec {
         )
         .arg(ArgSpec::positional("ui_kind", 1, "UI_KIND").about("Stable UI kind identifier"))
         .arg(
-            ArgSpec::option_enum("--scope", ["workspace", "global"])
+            ArgSpec::option_enum("--scope", scopes.iter().copied())
                 .value_name("SCOPE")
                 .default("workspace")
                 .about("Frontend scope"),
@@ -387,7 +425,7 @@ const STYLESHEET_STARTER: &str = "\
 ";
 
 fn run_init(invocation: &ResolvedInvocation) -> ExitCode {
-    run_domain(invocation, || {
+    run_domain(invocation, "frontend_error", || {
         let context = context(invocation)?;
         let frontend_id = required(invocation, "frontend_id");
         validate_frontend_identifier("frontend_id", &frontend_id)
@@ -427,11 +465,13 @@ fn run_init(invocation: &ResolvedInvocation) -> ExitCode {
 }
 
 fn run_check(invocation: &ResolvedInvocation) -> ExitCode {
-    run_domain(invocation, || inspect(invocation, "frontend_check"))
+    run_domain(invocation, "frontend_error", || {
+        inspect(invocation, "frontend_check")
+    })
 }
 
 fn run_dev(invocation: &ResolvedInvocation) -> ExitCode {
-    run_domain(invocation, || {
+    run_domain(invocation, "frontend_error", || {
         let mut value = inspect(invocation, "frontend_dev")?;
         value["provider_owned_runtime"] = Value::Bool(true);
         value["message"] = Value::String(
@@ -442,7 +482,7 @@ fn run_dev(invocation: &ResolvedInvocation) -> ExitCode {
 }
 
 fn run_preview(invocation: &ResolvedInvocation) -> ExitCode {
-    run_domain(invocation, || {
+    run_domain(invocation, "frontend_error", || {
         let mut value = inspect(invocation, "frontend_preview")?;
         value["provider_owned_runtime"] = Value::Bool(true);
         value["message"] =
@@ -452,7 +492,7 @@ fn run_preview(invocation: &ResolvedInvocation) -> ExitCode {
 }
 
 fn run_enable(invocation: &ResolvedInvocation) -> ExitCode {
-    run_domain(invocation, || {
+    run_domain(invocation, "frontend_error", || {
         let context = context(invocation)?;
         let location = load_frontend(context.scope, context.root.clone())
             .map_err(|error| error.to_string())?;
@@ -479,7 +519,7 @@ fn run_enable(invocation: &ResolvedInvocation) -> ExitCode {
 }
 
 fn run_disable(invocation: &ResolvedInvocation) -> ExitCode {
-    run_domain(invocation, || {
+    run_domain(invocation, "frontend_error", || {
         let context = context(invocation)?;
         let mut trust = load_trust()?;
         let disabled = trust.frontends.remove(&trust_key(&context)).is_some();
@@ -497,7 +537,7 @@ fn run_disable(invocation: &ResolvedInvocation) -> ExitCode {
 }
 
 fn run_diff(invocation: &ResolvedInvocation) -> ExitCode {
-    run_domain(invocation, || {
+    run_domain(invocation, "frontend_error", || {
         let provider_id = required(invocation, "provider_id");
         let ui_kind = required(invocation, "ui_kind");
         validate_frontend_identifier("provider_id", &provider_id)
@@ -561,11 +601,13 @@ fn inspect(invocation: &ResolvedInvocation, code: &str) -> Result<Value, String>
     let location =
         load_frontend(context.scope, context.root.clone()).map_err(|error| error.to_string())?;
     let current_fingerprint = fingerprint(&context.root)?;
-    let trust = load_trust()?;
-    let trusted = trust
-        .frontends
-        .get(&trust_key(&context))
-        .is_some_and(|entry| entry.fingerprint == current_fingerprint);
+    let trusted = match context.scope {
+        FrontendScope::Global => true,
+        FrontendScope::Workspace => load_trust()?
+            .frontends
+            .get(&trust_key(&context))
+            .is_some_and(|entry| entry.fingerprint == current_fingerprint),
+    };
     Ok(json!({
         "code": code,
         "fingerprint": current_fingerprint,
@@ -671,15 +713,23 @@ fn file_hashes(root: &Path) -> Result<BTreeMap<String, String>, String> {
     }
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry.map_err(|error| error.to_string())?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
         let relative = entry
             .path()
             .strip_prefix(root)
             .map_err(|error| error.to_string())?
             .to_string_lossy()
             .replace('\\', "/");
+        // Refused as the library refuses it when it loads the frontend, or
+        // `check` and `enable` would report ready a frontend no render can read.
+        if entry.file_type().is_symlink() {
+            return Err(format!(
+                "a frontend may not supply `{relative}`: it is a symlink, and a trusted \
+                 fingerprint covers files rather than the places they point at"
+            ));
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let bytes = fs::read(entry.path()).map_err(io_error)?;
         hashes.insert(relative, blake3::hash(&bytes).to_hex().to_string());
     }
@@ -728,17 +778,17 @@ fn flag(invocation: &ResolvedInvocation, id: &str) -> bool {
 
 /// How long the page outlives the person looking at it.
 ///
-/// Zero and negative both mean "no limit". A person reaching for that reaches
-/// for `0`, and telling them `-1` is an error while `0` is not would be a
-/// distinction with nothing behind it.
+/// Both flags refuse a negative value at parse time. `0` means what the policy
+/// makes of it: no idle expiry for `--idle-minutes`, no warning before the
+/// lapse for `--grace-minutes`.
 fn attention_policy_override(
     invocation: &ResolvedInvocation,
 ) -> Result<Option<agent_first_ui::UiAttentionPolicy>, String> {
     let minutes = |id: &str| -> Option<std::time::Duration> {
-        let value = invocation.optional(id).and_then(CliValue::as_i64)?;
-        Some(std::time::Duration::from_secs(
-            u64::try_from(value.max(0)).unwrap_or(0) * 60,
-        ))
+        invocation
+            .optional(id)
+            .and_then(CliValue::as_i64)
+            .map(minutes_as_duration)
     };
     let idle = minutes("idle_minutes");
     let grace = minutes("grace_minutes");
@@ -756,13 +806,23 @@ fn attention_policy_override(
     Ok(Some(policy))
 }
 
+/// A minute count as a duration. Non-positive is zero; a count too large to
+/// express in seconds saturates rather than wrapping to a short interval.
+fn minutes_as_duration(minutes: i64) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        u64::try_from(minutes.max(0))
+            .unwrap_or(0)
+            .saturating_mul(60),
+    )
+}
+
 /// List the sessions Providers currently have open.
 ///
 /// The credential never appears here. A session URL carries one, and this is
 /// stdout — where an agent reads. `session open` is how a session is reached,
 /// and it hands the URL straight to a window without printing it.
 fn run_session_list(invocation: &ResolvedInvocation) -> ExitCode {
-    run_domain(invocation, || {
+    run_domain(invocation, "session_list_failed", || {
         let sessions = agent_first_ui::list_sessions().map_err(|error| error.to_string())?;
         let listed: Vec<Value> = sessions
             .iter()
@@ -801,15 +861,11 @@ fn run_session_list(invocation: &ResolvedInvocation) -> ExitCode {
 /// completing it means; closing this window ends this view of it the same way
 /// closing the Provider's own window would.
 fn run_session_open(invocation: &ResolvedInvocation) -> ExitCode {
-    run_domain(invocation, || {
+    run_coded(invocation, "session_open_failed", || {
         let session_id = required(invocation, "session_id");
         let entry = agent_first_ui::find_session(&session_id)
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| {
-                format!(
-                    "no running session `{session_id}`; run `afui session list` to see what is open"
-                )
-            })?;
+            .ok_or_else(|| session_not_found(&session_id))?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -855,15 +911,11 @@ fn run_session_open(invocation: &ResolvedInvocation) -> ExitCode {
 /// process has exited: the two are usually a heartbeat apart, but this command
 /// has no way to wait for the second one.
 fn run_session_close(invocation: &ResolvedInvocation) -> ExitCode {
-    run_domain(invocation, || {
+    run_coded(invocation, "session_close_failed", || {
         let session_id = required(invocation, "session_id");
         let entry = agent_first_ui::find_session(&session_id)
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| {
-                format!(
-                    "no running session `{session_id}`; run `afui session list` to see what is open"
-                )
-            })?;
+            .ok_or_else(|| session_not_found(&session_id))?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -876,12 +928,16 @@ fn run_session_close(invocation: &ResolvedInvocation) -> ExitCode {
                 "provider_id": entry.provider_id,
                 "ui_kind": entry.ui_kind,
             })),
-            404 => Err(format!(
-                "session `{session_id}` is already gone; there is nothing left to close"
-            )),
+            404 => Err(Failure {
+                code: Some("session_not_found"),
+                message: format!(
+                    "session `{session_id}` is already gone; there is nothing left to close"
+                ),
+            }),
             other => Err(format!(
                 "closing session `{session_id}` failed: the session answered HTTP {other}"
-            )),
+            )
+            .into()),
         }
     })
 }
@@ -902,10 +958,10 @@ async fn post_session_end(access_url_secret: &str) -> Result<u16, String> {
 }
 
 async fn post_session_end_request(access_url_secret: &str) -> Result<u16, String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     let rest = access_url_secret
         .strip_prefix("http://")
-        .ok_or_else(|| format!("session URL `{access_url_secret}` is not an http:// URL"))?;
+        .ok_or_else(|| "session close requires an http:// session URL".to_owned())?;
     // The same split the remote view's proxy makes of the same URL: the path
     // keeps its leading `/` and loses any trailing one, so a root path is the
     // empty prefix and contributes no separator of its own.
@@ -936,16 +992,31 @@ async fn post_session_end_request(access_url_secret: &str) -> Result<u16, String
         )
         .await
         .map_err(|error| error.to_string())?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
+    // Only the status line matters. A peer can keep the body open, send binary
+    // bytes, or echo the private request target; none belongs in diagnostics.
+    const MAX_STATUS_LINE_BYTES: u64 = 8192;
+    let mut response = Vec::new();
+    BufReader::new(stream.take(MAX_STATUS_LINE_BYTES + 1))
+        .read_until(b'\n', &mut response)
         .await
         .map_err(|error| error.to_string())?;
-    response
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse().ok())
-        .ok_or_else(|| format!("no HTTP status in the session's response: {response}"))
+    let invalid = || "the session returned an invalid HTTP status line".to_owned();
+    if response.len() as u64 > MAX_STATUS_LINE_BYTES || !response.ends_with(b"\r\n") {
+        return Err(invalid());
+    }
+    let line = std::str::from_utf8(&response).map_err(|_| invalid())?;
+    let mut fields = line.split(' ');
+    if !matches!(fields.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
+        return Err(invalid());
+    }
+    let code = fields.next().ok_or_else(invalid)?;
+    if code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    code.parse::<u16>()
+        .ok()
+        .filter(|code| (100..=599).contains(code))
+        .ok_or_else(invalid)
 }
 
 /// Serve the sessions running here to a browser that is not here.
@@ -1066,14 +1137,58 @@ fn run_session_serve(invocation: &ResolvedInvocation) -> ExitCode {
     }
 }
 
+/// Why one verb failed. Most failures take the verb's own code; one that an
+/// agent should branch on differently names a code of its own.
+struct Failure {
+    code: Option<&'static str>,
+    message: String,
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self {
+            code: None,
+            message,
+        }
+    }
+}
+
+fn session_not_found(session_id: &str) -> Failure {
+    Failure {
+        code: Some("session_not_found"),
+        message: format!(
+            "no running session `{session_id}`; run `afui session list` to see what is open"
+        ),
+    }
+}
+
+/// Run one verb and report its failure under `error_code`, which names the
+/// verb's own family so an agent branching on it can tell a broken frontend
+/// from a session that is gone.
 fn run_domain(
     invocation: &ResolvedInvocation,
+    error_code: &'static str,
     action: impl FnOnce() -> Result<Value, String>,
+) -> ExitCode {
+    run_coded(invocation, error_code, || action().map_err(Failure::from))
+}
+
+/// [`run_domain`] for a verb with a failure of its own to name.
+fn run_coded(
+    invocation: &ResolvedInvocation,
+    error_code: &'static str,
+    action: impl FnOnce() -> Result<Value, Failure>,
 ) -> ExitCode {
     let (format, output_to) = plan_output(invocation.output_plan());
     match action() {
         Ok(value) => emit_result(value, format, output_to),
-        Err(message) => emit_error("frontend_error", &message, format, output_to, 1),
+        Err(failure) => emit_error(
+            failure.code.unwrap_or(error_code),
+            &failure.message,
+            format,
+            output_to,
+            1,
+        ),
     }
 }
 
@@ -1181,19 +1296,13 @@ fn run_skill(invocation: &ResolvedInvocation, action: SkillAction) -> ExitCode {
 }
 
 fn plan_output(plan: &OutputPlan) -> (OutputFormat, OutputTo) {
-    let format = plan
-        .format()
-        .and_then(|value| cli_parse_output(value).ok())
-        .unwrap_or(OutputFormat::Json);
-    let destination = plan
-        .destination()
-        .and_then(|value| OutputTo::parse(value).ok())
-        .unwrap_or(OutputTo::Split);
+    let format = plan.output_format().unwrap_or(OutputFormat::Json);
+    let destination = plan.output_to().unwrap_or(OutputTo::Split);
     (format, destination)
 }
 
 fn stream_of(plan: &OutputPlan, is_error: bool) -> OutputTo {
-    if is_error || plan.destination() == Some("stderr") {
+    if is_error || plan.output_to() == Some(OutputTo::Stderr) {
         OutputTo::Stderr
     } else {
         OutputTo::Stdout
@@ -1264,6 +1373,16 @@ mod tests {
                 Ok(CliOutcome::Run(_))
             ));
         }
+    }
+
+    #[test]
+    fn minute_overrides_never_wrap_to_a_shorter_interval() {
+        assert_eq!(minutes_as_duration(-5), std::time::Duration::ZERO);
+        assert_eq!(minutes_as_duration(2), std::time::Duration::from_secs(120));
+        assert_eq!(
+            minutes_as_duration(i64::MAX),
+            std::time::Duration::from_secs(u64::MAX)
+        );
     }
 
     #[test]
@@ -1355,7 +1474,60 @@ mod tests {
 
     #[tokio::test]
     async fn post_session_end_reports_a_clear_error_for_a_url_it_cannot_use() {
-        assert!(post_session_end("https://example.com/abc/").await.is_err());
+        let error = post_session_end("https://example.com/private-canary/")
+            .await
+            .unwrap_err();
+        assert!(!error.contains("private-canary"));
         assert!(post_session_end("http://127.0.0.1:1/").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn post_session_end_bounds_and_validates_the_status_without_echoing_the_peer() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        for reply in [
+            b"private-canary 204 ignored\r\n".to_vec(),
+            b"HTTP/1.1 2040 private-canary\r\n".to_vec(),
+            b"HTTP/1.1 099 private-canary\r\n".to_vec(),
+            b"HTTP/1.1 204 private-canary".to_vec(),
+            b"private-canary".repeat(1024),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                stream.read_line(&mut String::new()).await.unwrap();
+                stream.get_mut().write_all(&reply).await.unwrap();
+            });
+            let error = post_session_end(&url).await.unwrap_err();
+            assert_eq!(error, "the session returned an invalid HTTP status line");
+            assert!(!error.contains("private-canary"));
+            peer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn post_session_end_does_not_wait_for_a_response_body_or_peer_close() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            stream.read_line(&mut String::new()).await.unwrap();
+            stream
+                .get_mut()
+                .write_all(b"HTTP/1.1 204 No Content\r\n\r\n\xff")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let status =
+            tokio::time::timeout(std::time::Duration::from_secs(1), post_session_end(&url))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(status, 204);
+        peer.abort();
     }
 }

@@ -8,6 +8,7 @@
 //! makes that remote view unavailable.
 
 use std::fs;
+use std::io::Read;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,7 @@ const DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(5 * 60);
 
 /// The global settings file read by AFUI-owned remote pages.
 const CONFIG_FILE: &str = "config.json";
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -88,10 +90,50 @@ impl UiAttentionPolicy {
     /// does not exist.
     pub fn load_global() -> Result<Self> {
         let path = global_afui_root()?.join(CONFIG_FILE);
-        if !path.is_file() {
-            return Ok(Self::default());
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
         }
-        let bytes = fs::read(&path).map_err(Error::Io)?;
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling config symlink is an invalid configured source,
+                // not an absent configuration.
+                match fs::symlink_metadata(&path) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(Self::default());
+                    }
+                    _ => return Err(Error::Io(error)),
+                }
+            }
+            Err(error) => return Err(Error::Io(error)),
+        };
+        let metadata = file.metadata().map_err(Error::Io)?;
+        if !metadata.is_file() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "AFUI config.json must be a regular file",
+            )));
+        }
+        let too_large = || {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "AFUI config.json exceeds the 1 MiB size limit",
+            ))
+        };
+        if metadata.len() > MAX_CONFIG_BYTES {
+            return Err(too_large());
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_CONFIG_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(Error::Io)?;
+        if bytes.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(too_large());
+        }
         let config: Config = serde_json::from_slice(&bytes)
             .map_err(|source| Error::AttentionConfigInvalid { path, source })?;
         Ok(Self::default()
@@ -229,11 +271,12 @@ impl AttentionClock {
         }
     }
 
+    /// An unreadable clock is a lapsed one: it must never read as `Live`.
     pub(super) fn phase(&self, policy: &UiAttentionPolicy) -> Phase {
         self.attention
             .lock()
             .map(|mut attention| attention.phase(policy))
-            .unwrap_or(Phase::Live)
+            .unwrap_or(Phase::Dead)
     }
 
     pub(super) fn attend(&self) {
@@ -243,16 +286,34 @@ impl AttentionClock {
         }
     }
 
+    /// Shared-page attendance starts a new clock; mount clocks stay terminal.
+    pub(super) fn resume(&self) {
+        if let Ok(mut attention) = self.attention.lock() {
+            *attention = Attention::new();
+            self.changed.notify_waiters();
+        }
+    }
+
+    pub(super) async fn wait_until_resumed(&self, policy: &UiAttentionPolicy) {
+        loop {
+            let changed = self.changed.notified();
+            if self.phase(policy) != Phase::Dead {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     pub(super) async fn wait_until_dead(&self, policy: &UiAttentionPolicy) {
         loop {
             // Register before reading the deadline so attention arriving in
             // between cannot be lost and leave this sleeping on an old one.
             let changed = self.changed.notified();
-            let remaining = self
-                .attention
-                .lock()
-                .ok()
-                .and_then(|mut attention| attention.remaining_until_dead(policy));
+            // An unreadable clock ends the view rather than waiting forever.
+            let remaining = match self.attention.lock() {
+                Ok(mut attention) => attention.remaining_until_dead(policy),
+                Err(_) => Some(Duration::ZERO),
+            };
             match remaining {
                 None => std::future::pending::<()>().await,
                 Some(remaining) if remaining.is_zero() => return,
@@ -274,6 +335,24 @@ mod tests {
     use std::io::Write;
 
     use crate::{CONFIG_DIR_ENV, ENV_LOCK};
+
+    #[tokio::test]
+    #[allow(clippy::panic)]
+    async fn an_unreadable_clock_fails_closed_even_without_an_idle_limit() {
+        let clock = AttentionClock::new();
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = clock.attention.lock().unwrap();
+            panic!("simulate an interrupted attention update");
+        });
+        assert!(poisoned.is_err());
+        assert_eq!(clock.phase(&UiAttentionPolicy::never()), Phase::Dead);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            clock.wait_until_dead(&UiAttentionPolicy::never()),
+        )
+        .await
+        .expect("a poisoned clock must end the view");
+    }
 
     #[test]
     fn default_policy_has_one_warning_after_one_idle_interval() {
@@ -306,6 +385,57 @@ mod tests {
         assert_eq!(unlimited.grace_period(), Duration::from_secs(9));
         // SAFETY: every AFUI unit test that mutates this variable uses ENV_LOCK.
         unsafe { std::env::remove_var(CONFIG_DIR_ENV) };
+    }
+
+    #[test]
+    fn only_an_absent_global_config_uses_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(CONFIG_FILE);
+        // SAFETY: every AFUI unit test that mutates this variable uses ENV_LOCK.
+        unsafe { std::env::set_var(CONFIG_DIR_ENV, root.path()) };
+        let missing = UiAttentionPolicy::load_global();
+        fs::create_dir(&path).unwrap();
+        let directory = UiAttentionPolicy::load_global();
+        fs::remove_dir(&path).unwrap();
+        fs::write(&path, vec![b' '; MAX_CONFIG_BYTES as usize + 1]).unwrap();
+        let oversized = UiAttentionPolicy::load_global();
+        fs::remove_file(&path).unwrap();
+        #[cfg(unix)]
+        let dangling = {
+            std::os::unix::fs::symlink(root.path().join("missing.json"), &path).unwrap();
+            UiAttentionPolicy::load_global()
+        };
+        // SAFETY: every AFUI unit test that mutates this variable uses ENV_LOCK.
+        unsafe { std::env::remove_var(CONFIG_DIR_ENV) };
+        assert_eq!(missing.unwrap(), UiAttentionPolicy::default());
+        assert!(matches!(directory, Err(Error::Io(_))));
+        assert!(oversized.unwrap_err().to_string().contains("1 MiB"));
+        #[cfg(unix)]
+        assert!(matches!(dangling, Err(Error::Io(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_config_rejects_a_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let path =
+            std::ffi::CString::new(root.path().join(CONFIG_FILE).as_os_str().as_bytes()).unwrap();
+        // SAFETY: the C string names a path in this test's private directory.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        // SAFETY: ENV_LOCK serializes configuration access in this test binary.
+        unsafe { std::env::set_var(CONFIG_DIR_ENV, root.path()) };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            sender.send(UiAttentionPolicy::load_global()).unwrap();
+        });
+        let read = receiver.recv_timeout(Duration::from_secs(2));
+        // SAFETY: ENV_LOCK still holds exclusive configuration access.
+        unsafe { std::env::remove_var(CONFIG_DIR_ENV) };
+        assert!(matches!(read.unwrap(), Err(Error::Io(_))));
+        reader.join().unwrap();
     }
 
     #[test]

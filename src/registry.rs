@@ -29,7 +29,10 @@ use crate::{Error, Result, UiSessionMetadata, global_afui_root};
 pub const NO_REGISTRY_ENV: &str = "AFUI_NO_REGISTRY";
 
 /// One live session, as another process can see it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` prints `***` for both URLs: each carries the session's credential,
+/// and `{:?}` on a listing is how one ends up in a log.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiSessionEntry {
     pub session_id: String,
     pub provider_id: String,
@@ -66,8 +69,8 @@ pub struct UiSessionEntry {
     /// it. Somebody opens a terminal, works in it, and asks for a second
     /// interface — that one belongs *after* the terminal, because that is when
     /// it happened. Sorting by name instead would file it wherever its
-    /// Provider's name falls in the alphabet, which is a fact about this kit's
-    /// naming and not about anything the person did.
+    /// Provider's name falls in the alphabet, which is a fact about how
+    /// programs are named and not about anything the person did.
     ///
     /// **Not stored, and deliberately not.** It is the entry file's own
     /// modification time, read when the entry is read. A Provider announces by
@@ -93,6 +96,26 @@ pub struct UiSessionEntry {
     /// one process and served by another, and then this is the only thing that
     /// answers §4.6's third criterion.
     pub owner_pid: u32,
+}
+
+impl std::fmt::Debug for UiSessionEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UiSessionEntry")
+            .field("session_id", &self.session_id)
+            .field("provider_id", &self.provider_id)
+            .field("ui_kind", &self.ui_kind)
+            .field("subject", &self.subject)
+            .field("waits_for_decision", &self.waits_for_decision)
+            .field("access_url_secret", &"***")
+            .field(
+                "window_url_secret",
+                &self.window_url_secret.as_ref().map(|_| "***"),
+            )
+            .field("announced_at_epoch_ms", &self.announced_at_epoch_ms)
+            .field("owner_pid", &self.owner_pid)
+            .finish()
+    }
 }
 
 impl UiSessionEntry {
@@ -123,42 +146,21 @@ impl Drop for RegistryHandle {
     }
 }
 
+/// Announce, or say why not.
+///
+/// Whether a failure matters is the caller's call, because callers are not in
+/// the same position. A session with a window or a URL of its own still works
+/// when this fails; it is only invisible to `afui session list`. A `session`
+/// delivery or an announced upstream has nothing else — the listing *is* the
+/// delivery — so a failure that went unmentioned would leave a Provider
+/// waiting on a session nobody can find. Opting out is a decision rather than
+/// a failure, so it succeeds and lists nothing.
 pub(crate) fn publish(
     metadata: &UiSessionMetadata,
     subject: Option<String>,
     waits_for_decision: bool,
     access_url: &str,
     window_url: Option<&str>,
-) -> RegistryHandle {
-    if registry_opted_out() {
-        return RegistryHandle { path: None };
-    }
-    // Announcing is a convenience, never a precondition. A session that cannot
-    // write here still works; it is only invisible to `afui session list`.
-    let path = write_entry(
-        metadata,
-        subject,
-        waits_for_decision,
-        access_url,
-        window_url,
-    )
-    .ok();
-    RegistryHandle { path }
-}
-
-/// Announce, or say why not.
-///
-/// The same write as [`publish`] under a different error policy, because the
-/// two callers are not in the same position. A served session that cannot
-/// announce itself still has its window and its URL, so failing there would
-/// take away something that works. An announced upstream has nothing else —
-/// the listing *is* the delivery — so a failure that went unmentioned would
-/// leave a Provider waiting on a session nobody can find.
-pub(crate) fn publish_strictly(
-    metadata: &UiSessionMetadata,
-    subject: Option<String>,
-    waits_for_decision: bool,
-    access_url: &str,
 ) -> Result<RegistryHandle> {
     if registry_opted_out() {
         return Ok(RegistryHandle { path: None });
@@ -169,7 +171,7 @@ pub(crate) fn publish_strictly(
             subject,
             waits_for_decision,
             access_url,
-            None,
+            window_url,
         )?),
     })
 }
@@ -349,8 +351,8 @@ const REACHABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_mill
 impl UiSessionEntry {
     /// Whether this entry describes something a person can still use.
     ///
-    /// Two questions, because a session has two ways of being over and only one
-    /// of them used to be asked. Reachability answers "is this still being
+    /// Both questions, because a session can be over in either sense and
+    /// asking only one misses the other. Reachability answers "is this still being
     /// served?", which for a session AFUI serves is the whole story: the host
     /// lives in the owning process and stops accepting the moment that process
     /// does. An announced upstream separates the two — its page is served by a

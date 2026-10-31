@@ -30,9 +30,9 @@ const MINIMUM_RENEWAL_INTERVAL: Duration = Duration::from_millis(100);
 /// Whether this is the shape of a credential AFUI issues.
 ///
 /// A caller that reads an access URL apart to find the credential inside it
-/// has, until now, hard-coded "sixty-four hex digits" — a fact about
-/// [`crate::UiAccessToken`] that lived in a consumer, and that would have gone
-/// on being true in that consumer long after it stopped being true here.
+/// would otherwise hard-code "sixty-four hex digits" — a fact about
+/// [`crate::UiAccessToken`] held outside this crate, which would go on being
+/// true there long after it stopped being true here.
 #[must_use]
 pub fn is_ui_credential(candidate: &str) -> bool {
     candidate.len() == SECRET_HEX_DIGITS

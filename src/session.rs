@@ -143,6 +143,11 @@ pub struct ActiveUiSession<T> {
     _registration: SessionRegistration,
     /// Withdraws this session from the cross-process registry when dropped.
     _announcement: RegistryHandle,
+    /// Why the registry write failed, if it did. Kept rather than returned: a
+    /// session with a window or a URL still works without the listing, and
+    /// only a `session` delivery, which has nothing else, turns it into an
+    /// error.
+    listing_failure: Option<Error>,
     /// Set only when this session created its own single-session host, which
     /// must then outlive it. A session mounted on a caller-owned host holds
     /// nothing here — the caller decides when that host stops.
@@ -178,15 +183,25 @@ impl<T> UiCompletion<T> {
 
     /// Offer `outcome` as the session's ending, and return the one that won.
     ///
-    /// The close, expiry and window-close branches used to build an outcome and
-    /// return it directly, so a `Completed(T)` that became ready in the same
-    /// moment could lose to `Closed` or `Expired` on nothing more than which
-    /// arm `select!` happened to pick — and a caller would be told the person
-    /// closed the window when they had in fact just answered. Every ending goes
-    /// through the same slot now, and whoever got there first is the answer.
+    /// A close, expiry or window-close branch that built an outcome and
+    /// returned it directly could lose a `Completed(T)` that became ready in
+    /// the same moment, on nothing more than which arm `select!` happened to
+    /// pick — and a caller would be told the person closed the window when they
+    /// had in fact just answered. So every ending goes through the same slot,
+    /// and whoever got there first is the answer.
     async fn settle(&self, outcome: Outcome<T>) -> Outcome<T> {
         self.finish(outcome).await;
         self.wait().await
+    }
+
+    /// End the session on `error`, unless an outcome already won. A failure
+    /// after the person answered must not lose the answer, and one before it
+    /// must still close the slot, so a late `complete` reports `false` rather
+    /// than finishing a session whose caller was already told it failed.
+    async fn settle_failed(&self, error: Error) -> Result<Outcome<T>> {
+        let won = self.finish(Outcome::Closed).await;
+        let outcome = self.wait().await;
+        if won { Err(error) } else { Ok(outcome) }
     }
 
     /// Take the terminal outcome. Called once, by the waiter that owns the
@@ -442,14 +457,17 @@ impl UiMount {
         // Provider remembering to opt in is a feature that silently has holes.
         let subject = session.subject;
         let waits_for_decision = session.waits_for_decision;
-        let announcement = registry::publish(
+        let (announcement, listing_failure) = match registry::publish(
             &session.metadata,
             subject.clone(),
             waits_for_decision,
             &registered.access_url,
             (registered.window_url != registered.access_url)
                 .then_some(registered.window_url.as_str()),
-        );
+        ) {
+            Ok(announcement) => (announcement, None),
+            Err(error) => (registry::unpublished(), Some(error)),
+        };
         Ok(ActiveUiSession {
             metadata: session.metadata,
             subject,
@@ -461,6 +479,7 @@ impl UiMount {
             close: registered.close,
             _registration: registered.registration,
             _announcement: announcement,
+            listing_failure,
             _owned_host: None,
             runtime_closer: registered.runtime_closer,
         })
@@ -500,6 +519,7 @@ where
 
     /// The URL AFUI's own local window opens: the access URL plus the window
     /// key that lets that window, and only it, ask this machine to open a link.
+    #[cfg(test)]
     pub(crate) fn window_url(&self) -> &str {
         &self.window_url
     }
@@ -537,7 +557,24 @@ where
         self.completion.clone()
     }
 
-    pub async fn wait(mut self) -> Result<Outcome<T>> {
+    /// Take why this session is missing from the registry, if its write
+    /// failed.
+    pub(crate) fn take_listing_failure(&mut self) -> Option<Error> {
+        self.listing_failure.take()
+    }
+
+    pub async fn wait(self) -> Result<Outcome<T>> {
+        self.wait_or_lapse(std::future::pending()).await
+    }
+
+    /// [`Self::wait`], with one more way to end: `lapsed` resolving, which is a
+    /// remote view's attention policy running out. It offers `Expired` to the
+    /// same slot every other ending goes through, so an answer given in the
+    /// same moment still wins and a later `complete` still reports `false`.
+    pub(crate) async fn wait_or_lapse(
+        mut self,
+        lapsed: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<Outcome<T>> {
         let outcome = tokio::select! {
             outcome = self.completion.wait() => outcome,
             // The reserved end route this session answers under its own
@@ -549,23 +586,41 @@ where
             () = expiry_elapsed(&self.access_token) => {
                 self.completion.settle(Outcome::Expired).await
             }
+            lapsed = lapsed => match lapsed {
+                Ok(()) => self.completion.settle(Outcome::Expired).await,
+                Err(error) => {
+                    let failed = self.completion.settle_failed(error).await;
+                    self.end();
+                    return failed;
+                }
+            },
         };
         self.end();
         Ok(outcome)
     }
 
     pub async fn open_window(self, config: &UiWindowConfig) -> Result<Outcome<T>> {
-        let window = UiWindow::launch(&self.window_url, config)?;
+        let window = self.launch_window(config)?;
         self.wait_with_window(window).await
+    }
+
+    pub(crate) fn launch_window(&self, config: &UiWindowConfig) -> Result<UiWindow> {
+        let (url, arrived) = self._registration.launch(&self.window_url)?;
+        Ok(UiWindow::launch(&url, config)?.track_arrival(arrived))
     }
 
     pub(crate) async fn wait_with_window(mut self, mut window: UiWindow) -> Result<Outcome<T>> {
         let outcome = tokio::select! {
             outcome = self.completion.wait() => outcome,
             () = self.close.notified() => self.completion.settle(Outcome::Closed).await,
-            closed = window.wait_closed() => {
-                closed?;
-                self.completion.settle(Outcome::Closed).await
+            closed = window.wait_closed() => match closed {
+                Ok(()) => self.completion.settle(Outcome::Closed).await,
+                Err(error) => {
+                    let failed = self.completion.settle_failed(error).await;
+                    drop(window);
+                    self.end();
+                    return failed;
+                }
             },
             () = expiry_elapsed(&self.access_token) => {
                 self.completion.settle(Outcome::Expired).await
@@ -725,6 +780,80 @@ mod tests {
         // The credential lives in the path, and the trailing slash is what
         // makes a page's relative asset references resolve.
         assert!(url.ends_with('/'), "{url}");
+    }
+
+    #[tokio::test]
+    async fn a_remote_view_lapsing_with_an_answer_still_returns_the_answer() {
+        // A link's attention policy used to return `Expired` from its own
+        // `select!` arm, past the slot: an answer given in the same moment came
+        // back as an expiry, and a handle kept afterwards could still answer.
+        let session = UiSession::<u32>::new("reviewer", "case_review").unwrap();
+        let completion = session.completion();
+        let active = session
+            .serve(Router::new(), UiUrlDelivery::new(UiExpiry::Never))
+            .await
+            .unwrap();
+        assert!(completion.complete(7).await);
+        assert_eq!(
+            active
+                .wait_or_lapse(std::future::ready(Ok(())))
+                .await
+                .unwrap(),
+            Outcome::Completed(7)
+        );
+
+        let session = UiSession::<u32>::new("reviewer", "case_review").unwrap();
+        let completion = session.completion();
+        let active = session
+            .serve(Router::new(), UiUrlDelivery::new(UiExpiry::Never))
+            .await
+            .unwrap();
+        assert_eq!(
+            active
+                .wait_or_lapse(std::future::ready(Ok(())))
+                .await
+                .unwrap(),
+            Outcome::Expired
+        );
+        assert!(
+            !completion.complete(9).await,
+            "a lapsed session must not accept an answer"
+        );
+
+        // A remote view that fails rather than lapses is an error to the
+        // caller, and still closes the slot behind it.
+        let session = UiSession::<u32>::new("reviewer", "case_review").unwrap();
+        let completion = session.completion();
+        let active = session
+            .serve(Router::new(), UiUrlDelivery::new(UiExpiry::Never))
+            .await
+            .unwrap();
+        assert!(matches!(
+            active
+                .wait_or_lapse(std::future::ready(Err(Error::InvalidTtl)))
+                .await,
+            Err(Error::InvalidTtl)
+        ));
+        assert!(
+            !completion.complete(9).await,
+            "a failed session must not accept an answer"
+        );
+
+        // And one that fails after the person answered keeps the answer.
+        let session = UiSession::<u32>::new("reviewer", "case_review").unwrap();
+        let completion = session.completion();
+        let active = session
+            .serve(Router::new(), UiUrlDelivery::new(UiExpiry::Never))
+            .await
+            .unwrap();
+        assert!(completion.complete(7).await);
+        assert_eq!(
+            active
+                .wait_or_lapse(std::future::ready(Err(Error::InvalidTtl)))
+                .await
+                .unwrap(),
+            Outcome::Completed(7)
+        );
     }
 
     #[tokio::test]

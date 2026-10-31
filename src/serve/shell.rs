@@ -68,7 +68,16 @@ pub(super) async fn respond(
     let response = match (request.method(), remainder) {
         (&Method::GET, "/") => asset_owned(
             "text/html; charset=utf-8",
-            state.shell.page().as_bytes().to_vec(),
+            state
+                .shell
+                .page(super::locale::chinese(
+                    request
+                        .headers()
+                        .get("accept-language")
+                        .and_then(|value| value.to_str().ok()),
+                ))
+                .as_bytes()
+                .to_vec(),
         ),
         (&Method::GET, "/shell.css") => {
             asset_owned("text/css; charset=utf-8", state.shell.stylesheet().to_vec())
@@ -89,21 +98,17 @@ pub(super) async fn respond(
         // A replacement page's own static files. Every path 404s when there is
         // no replacement, so the route is answered without asking whether one
         // exists.
-        (&Method::GET, rest) if rest.starts_with("/assets/") => {
-            state.shell.asset(rest.trim_start_matches("/assets/"))
-        }
+        (&Method::GET, rest) if rest.starts_with("/assets/") => state
+            .shell
+            .asset(rest.strip_prefix("/assets/").unwrap_or(rest)),
         (&Method::POST, "/attention") => attention(state, request).await,
         (&Method::POST, rest) => {
-            if let Some(session_id) = rest
-                .strip_prefix("/sessions/")
-                .and_then(|rest| rest.strip_suffix("/reopen"))
+            if let Some(session_id) = rest.strip_circumfix("/sessions/", "/reopen")
                 && !session_id.is_empty()
                 && !session_id.contains('/')
             {
                 reopen(state, session_id)
-            } else if let Some(session_id) = rest
-                .strip_prefix("/sessions/")
-                .and_then(|rest| rest.strip_suffix("/end"))
+            } else if let Some(session_id) = rest.strip_circumfix("/sessions/", "/end")
                 && !session_id.is_empty()
                 && !session_id.contains('/')
             {
@@ -158,6 +163,10 @@ async fn attention(state: &Arc<ServeState>, request: Request) -> Response<Body> 
                 .iter()
                 .filter_map(|session| session.as_str().map(str::to_owned)),
         );
+    }
+    // Record sessions that arrived while unattended before restarting the clock.
+    if state.sessions(None).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     state.attend(&watching);
     StatusCode::NO_CONTENT.into_response()
@@ -232,9 +241,14 @@ fn content_security_policy(addressing: &Addressing) -> HeaderValue {
 /// parsing.
 async fn sessions(state: &Arc<ServeState>, shell_authority: Option<&str>) -> Response<Body> {
     match state.sessions(shell_authority).await {
-        Ok(sessions) => {
-            let mut page = serde_json::json!({ "state": state.shell_phase().word() });
-            if let Phase::Expiring { remaining } = state.shell_phase() {
+        Ok((sessions, phase)) => {
+            let word = if phase == Phase::Dead && !state.is_link() {
+                "unattended"
+            } else {
+                phase.word()
+            };
+            let mut page = serde_json::json!({ "state": word });
+            if let Phase::Expiring { remaining } = phase {
                 page["expires_in_ms"] = serde_json::json!(remaining.as_millis());
             }
             let body = serde_json::json!({

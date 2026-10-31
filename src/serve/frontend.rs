@@ -1,6 +1,6 @@
 //! Where this listener's own page comes from, and what a person may replace.
 //!
-//! Every other page in this kit is a Provider's, and AFUI holds it to a
+//! Every other page AFUI serves is a Provider's, and AFUI holds it to a
 //! contract: content-addressed trust, no scripts from a frontend, an error
 //! rather than a quiet fallback. This one is AFUI's, and it is held to exactly
 //! the same contract by exactly the same machinery — a page that lists what is
@@ -25,7 +25,7 @@
 //! later edit revokes it, and `AFUI_SAFE_MODE=1` ignores overrides entirely.
 //!
 //! What none of that covers is a person who enables a fingerprint without
-//! reading it. That is the same bargain as every other frontend in this kit,
+//! reading it. That is the same bargain as every other AFUI frontend,
 //! and it is why enabling is a deliberate act rather than a directory being
 //! present.
 
@@ -54,7 +54,7 @@ const UI_API_VERSION: &str = "1";
 
 /// Where AFUI splices in its own runtime.
 const TRUSTED_RUNTIME_MARKER: &str = "<!-- afui:trusted-runtime -->";
-const TRUSTED_RUNTIME: &str = "<script defer src=\"shell.js\"></script>";
+const TRUSTED_RUNTIME: &str = "<script defer src=\"shell.js\" data-words=\"{words}\"></script>";
 
 const ENTRY_TEMPLATE: &str = "page.html.j2";
 const BUILTIN_PAGE: &str = include_str!("assets/page.html.j2");
@@ -160,7 +160,7 @@ const ACTIONS: [Action; 7] = [
         hidden: true,
         slot: "navigation",
     },
-    // A glyph rather than the word it used to carry: the card's own height is
+    // A glyph rather than a word on its face: the card's own height is
     // where a person reads its size off, so the word is worth more as this
     // control's name — which the runtime keeps current — than as its face.
     Action {
@@ -217,6 +217,8 @@ const ACTIONS: [Action; 7] = [
 #[derive(Serialize)]
 struct ShellDocument {
     ui_api_version: &'static str,
+    lang: &'static str,
+    words: std::collections::BTreeMap<&'static str, &'static str>,
     title: &'static str,
     heading: &'static str,
     slot_heading: &'static str,
@@ -230,19 +232,26 @@ struct ShellDocument {
     action_attribute: &'static str,
 }
 
-fn shell_document() -> ShellDocument {
+fn shell_document(chinese: bool) -> ShellDocument {
+    let words = super::locale::words(chinese);
+    let actions = ACTIONS.map(|mut action| {
+        action.label = words[action.name];
+        action
+    });
     ShellDocument {
         ui_api_version: UI_API_VERSION,
+        lang: if chinese { "zh-CN" } else { "en" },
         title: "Agent-First UI",
         heading: "Agent-First UI",
-        slot_heading: "Open interfaces",
-        empty_label: "Nothing is open.",
-        open_label: "Open in a new tab",
-        more_label: "More actions",
-        renew_label: "Keep open",
+        slot_heading: words["slot_heading"],
+        empty_label: words["empty"],
+        open_label: words["open"],
+        more_label: words["more"],
+        renew_label: words["renew"],
         elements: ELEMENT_IDS,
         card: CARD_CLASSES,
-        actions: ACTIONS,
+        actions,
+        words,
         action_attribute: "data-act",
     }
 }
@@ -254,6 +263,7 @@ fn shell_document() -> ShellDocument {
 /// nothing.
 pub(super) struct ShellUi {
     page: String,
+    page_zh: String,
     stylesheet: Vec<u8>,
     app_icon: UiAppIcon,
     frontend: UiFrontend,
@@ -266,17 +276,19 @@ impl ShellUi {
             .file("style.css")?
             .unwrap_or_else(|| BUILTIN_STYLE.as_bytes().to_vec());
         let app_icon = frontend.app_icon(BUILTIN_APP_ICON)?;
-        let page = render(&frontend)?;
+        let page = render(&frontend, false)?;
+        let page_zh = render(&frontend, true)?;
         Ok(Self {
             page,
+            page_zh,
             stylesheet,
             app_icon,
             frontend,
         })
     }
 
-    pub(super) fn page(&self) -> &str {
-        &self.page
+    pub(super) fn page(&self, chinese: bool) -> &str {
+        if chinese { &self.page_zh } else { &self.page }
     }
 
     pub(super) fn stylesheet(&self) -> &[u8] {
@@ -303,7 +315,7 @@ impl ShellUi {
     }
 }
 
-fn render(frontend: &UiFrontend) -> Result<String> {
+fn render(frontend: &UiFrontend, chinese: bool) -> Result<String> {
     let source = match frontend.text(&format!("templates/{ENTRY_TEMPLATE}"))? {
         Some(text) => {
             reject_frontend_script(ENTRY_TEMPLATE, &text)?;
@@ -311,7 +323,7 @@ fn render(frontend: &UiFrontend) -> Result<String> {
         }
         None => BUILTIN_PAGE.to_owned(),
     };
-    render_source(&source, frontend.frontend_id())
+    render_source_localized(&source, frontend.frontend_id(), chinese)
 }
 
 /// The checks, over whatever source was resolved.
@@ -319,7 +331,16 @@ fn render(frontend: &UiFrontend) -> Result<String> {
 /// Separated from resolution so that what a replacement must satisfy can be
 /// tested against a replacement, rather than only against the one page that
 /// happens to satisfy it.
+#[cfg(test)]
 fn render_source(source: &str, frontend_id: Option<&str>) -> Result<String> {
+    render_source_localized(source, frontend_id, false)
+}
+
+fn render_source_localized(
+    source: &str,
+    frontend_id: Option<&str>,
+    chinese: bool,
+) -> Result<String> {
     let source = source.to_owned();
     let mut environment = Environment::new();
     environment.set_undefined_behavior(UndefinedBehavior::SemiStrict);
@@ -333,7 +354,7 @@ fn render_source(source: &str, frontend_id: Option<&str>) -> Result<String> {
         .map_err(|error| broken(frontend_id, &error.to_string()))?;
     let page = template
         .render(minijinja::context! {
-            document => minijinja::Value::from(minijinja::value::Serde(shell_document())),
+            document => minijinja::Value::from(minijinja::value::Serde(shell_document(chinese))),
         })
         .map_err(|error| broken(frontend_id, &error.to_string()))?;
 
@@ -389,7 +410,17 @@ fn render_source(source: &str, frontend_id: Option<&str>) -> Result<String> {
             ));
         }
     }
-    Ok(page.replace(TRUSTED_RUNTIME_MARKER, TRUSTED_RUNTIME))
+    let words = serde_json::to_string(&super::locale::words(chinese))
+        .map_err(Error::SessionRuntimeEncode)?;
+    let words = words
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    Ok(page.replace(
+        TRUSTED_RUNTIME_MARKER,
+        &TRUSTED_RUNTIME.replace("{words}", &words),
+    ))
 }
 
 fn broken(frontend_id: Option<&str>, what: &str) -> Error {
@@ -415,12 +446,13 @@ mod tests {
     fn the_built_in_page_meets_every_rule_a_frontend_is_held_to() {
         let ui = ShellUi::resolve(std::path::Path::new("/nonexistent")).unwrap();
         assert!(ui.frontend_id().is_none());
-        assert!(!ui.page().contains(TRUSTED_RUNTIME_MARKER));
-        assert!(ui.page().contains(TRUSTED_RUNTIME));
+        assert!(!ui.page(false).contains(TRUSTED_RUNTIME_MARKER));
+        assert!(ui.page(false).contains("src=\"shell.js\""));
         assert!(!ui.stylesheet().is_empty());
         for action in ACTIONS {
             assert!(
-                ui.page().contains(&format!("data-act=\"{}\"", action.name)),
+                ui.page(false)
+                    .contains(&format!("data-act=\"{}\"", action.name)),
                 "the page never offers `{}`",
                 action.name
             );
@@ -442,9 +474,9 @@ mod tests {
         // interface inside it are the one place where two palettes would be
         // visible side by side.
         assert!(
-            ui.page().contains("href=\"__afui/base.css\""),
+            ui.page(false).contains("href=\"__afui/base.css\""),
             "{}",
-            ui.page()
+            ui.page(false)
         );
         assert!(
             crate::page_style::BASE_STYLE.contains("color-scheme: light dark"),
@@ -452,15 +484,31 @@ mod tests {
         );
         assert!(style.contains(".card-notice[data-state=\"dead\"]"));
         assert!(style.contains("@media (pointer: coarse)"));
-        assert!(ui.page().contains("card-action-status"), "{}", ui.page());
+        assert!(
+            ui.page(false).contains("card-action-status"),
+            "{}",
+            ui.page(false)
+        );
         // The head takes the one thing it cannot know, so an interface that
         // trusts it with all three stops drawing a second head underneath.
-        assert!(ui.page().contains("card-page-status"), "{}", ui.page());
+        assert!(
+            ui.page(false).contains("card-page-status"),
+            "{}",
+            ui.page(false)
+        );
         // Removing a card and ending the session behind it stay words, behind
         // the overflow control: they are the two nobody should reach for by
         // recognising a picture.
-        assert!(ui.page().contains(">Hide</button>"), "{}", ui.page());
-        assert!(ui.page().contains(">End session</button>"), "{}", ui.page());
+        assert!(
+            ui.page(false).contains(">Hide</button>"),
+            "{}",
+            ui.page(false)
+        );
+        assert!(
+            ui.page(false).contains(">End session</button>"),
+            "{}",
+            ui.page(false)
+        );
         // A control drawn as a glyph still has to say what it is. The name is
         // the label, on the control itself, with the picture hidden from
         // anything reading the page out — a bar of unnamed glyphs is a bar
@@ -472,25 +520,29 @@ mod tests {
             "aria-label=\"Open in a new tab\"",
         ] {
             assert!(
-                ui.page().contains(named),
+                ui.page(false).contains(named),
                 "{named} is missing: {}",
-                ui.page()
+                ui.page(false)
             );
         }
         for glyph in ["←", "↕", "↗", "⋮"] {
             assert!(
-                ui.page()
+                ui.page(false)
                     .contains(&format!("aria-hidden=\"true\">{glyph}<")),
                 "the glyph {glyph} must be hidden from a reader that has the name: {}",
-                ui.page()
+                ui.page(false)
             );
         }
         assert!(style.contains(".card:has(.act-menu[open])"), "{style}");
         assert!(
-            super::super::shell::SHELL_JS.contains("Ending session…"),
+            super::super::shell::SHELL_JS.contains("say('ending')"),
             "network actions need immediate feedback"
         );
-        assert!(ui.page().contains("Open interfaces"), "{}", ui.page());
+        assert!(
+            ui.page(false).contains("Open interfaces"),
+            "{}",
+            ui.page(false)
+        );
     }
 
     /// Every size the runtime can put on a card is one the stylesheet has a

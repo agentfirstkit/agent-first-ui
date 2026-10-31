@@ -2,7 +2,7 @@
 
 /* What is running, refreshed, framed.
  *
- * Four rules run through this file.
+ * These rules run through this file.
  *
  * Every session is placed the same way. This page does not rank them, does not
  * reserve a position for one, and has no notion of which kinds of interface
@@ -60,6 +60,8 @@
  * page's arithmetic. */
 
 (() => {
+  const words = JSON.parse(document.currentScript.dataset.words);
+  const say = (key, values = {}) => words[key].replace(/\{(\w+)\}/g, (_, name) => values[name] || '');
   const REFRESH_MS = 2000;
   /* Far below any sane idle window, and far above what the listener needs to
    * hear from a page that is simply open. */
@@ -85,7 +87,6 @@
    * with the stylesheet by a test, because a size nothing styles is a button
    * that does nothing. */
   const SIZES = ['short', 'tall', 'full'];
-  const SIZE_LABELS = {short: 'Short', tall: 'Tall', full: 'Full'};
   const SIZE_STORE = 'afui.card-size';
 
   /* Which size the last card of a given shape was given.
@@ -147,11 +148,15 @@
     // browser storage requires. Without one origin per session the same flag
     // would put the framed UI on *this* origin, so it stays off.
     //
-    // Everything else the sandbox denies stays denied in both shapes: no top
-    // navigation, no popups, no pointer lock, no modal dialogs.
+    // Popups are allowed, and escape the sandbox, because a link the page
+    // opens outside itself is a tab of the person's own browser rather than a
+    // copy of this frame; without them `afui.openExternal` would silently open
+    // nothing. Everything else the sandbox denies stays denied in both shapes:
+    // no top navigation, no pointer lock, no modal dialogs. The listener sends
+    // the same flags as a policy of its own, so they cannot drift apart.
     const sandbox = isolation === 'own-origin'
-      ? 'allow-scripts allow-forms allow-same-origin'
-      : 'allow-scripts allow-forms';
+      ? 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-same-origin'
+      : 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox';
     frame.setAttribute('sandbox', sandbox);
     frame.setAttribute('referrerpolicy', 'no-referrer');
     frame.title = label;
@@ -337,7 +342,7 @@
     // the card's own height is what a person reads its size off — the word is
     // for whoever is not reading heights, and for a pointer resting on it.
     if (button) {
-      const named = `${SIZE_LABELS[chosen]} card`;
+      const named = say(chosen);
       button.setAttribute('aria-label', named);
       button.title = named;
     }
@@ -346,7 +351,7 @@
   function fold(card, button) {
     const folded = card.dataset.folded === 'true';
     card.dataset.folded = folded ? 'false' : 'true';
-    if (button) button.textContent = folded ? 'Fold' : 'Unfold';
+    if (button) button.textContent = folded ? say('fold') : say('unfold');
   }
 
   function drop(sessionId) {
@@ -371,11 +376,10 @@
   /* Where a session can be opened as a page of its own, when it can.
    *
    * Only when every session has an origin of its own. In the other shape a
-   * session is a path on *this* origin, and opening it top-level would take the
-   * Provider UI out of the sandbox and put it on the page's own origin —
-   * where it would share storage with every other Provider UI opened the same
-   * way. The isolation that makes the frames safe is exactly what a top-level
-   * navigation would discard, so the control is absent rather than dangerous.
+   * session is a path on *this* origin and only the sandbox keeps it off it.
+   * The proxied response carries that sandbox too, so an address opened by hand
+   * stays isolated — but as a page it would gain nothing a frame lacks, still an
+   * opaque origin with no storage, so the control is absent there.
    *
    * `noopener` on top of that: the new page gets no handle on this one. */
   function opensInAPage(entry, session) {
@@ -387,7 +391,7 @@
     }
     entry.open.hidden = false;
     entry.open.href = address;
-    entry.open.title = `Open ${labelOf(session)} in its own page`;
+    entry.open.title = say('open_page', {label: labelOf(session)});
   }
 
   /* What the listener says about this card, said to the person.
@@ -412,11 +416,11 @@
     if (state === 'expiring') {
       entry.notice.hidden = false;
       entry.notice.textContent =
-        `This view stops in ${countdown(session.expires_in_ms)} unless you keep it open.`;
+        say('view_warning', {time: countdown(session.expires_in_ms)});
     } else if (state === 'dead') {
       entry.notice.hidden = false;
       entry.notice.textContent =
-        'This view expired and its address stopped working. The session itself is still running.';
+        say('view_expired');
     } else {
       entry.notice.hidden = true;
       entry.notice.textContent = '';
@@ -477,7 +481,10 @@
     if (state === 'expiring') {
       pageNotice.hidden = false;
       pageNoticeText.textContent =
-        `This page stops working in ${countdown(page.expires_in_ms)} unless you keep it open.`;
+        say('page_warning', {time: countdown(page.expires_in_ms)});
+    } else if (state === 'unattended') {
+      pageNotice.hidden = false;
+      pageNoticeText.textContent = say('page_unattended');
     } else {
       pageNotice.hidden = true;
       pageNoticeText.textContent = '';
@@ -518,12 +525,12 @@
   }
 
   async function renewCard(entry) {
-    setCardAction(entry, true, 'Keeping open…', 'pending');
+    setCardAction(entry, true, say('keeping'), 'pending');
     const kept = await attend(true);
     setCardAction(
       entry,
       false,
-      kept ? 'Kept open' : 'Couldn’t keep this open. Try again.',
+      kept ? say('kept') : say('keep_failed'),
       kept ? '' : 'error',
     );
   }
@@ -534,7 +541,7 @@
    * above can do: a page that revived everything it could see would undo the
    * lapse two seconds after it happened. */
   async function reopen(entry, sessionId) {
-    setCardAction(entry, true, 'Reopening…', 'pending');
+    setCardAction(entry, true, say('reopening'), 'pending');
     try {
       const response = await fetch(
         `${base}sessions/${encodeURIComponent(sessionId)}/reopen`,
@@ -542,37 +549,32 @@
       );
       if (!response.ok) throw new Error(String(response.status));
     } catch (error) {
-      setCardAction(entry, false, 'Couldn’t reopen. Try again.', 'error');
+      setCardAction(entry, false, say('reopen_failed'), 'error');
       return;
     }
     await poll();
     const current = shown.get(sessionId);
-    if (current) setCardAction(current, false, 'Reopened');
+    if (current) setCardAction(current, false, say('reopened'));
   }
 
   /* End through the page's own origin in both delivery shapes. The listener
    * alone reaches the session upstream under its existing credential. */
   async function end(entry, sessionId) {
     if (!entry || !entry.path) return;
-    setCardAction(entry, true, 'Ending session…', 'pending');
+    setCardAction(entry, true, say('ending'), 'pending');
     try {
       const response = await fetch(`${base}sessions/${encodeURIComponent(sessionId)}/end`, {method: 'POST'});
       if (!response.ok) throw new Error(String(response.status));
     } catch (error) {
-      setCardAction(entry, false, 'Couldn’t end the session. Try again.', 'error');
+      setCardAction(entry, false, say('end_failed'), 'error');
       return;
     }
     await poll();
     const current = shown.get(sessionId);
-    if (current) setCardAction(current, false, 'End requested');
+    if (current) setCardAction(current, false, say('ended'));
   }
 
-  /* The page's own ending, which is final.
-   *
-   * Every frame goes with it. The person's terminal is not left painted on a
-   * phone that has stopped being allowed to talk to it, and the only way back
-   * is a new URL from the machine doing the work — which is the whole of what
-   * this expiry is for. */
+  /* Direct links retain their terminal expiry. Shared pages keep polling. */
   function expire() {
     over = true;
     if (refreshTimer) clearInterval(refreshTimer);
@@ -582,9 +584,9 @@
     pageNotice.hidden = false;
     pageNotice.dataset.state = 'dead';
     pageNoticeText.textContent =
-      'This page expired. Ask for a new AFUI link on the machine doing the work.';
+      say('page_expired');
     pageRenew.hidden = true;
-    stateNode.textContent = 'expired';
+    stateNode.textContent = say('expired');
     stateLine.classList.add('stale');
   }
 
@@ -608,12 +610,12 @@
       }
       render(Array.isArray(body.sessions) ? body.sessions : []);
       renderPage(body.page);
-      stateNode.textContent = 'live';
+      stateNode.textContent = say('live');
       stateLine.classList.remove('stale');
     } catch (error) {
       // Say so rather than showing a list that stopped being true. The page
       // keeps its frames: whatever they are talking to is not this listener.
-      stateNode.textContent = 'not answering';
+      stateNode.textContent = say('unavailable');
       stateLine.classList.add('stale');
     }
     attend(false);
@@ -621,10 +623,10 @@
 
   pageRenew.addEventListener('click', async () => {
     pageRenew.disabled = true;
-    pageNoticeText.textContent = 'Keeping this page open…';
+    pageNoticeText.textContent = say('keeping');
     const kept = await attend(true);
     pageRenew.disabled = false;
-    if (!kept) pageNoticeText.textContent = 'Couldn’t keep this page open. Try again.';
+    if (!kept) pageNoticeText.textContent = say('keep_failed');
   });
   // Coming back to a page is the clearest statement there is that somebody is
   // here, and it is the moment a phone has just been unlocked.

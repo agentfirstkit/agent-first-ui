@@ -53,12 +53,22 @@ pub(crate) fn open_in_system_browser(url: &str) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, code));
     }
     let mut command = opener_command(url);
-    command
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .map(|_child| ())
+        .spawn()?;
+    // The opener hands the URL to the browser and exits within moments, but a
+    // child nobody waits for stays a zombie for the life of this process, and
+    // a long-lived Provider's window may send thousands of links its way. The
+    // wait happens off the caller's thread, so a slow opener never stalls the
+    // runtime that asked for it.
+    std::thread::Builder::new()
+        .name("afui-open-external".to_string())
+        .spawn(move || {
+            let _exit_status_is_not_ours_to_judge = child.wait();
+        })
+        .map(|_reaper| ())
 }
 
 #[cfg(target_os = "macos")]

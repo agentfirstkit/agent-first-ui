@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{Request, State};
 use axum::http::{Method, Response, StatusCode};
 use axum::response::IntoResponse;
@@ -119,6 +122,11 @@ struct MountedSession {
     /// URL is finished with", so it revokes the credential instead of waking a
     /// waiter that does not exist.
     external: bool,
+    launch: Option<(String, Arc<AtomicBool>)>,
+    /// Set once the credential stops working, for whatever reason. A response
+    /// the Provider is still streaming — an event stream, a long poll — ends
+    /// on it, because removing the entry only stops *new* requests.
+    ended: Arc<watch::Sender<bool>>,
 }
 
 /// Removes a session from its host when the session ends.
@@ -140,21 +148,108 @@ pub(crate) struct RegisteredSession {
     pub(crate) runtime_closer: Option<UiSessionRuntimeCloser>,
 }
 
+impl SessionRegistration {
+    pub(crate) fn launch(&self, url: &str) -> Result<(String, Arc<AtomicBool>)> {
+        let id = UiAccessToken::issue(UiExpiry::Never)?
+            .secret()
+            .expose_secret()
+            .to_owned();
+        let arrived = Arc::new(AtomicBool::new(false));
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| Error::SessionRuntimeBusy)?;
+        let mounted = sessions
+            .get_mut(&self.secret)
+            .ok_or(Error::SessionRuntimeClosed)?;
+        mounted.launch = Some((id.clone(), Arc::clone(&arrived)));
+        let (base, fragment) = url
+            .split_once('#')
+            .map_or((url, None), |(a, b)| (a, Some(b)));
+        let separator = if base.contains('?') { '&' } else { '?' };
+        let mut url = format!("{base}{separator}afui_launch_id={id}");
+        if let Some(fragment) = fragment {
+            url.push('#');
+            url.push_str(fragment);
+        }
+        Ok((url, arrived))
+    }
+}
+
 impl Drop for SessionRegistration {
     fn drop(&mut self) {
         if let Ok(mut sessions) = self.sessions.lock()
             && let Some(mounted) = sessions.remove(&self.secret)
         {
-            mounted.close_runtime();
+            mounted.withdraw();
         }
     }
 }
 
 impl MountedSession {
-    fn close_runtime(&self) {
+    /// Called with the entry once it has left the registry: close the runtime
+    /// and end every response still streaming under this credential.
+    fn withdraw(&self) {
         if let Some(runtime) = &self.runtime_closer {
             runtime.close();
         }
+        self.ended.send_replace(true);
+    }
+}
+
+/// A Provider response body that stops when its credential does.
+///
+/// The same rule the remote proxy applies to what it relays: a revoked or
+/// lapsed credential that kept an open event stream flowing would still be
+/// handing the page's data to whoever holds it.
+struct EndsWithMount {
+    inner: Option<Body>,
+    ended: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+}
+
+impl EndsWithMount {
+    fn new(inner: Body, ended: &watch::Sender<bool>) -> Self {
+        let mut ended = ended.subscribe();
+        Self {
+            inner: Some(inner),
+            ended: Box::pin(async move {
+                while !*ended.borrow_and_update() {
+                    if ended.changed().await.is_err() {
+                        return;
+                    }
+                }
+            }),
+        }
+    }
+}
+
+impl HttpBody for EndsWithMount {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Bytes>, axum::Error>>> {
+        let body = self.get_mut();
+        let Some(inner) = body.inner.as_mut() else {
+            return std::task::Poll::Ready(None);
+        };
+        if body.ended.as_mut().poll(context).is_ready() {
+            body.inner = None;
+            return std::task::Poll::Ready(None);
+        }
+        std::pin::Pin::new(inner).poll_frame(context)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.as_ref().is_none_or(HttpBody::is_end_stream)
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner
+            .as_ref()
+            .map_or_else(|| hyper::body::SizeHint::with_exact(0), HttpBody::size_hint)
     }
 }
 
@@ -296,6 +391,8 @@ impl UiMount {
                 runtime_endpoint,
                 runtime_closer: runtime_closer.clone(),
                 external: false,
+                launch: None,
+                ended: Arc::new(watch::channel(false).0),
             },
         );
         drop(sessions);
@@ -341,10 +438,23 @@ pub struct UiMountAccess {
 }
 
 /// One credential this process issued, and the URL it reaches.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints neither: both are the credential, and a Provider that logs
+/// its own state with `{:?}` would otherwise write it into its logs.
+#[derive(Clone)]
 pub struct UiMountCredential {
     secret: String,
     access_url: String,
+}
+
+impl std::fmt::Debug for UiMountCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UiMountCredential")
+            .field("secret", &"***")
+            .field("access_url", &"***")
+            .finish()
+    }
 }
 
 impl UiMountCredential {
@@ -378,7 +488,9 @@ impl UiMountAccess {
     /// [`crate::UiSession::with_runtime`]. The returned runtime belongs only
     /// to the returned credential: revoking, expiring, or ending that
     /// credential closes the runtime and wakes a Provider waiting in
-    /// [`UiSessionRuntime::recv`].
+    /// [`UiSessionRuntime::recv`]. Expiry does so on its own clock: a
+    /// credential that lapses while the listener is otherwise quiet is reaped
+    /// when it lapses, not when the next unrelated call happens to look.
     pub fn issue_with_runtime<Action, Reply, SurfaceState>(
         &self,
         expiry: UiExpiry,
@@ -491,8 +603,15 @@ impl UiMountAccess {
                 runtime_endpoint,
                 runtime_closer,
                 external: true,
+                launch: None,
+                ended: Arc::new(watch::channel(false).0),
             },
         );
+        let watched = sessions.get(&secret).map(|mounted| mounted.token.clone());
+        drop(sessions);
+        if let Some(token) = watched {
+            watch_expiry(Arc::clone(&self.sessions), token, secret.clone());
+        }
         Ok(UiMountCredential { secret, access_url })
     }
 
@@ -515,7 +634,7 @@ impl UiMountAccess {
             return false;
         };
         if let Some(mounted) = sessions.remove(&found) {
-            mounted.close_runtime();
+            mounted.withdraw();
             true
         } else {
             false
@@ -567,7 +686,7 @@ impl UiMountAccess {
                 let retain = !mounted.external
                     || !(mounted.token.is_expired() || mounted.token.is_revoked());
                 if !retain {
-                    mounted.close_runtime();
+                    mounted.withdraw();
                 }
                 retain
             });
@@ -624,11 +743,7 @@ impl UiHost {
     #[must_use]
     pub fn with_advertised_host(mut self, host: impl Into<String>) -> Self {
         let host = host.into();
-        let authority = if host.contains(':') {
-            host
-        } else {
-            format!("{host}:{}", self.local_addr.port())
-        };
+        let authority = crate::lan::authority_with_port(&host, self.local_addr.port());
         self.mount.base_url = format!("http://{authority}/");
         self.mount.authority = authority;
         self
@@ -771,7 +886,7 @@ async fn dispatch(State(sessions): State<SessionRegistry>, mut request: Request)
                     if let Ok(mut sessions) = sessions.lock()
                         && let Some(mounted) = sessions.remove(&secret)
                     {
-                        mounted.close_runtime();
+                        mounted.withdraw();
                     }
                     return with_headers(StatusCode::NO_CONTENT.into_response(), &mounted.policy);
                 }
@@ -798,11 +913,29 @@ async fn dispatch(State(sessions): State<SessionRegistry>, mut request: Request)
         };
         return with_headers(response, &mounted.policy);
     }
+    let arrival = mounted
+        .launch
+        .as_ref()
+        .filter(|(id, _)| {
+            request.method() == Method::GET
+                && remainder == "/"
+                && request.uri().query().is_some_and(|query| {
+                    query
+                        .split('&')
+                        .any(|pair| pair.strip_prefix("afui_launch_id=") == Some(id.as_str()))
+                })
+        })
+        .map(|(_, arrived)| Arc::clone(arrived));
     rewrite_path(&mut request, &remainder);
     let response = match mounted.router.oneshot(request).await {
-        Ok(response) => response,
+        Ok(response) => response.map(|body| Body::new(EndsWithMount::new(body, &mounted.ended))),
         Err(infallible) => match infallible {},
     };
+    if response.status().is_success()
+        && let Some(arrived) = arrival
+    {
+        arrived.store(true, Ordering::Release);
+    }
     with_headers(response, &mounted.policy)
 }
 
@@ -812,6 +945,51 @@ async fn dispatch(State(sessions): State<SessionRegistry>, mut request: Request)
 fn reserved_route(remainder: &str) -> Option<&str> {
     let rest = remainder.strip_prefix('/')?;
     rest.starts_with(RESERVED_PATH_PREFIX).then_some(rest)
+}
+
+/// Reap one credential the moment it lapses.
+///
+/// The lazy reap in [`UiMountAccess::reap`] runs only when the mount is asked
+/// for something, and a listener that has gone quiet is asked for nothing: its
+/// expired credentials would otherwise keep their runtimes, and every task a
+/// Provider spun up per credential, until the next issue. An idle deadline
+/// slides on every authorized request, so the watcher sleeps to the deadline
+/// it last saw and looks again, and stops as soon as the entry is gone for any
+/// other reason. Without a runtime to spawn on (a mount used from plain
+/// synchronous code) the lazy reap remains the only one.
+fn watch_expiry(sessions: SessionRegistry, token: UiAccessToken, secret: String) {
+    if token.remaining_ttl().is_none() {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        loop {
+            let present = sessions
+                .lock()
+                .map(|sessions| sessions.contains_key(&secret))
+                .unwrap_or(false);
+            if !present {
+                return;
+            }
+            match token.remaining_ttl() {
+                Some(remaining) if !remaining.is_zero() && !token.is_revoked() => {
+                    tokio::time::sleep(remaining).await;
+                }
+                _ => break,
+            }
+        }
+        let Ok(mut sessions) = sessions.lock() else {
+            return;
+        };
+        let lapsed = sessions
+            .get(&secret)
+            .is_some_and(|mounted| mounted.token.is_expired() || mounted.token.is_revoked());
+        if lapsed && let Some(mounted) = sessions.remove(&secret) {
+            mounted.withdraw();
+        }
+    });
 }
 
 /// Clone what serving one request needs, so the registry lock is not held
@@ -828,6 +1006,8 @@ fn lookup(sessions: &SessionRegistry, secret: &str) -> Option<MountedSession> {
         runtime_endpoint: mounted.runtime_endpoint.clone(),
         runtime_closer: mounted.runtime_closer.clone(),
         external: mounted.external,
+        launch: mounted.launch.clone(),
+        ended: Arc::clone(&mounted.ended),
     })
 }
 

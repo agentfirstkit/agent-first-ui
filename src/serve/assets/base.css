@@ -1,6 +1,6 @@
 /* The floor every AFUI page stands on, served at AFUI's own reserved route.
  *
- * Two kinds of rule live here and nothing else:
+ * These kinds of rule live here and nothing else:
  *
  *   1. rules AFUI's own behaviour decides — the runtime marks a control
  *      `aria-disabled` while a call is in flight, and hides an element with
@@ -43,7 +43,7 @@
   /* Where the keyboard is. Never remove the ring — replace it. */
   --afui-focus: #1769d2;
 
-  /* Three things a page says about a value rather than about itself: this
+  /* What a page says about a value rather than about itself: this
    * needs attention, this went wrong, this is settled. Each is an ink and a
    * wash meant to be used together. */
   --afui-warn-ink: #775000;

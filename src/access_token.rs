@@ -50,13 +50,17 @@ struct Inner {
 
 impl UiAccessToken {
     pub fn issue(expiry: UiExpiry) -> Result<Self> {
-        let lifetime = match expiry {
+        let expires_at = match expiry {
             UiExpiry::Never => None,
             UiExpiry::After(duration) | UiExpiry::Idle(duration) => {
                 if duration.is_zero() {
                     return Err(Error::InvalidTtl);
                 }
-                Some(duration)
+                Some(
+                    Instant::now()
+                        .checked_add(duration)
+                        .ok_or(Error::InvalidTtl)?,
+                )
             }
         };
         let mut secret = [0_u8; TOKEN_BYTES];
@@ -66,7 +70,7 @@ impl UiAccessToken {
             inner: Arc::new(Inner {
                 secret,
                 expiry,
-                expires_at: Mutex::new(lifetime.map(|lifetime| Instant::now() + lifetime)),
+                expires_at: Mutex::new(expires_at),
                 revoked: AtomicBool::new(false),
             }),
         })
@@ -77,8 +81,7 @@ impl UiAccessToken {
     ///
     /// AFDATA's `SecretString`: `Debug` and `Display` redact it, and the value
     /// comes out only through `expose_secret`, at the boundary that builds the
-    /// URL. afui used to hand-roll that newtype; there is one now, and every
-    /// spore holding a credential shares it.
+    /// URL.
     pub fn secret(&self) -> SecretString {
         SecretString::new(hex::encode(self.inner.secret))
     }
@@ -87,7 +90,7 @@ impl UiAccessToken {
     /// it is still live. An idle expiry slides forward on success.
     #[must_use]
     pub fn authorize(&self, candidate_secret: &str) -> bool {
-        if self.is_expired() || self.is_revoked() {
+        if candidate_secret.len() != SECRET_HEX_DIGITS || self.is_expired() || self.is_revoked() {
             return false;
         }
         let Ok(candidate) = hex::decode(candidate_secret) else {
@@ -107,8 +110,19 @@ impl UiAccessToken {
         let UiExpiry::Idle(window) = self.inner.expiry else {
             return;
         };
+        if self.is_revoked() {
+            return;
+        }
         if let Ok(mut expires_at) = self.inner.expires_at.lock() {
-            *expires_at = Some(Instant::now() + window);
+            let now = Instant::now();
+            if expires_at.is_some_and(|deadline| now >= deadline) {
+                return;
+            }
+            let Some(deadline) = now.checked_add(window) else {
+                self.revoke();
+                return;
+            };
+            *expires_at = Some(deadline);
         }
     }
 
@@ -138,11 +152,11 @@ impl UiAccessToken {
     }
 
     fn expires_at(&self) -> Option<Instant> {
-        self.inner
-            .expires_at
-            .lock()
-            .ok()
-            .and_then(|expires_at| *expires_at)
+        match self.inner.expires_at.lock() {
+            Ok(expires_at) => *expires_at,
+            // An unreadable deadline must not become the `Never` policy.
+            Err(_) => Some(Instant::now()),
+        }
     }
 }
 
@@ -222,6 +236,59 @@ mod tests {
             idle_left > fixed_left + ELAPSED / 2,
             "an idle window must slide forward on use: idle {idle_left:?} vs fixed {fixed_left:?}"
         );
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn unreadable_expiry_state_fails_closed_even_for_never_expiring_tokens() {
+        let token = UiAccessToken::issue(UiExpiry::Never).unwrap();
+        let secret = token.secret();
+        let result = std::panic::catch_unwind(|| {
+            let _guard = token.inner.expires_at.lock().unwrap();
+            panic!("simulate interrupted expiry update");
+        });
+        assert!(result.is_err());
+        assert!(token.is_expired());
+        assert_eq!(token.remaining_ttl(), Some(Duration::ZERO));
+        assert!(!token.authorize(secret.expose_secret()));
+    }
+
+    #[test]
+    fn invalid_length_candidates_never_affect_a_valid_token() {
+        let token = UiAccessToken::issue(UiExpiry::Never).unwrap();
+        for candidate in ["a".repeat(SECRET_HEX_DIGITS - 1), "a".repeat(1024 * 1024)] {
+            assert!(!token.authorize(&candidate));
+        }
+        assert!(token.authorize(token.secret().expose_secret()));
+    }
+
+    #[test]
+    fn touching_cannot_revive_expired_or_extend_revoked_idle_credentials() {
+        let token = UiAccessToken::issue(UiExpiry::Idle(Duration::from_secs(60))).unwrap();
+        *token.inner.expires_at.lock().unwrap() = Some(Instant::now());
+        token.touch();
+        assert!(token.is_expired());
+        assert!(!token.authorize(token.secret().expose_secret()));
+        assert_eq!(token.remaining_ttl(), Some(Duration::ZERO));
+
+        let token = UiAccessToken::issue(UiExpiry::Idle(Duration::from_secs(60))).unwrap();
+        let deadline = token.expires_at();
+        token.revoke();
+        token.touch();
+        assert_eq!(token.expires_at(), deadline);
+    }
+
+    #[test]
+    fn unrepresentable_lifetimes_are_rejected_without_panicking() {
+        for expiry in [
+            UiExpiry::After(Duration::MAX),
+            UiExpiry::Idle(Duration::MAX),
+        ] {
+            assert!(matches!(
+                UiAccessToken::issue(expiry),
+                Err(Error::InvalidTtl)
+            ));
+        }
     }
 
     #[test]

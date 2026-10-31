@@ -6,6 +6,32 @@ use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 // multicast route used to reach another device on the physical LAN.
 const LAN_ROUTE_PROBE_IPV4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 1);
 
+/// `host` as an authority: as given when it already names a port, with `port`
+/// otherwise.
+///
+/// "Already names a port" cannot be read as "contains a colon", because every
+/// IPv6 address does. A bracketed address names a port only after its `]`, and
+/// a bare IPv6 address is bracketed so the port appended to it is not read as
+/// one more group of the address.
+#[cfg(feature = "session")]
+pub(crate) fn authority_with_port(host: &str, port: u16) -> String {
+    if let Some(bracketed) = host.strip_prefix('[') {
+        let names_port = bracketed.split_once("]:").is_some_and(|(_, digits)| {
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        });
+        return if names_port {
+            host.to_owned()
+        } else {
+            format!("{host}:{port}")
+        };
+    }
+    match host.matches(':').count() {
+        0 => format!("{host}:{port}"),
+        1 => host.to_owned(),
+        _ => format!("[{host}]:{port}"),
+    }
+}
+
 /// Pick the address another device on the same physical LAN can reach this
 /// machine on.
 ///
@@ -41,6 +67,21 @@ fn usable_lan_ipv4(ip: Ipv4Addr) -> bool {
 mod tests {
     use super::{LAN_ROUTE_PROBE_IPV4, usable_lan_ipv4};
     use std::net::Ipv4Addr;
+
+    #[cfg(feature = "session")]
+    #[test]
+    fn an_advertised_host_keeps_the_bound_port_unless_it_names_one() {
+        for (host, expected) in [
+            ("phone.example", "phone.example:8787"),
+            ("phone.example:9000", "phone.example:9000"),
+            ("192.168.1.5", "192.168.1.5:8787"),
+            ("[fd00::5]", "[fd00::5]:8787"),
+            ("[fd00::5]:9000", "[fd00::5]:9000"),
+            ("fd00::5", "[fd00::5]:8787"),
+        ] {
+            assert_eq!(super::authority_with_port(host, 8787), expected, "{host}");
+        }
+    }
 
     #[test]
     fn lan_route_probe_uses_link_local_multicast_instead_of_a_unicast_default_route() {

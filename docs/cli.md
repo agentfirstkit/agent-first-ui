@@ -46,6 +46,12 @@ A **shape** is one legal set of arguments that may appear together, under a stab
 
 Ask a person one or more questions with options and written answers; wait for the answer.
 
+#### `ask-request` — Complete request from a value source
+
+```
+afui ask --request <SOURCE> [--mode <window|link|session>] [--detach]
+```
+
 #### `ask` — One question from --question and --options
 
 ```
@@ -62,12 +68,13 @@ Arguments across every shape above:
 
 | Argument | Meaning |
 |---|---|
+| `--request` | Complete JSON request: context blocks and questions; accepts a whole file or stream (the value, or where to read it: env:NAME, file[+FORMAT]:PATH[#DOT_PATH], stdin, fd:N, literal:VALUE) |
 | `--question` | The question, displayed as plain text; its answer has question_id `question` |
-| `--options` | JSON array of 1–32 options: unique id, label, optional description, optional recommended |
+| `--options` | JSON array of 0–32 options: unique id, label, optional description, optional recommended |
 | `--multiple` | Allow choosing several options |
 | `--no-custom` | Offer only the supplied options; disable written answers and notes |
 | `--questions` | JSON array of 1–8 questions: unique id, question, options, optional multiple, optional allow_custom |
-| `--context` | JSON array of background blocks shown above the questions: paragraph {text}, list {items}, or code {text} |
+| `--context` | JSON array of background blocks shown above the questions: paragraph/code/diff {text}, list {items}, image {path,title}, table {columns,rows} |
 | `--mode` | How this reaches the person: window a browser window is open on this machine; link the page is reachable from this machine's network at the link URL; session the session is registered only; open it with `afui session open` or reach it through `afui session serve`. Falls back to AFUI_DELIVERY, then window |
 | `--detach` | Return once the question is ready; collect the answer later with `afui ask wait` |
 
@@ -133,7 +140,7 @@ afui frontend diff <PROVIDER_ID> <UI_KIND> [--scope <workspace|global>]
 Remove explicit trust for one frontend.
 
 ```
-afui frontend disable <PROVIDER_ID> <UI_KIND> [--scope <workspace|global>]
+afui frontend disable <PROVIDER_ID> <UI_KIND> [--scope <workspace>]
 ```
 
 | Argument | Meaning |
@@ -147,7 +154,7 @@ afui frontend disable <PROVIDER_ID> <UI_KIND> [--scope <workspace|global>]
 Explicitly trust the current contents of one frontend.
 
 ```
-afui frontend enable <PROVIDER_ID> <UI_KIND> [--scope <workspace|global>]
+afui frontend enable <PROVIDER_ID> <UI_KIND> [--scope <workspace>]
 ```
 
 | Argument | Meaning |
@@ -233,13 +240,15 @@ Output: protocol events; `--output` json/yaml/plain (default `json`), `--output-
 |---|---|
 | `--listen` | Address to bind. Loopback by default; widen it only behind a tunnel or VPN you trust |
 | `--advertise-host` | Authority to put in the URL when the bound address is not one anybody can open |
-| `--idle-minutes` | Stop answering this long after nobody is attending the page: no visible tab, no traffic through a session. Overrides AFUI's global `attention.idle_timeout_s`; `0` never stops |
+| `--idle-minutes` | Start the warning this long after nobody is attending the page: no visible tab, no traffic through a session. Overrides AFUI's global `attention.idle_timeout_s`; `0` disables attention expiry |
 | `--grace-minutes` | How long the page warns first, still fully working, with a button that renews it. Overrides AFUI's global `attention.grace_period_s`; `0` lapses without warning |
 | `--session-origin-host` | Give every session an origin of its own, `s-<credential>.<HOST>`, so a framed UI keeps browser storage. Needs `*.<HOST>` to resolve here, and a wildcard certificate behind TLS; `localhost` needs neither, because browsers resolve `*.localhost` to this machine. Also the host the page itself is served on |
 
 When neither override is supplied, AFUI reads `attention.idle_timeout_s` (default `900`) and `attention.grace_period_s` (default `300`) from the global AFUI `config.json`: `~/Library/Application Support/afui/config.json` on macOS, `$XDG_CONFIG_HOME/afui/config.json` on Linux (or `~/.config/afui/config.json` when `XDG_CONFIG_HOME` is unset), or `%APPDATA%\afui\config.json` on Windows. `AFUI_CONFIG_DIR` replaces that file's parent directory. The same policy controls direct `link` delivery.
 
 The serving progress event reports the resolved values as `idle_timeout_s` and `grace_period_s`; `idle_timeout_s` is `null` when expiry is disabled.
+
+The shared entry URL stays valid until this process exits. Unattended revokes all mounts and streams while the current session list remains available. Heartbeat resumes attendance; lapsed cards need Reopen. Direct links retain terminal Expired delivery. AFUI-owned controls follow Accept-Language (English or Simplified Chinese, English fallback).
 
 ### `afui skill install`
 
@@ -322,6 +331,7 @@ Arguments across every shape above:
 | 0 | The command ran and succeeded. |
 | 1 | The command ran and failed. The event carries a domain `error.code`. |
 | 2 | The invocation was rejected before anything ran. `error.code` is one of the `cli_*` codes below. |
+| 4 | Output could not be written (`output_write_failed`); a closed reader is success. |
 
 The split is the useful one for a caller: exit 2 means the call was never made, so retrying it unchanged cannot help, while exit 1 means it was.
 
@@ -329,6 +339,8 @@ The split is the useful one for a caller: exit 2 means the call was never made, 
 
 Every structural failure emits one strict JSON `kind:"error"` event on stderr, leaves stdout empty, and exits 2. The `code` names the failure — `cli_unknown_argument` for an unknown spelling, `cli_unregistered_combination` for registered arguments in a mixture that is not, and one each for `cli_unknown_command`, `cli_missing_argument_value`, `cli_invalid_argument_value`, `cli_duplicate_argument`, `cli_unexpected_positional`, and `cli_invalid_utf8`. `message` identifies a safe argument spelling or the failure category and `hint` gives the command to run next; neither ever quotes a raw value, including secrets. These are decided before any config, secret source, filesystem, network, or domain I/O.
 
-Two exit-1 codes describe the tool itself rather than the call: `cli_invocation_invalid` means the program misread its own resolved invocation — an unknown action id, or an argument id the selected combination cannot produce — and `output_setup_failed` means an output sink (`--stdout-file`, `--stderr-file`, stream redirection) could not be established. Both are defects to report, not inputs to correct; retrying the same command cannot help.
+`cli_invocation_invalid` (exit 1) describes the tool itself rather than the call: the program misread its own resolved invocation — an unknown action id, or an argument id the selected combination cannot produce. It is a defect to report, not an input to correct; retrying the same command cannot help. `output_setup_failed` (exit 1) means an output sink (`--stdout-file`, `--stderr-file`, stream redirection) could not be established; the message names the flag and path, which is usually a missing directory or a permission to fix.
+
+A tool may also exit 2 with a code of its own for a usage error its argument grammar cannot express — two arguments that are each valid but cannot be combined, or a value whose meaning depends on the target. Such a call is likewise refused before anything is changed.
 
 Domain failures (exit 1) carry their own stable `error.code` instead, drawn from whatever this tool defines rather than from the `cli_*` set. Error events are routinely logged, so a message never quotes a value that came from an argument able to carry a credential — a header, a cookie, a token, a password, a proxy URL, an environment value, a form field. Such an error names the argument and the shape that was wrong, and stops there. A value that cannot be a secret — a path, a dot-path, a session name — is quoted, because an error that cannot say which one it means is not worth logging either.

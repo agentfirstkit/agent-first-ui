@@ -117,9 +117,9 @@ async fn check_standard_questions(cdp: &mut Cdp, browser_session: &str) {
         description: (id == "retry").then(|| "重新运行操作".into()),
         recommended,
     };
-    for mode in ["note", "custom", "cancel", "several"] {
+    for mode in ["note", "custom", "cancel", "several", "text-only", "large"] {
         let question = "接下来怎么处理？ <script>globalThis.askInjection = true</script>";
-        let first = AskQuestion {
+        let mut first = AskQuestion {
             id: "next".into(),
             question: question.into(),
             options: vec![
@@ -130,7 +130,13 @@ async fn check_standard_questions(cdp: &mut Cdp, browser_session: &str) {
             multiple: false,
             allow_custom: mode != "cancel",
         };
-        let request = if mode == "several" {
+        if mode == "text-only" {
+            first.options.clear();
+        }
+        let image_root = tempfile::tempdir().expect("image fixture directory");
+        let image_path = image_root.path().join("a.png");
+        std::fs::write(&image_path, hex::decode("89504e470d0a1a0a0000000d4948445200000001000000010804000000b51c0c020000000b4944415478da6364f80f00010501012718e3660000000049454e44ae426082").expect("PNG bytes")).expect("write image fixture");
+        let mut request = if mode == "several" {
             AskRequest {
                 context: vec![
                     AskBlock::Paragraph {
@@ -141,6 +147,17 @@ async fn check_standard_questions(cdp: &mut Cdp, browser_session: &str) {
                     },
                     AskBlock::Code {
                         text: "afui ask --detach".into(),
+                    },
+                    AskBlock::Image {
+                        path: image_path,
+                        title: "图 A".into(),
+                    },
+                    AskBlock::Table {
+                        columns: vec!["Name".into(), "Value".into()],
+                        rows: vec![vec!["A".into(), "<b>plain</b>".into()]],
+                    },
+                    AskBlock::Diff {
+                        text: "@@ -1 +1 @@\n-before\n+after".into(),
                     },
                 ],
                 questions: vec![
@@ -160,6 +177,36 @@ async fn check_standard_questions(cdp: &mut Cdp, browser_session: &str) {
         } else {
             AskRequest::single(first)
         };
+        if mode == "large" {
+            let base = request.questions[0].clone();
+            request.questions = (0..8)
+                .map(|index| {
+                    let mut question = base.clone();
+                    if index > 0 {
+                        question.id = format!("question{index}");
+                    }
+                    question.options = (0..32)
+                        .map(|number| AskOption {
+                            id: if number == 0 {
+                                "retry".into()
+                            } else {
+                                format!("option{number}")
+                            },
+                            label: "Option".into(),
+                            description: Some("x".repeat(4096)),
+                            recommended: index == 0 && number == 0,
+                        })
+                        .collect();
+                    question
+                })
+                .collect();
+            assert!(
+                serde_json::to_vec(&request)
+                    .expect("serialize large request")
+                    .len()
+                    > agent_first_ui::MAX_UI_RUNTIME_MESSAGE_BYTES
+            );
+        }
         let active = request
             .start(UiDeliveryPlan::resolve(Some(UiDeliveryMode::Session)).expect("session plan"))
             .await
@@ -180,7 +227,7 @@ async fn check_standard_questions(cdp: &mut Cdp, browser_session: &str) {
             "connect the question runtime",
         )
         .await;
-        assert_eq!(cdp.evaluate(browser_session, "document.querySelector('input:checked') === null && document.getElementById('submit').disabled").await, true);
+        assert_eq!(cdp.evaluate(browser_session, "document.querySelector('input[data-option]:checked') === null && document.getElementById('submit').disabled").await, true);
         assert_eq!(
             cdp.evaluate(
                 browser_session,
@@ -192,7 +239,7 @@ async fn check_standard_questions(cdp: &mut Cdp, browser_session: &str) {
         assert_eq!(
             cdp.evaluate(
                 browser_session,
-                "!globalThis.askInjection && !document.querySelector('fieldset b, #context i') && document.querySelectorAll('.badge').length === 1"
+                &format!("!globalThis.askInjection && !document.querySelector('fieldset b, #context i, #context b') && document.querySelectorAll('.badge').length === {}", usize::from(mode != "text-only"))
             )
             .await,
             true
@@ -200,6 +247,14 @@ async fn check_standard_questions(cdp: &mut Cdp, browser_session: &str) {
         assert_eq!(cdp.evaluate(browser_session, "document.documentElement.scrollWidth <= innerWidth && document.getElementById('submit').getBoundingClientRect().height >= 44").await, true);
         let first = "document.querySelector('fieldset[data-question=next]')";
         match mode {
+            "large" => {
+                assert_eq!(cdp.evaluate(browser_session, "document.querySelectorAll('fieldset.question').length === 8 && document.querySelectorAll('input[data-option]').length === 256").await, true);
+                cdp.evaluate(browser_session, "for (const field of document.querySelectorAll('fieldset.question')) field.querySelector('input[data-option=retry]').click(); document.getElementById('submit').click()").await;
+            }
+            "text-only" => {
+                assert_eq!(cdp.evaluate(browser_session, "const t = document.querySelector('textarea.answer-text'); !t.hidden && t.getBoundingClientRect().height > 0 && document.querySelector('.choice-head').hidden").await, true);
+                cdp.evaluate(browser_session, "const textOnlyAnswer = document.querySelector('textarea.answer-text'); textOnlyAnswer.value = 'Text only'; textOnlyAnswer.dispatchEvent(new Event('input', {bubbles:true})); document.getElementById('submit').click()").await;
+            }
             "note" => {
                 cdp.evaluate(
                     browser_session,
@@ -256,6 +311,13 @@ async fn check_standard_questions(cdp: &mut Cdp, browser_session: &str) {
                     .await;
             }
             "several" => {
+                cdp.wait_for(
+                    browser_session,
+                    "document.querySelector('#context img')?.naturalWidth > 0",
+                    "image blob rendered",
+                )
+                .await;
+                assert_eq!(cdp.evaluate(browser_session, "document.querySelector('#context figcaption').textContent === '图 A' && document.querySelectorAll('#context th').length === 2 && document.querySelector('#context td:last-child').textContent === '<b>plain</b>' && document.querySelector('.diff .added').textContent.includes('+after') && document.querySelector('.diff .removed').textContent.includes('-before') && getComputedStyle(document.querySelector('.diff .added')).backgroundColor !== getComputedStyle(document.querySelector('.diff .removed')).backgroundColor && document.documentElement.scrollWidth <= innerWidth").await, true);
                 assert_eq!(
                     cdp.evaluate(browser_session, "document.querySelectorAll('#context p, #context li, #context code').length === 4 && !document.getElementById('context').hidden").await,
                     true
@@ -306,6 +368,26 @@ async fn check_standard_questions(cdp: &mut Cdp, browser_session: &str) {
             note: note.map(str::to_owned),
         };
         let expected = match mode {
+            "large" => AskResponse::Answered {
+                answers: (0..8)
+                    .map(|index| AskAnswer {
+                        question_id: if index == 0 {
+                            "next".into()
+                        } else {
+                            format!("question{index}")
+                        },
+                        selected: vec![selection("retry", "Option", None)],
+                        text: None,
+                    })
+                    .collect(),
+            },
+            "text-only" => AskResponse::Answered {
+                answers: vec![AskAnswer {
+                    question_id: "next".into(),
+                    selected: vec![],
+                    text: Some("Text only".into()),
+                }],
+            },
             "note" => AskResponse::Answered {
                 answers: vec![AskAnswer {
                     question_id: "next".into(),
@@ -562,7 +644,10 @@ async fn headless_browser_smoke() {
         viewport["frameWidth"].as_f64().expect("frame width") > 0.0,
         "{viewport}"
     );
-    assert_eq!(viewport["sandbox"], "allow-scripts allow-forms");
+    assert_eq!(
+        viewport["sandbox"],
+        "allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"
+    );
     let frame_url = cdp
         .evaluate(&session, "document.querySelector('.card iframe').src")
         .await;
@@ -633,7 +718,7 @@ async fn headless_browser_smoke() {
     )
     .await;
     cdp.wait_for(&session,
-        "document.querySelector('#page-notice')?.dataset.state === 'dead' && document.querySelector('#state')?.textContent === 'expired' && document.querySelectorAll('iframe').length === 0",
+        "document.querySelector('#page-notice')?.dataset.state === 'unattended' && !document.querySelector('#page-notice').hidden && document.querySelectorAll('iframe').length === 0",
         "remove every iframe after expiry").await;
     cdp.command(
         "Target.activateTarget",
@@ -641,7 +726,7 @@ async fn headless_browser_smoke() {
         None,
     )
     .await;
-    cdp.wait_for(&session, "document.visibilityState === 'visible' && document.querySelectorAll('iframe').length === 0", "keep the expired view empty on return").await;
+    cdp.wait_for(&session, "document.visibilityState === 'visible' && document.querySelectorAll('iframe').length === 0", "keep lapsed views empty on return").await;
     assert_eq!(
         cdp.evaluate(
             &session,
@@ -652,6 +737,27 @@ async fn headless_browser_smoke() {
         )
         .await,
         404
+    );
+    cdp.command("Page.reload", json!({}), Some(&session)).await;
+    cdp.wait_for(&session,
+        "document.querySelector('.card [data-act=reopen]') && !document.querySelector('.card [data-act=reopen]').hidden && document.querySelectorAll('iframe').length === 0",
+        "reload the original entry without reviving lapsed mounts").await;
+    cdp.evaluate(
+        &session,
+        "document.querySelector('.card [data-act=reopen]').click()",
+    )
+    .await;
+    cdp.wait_for(
+        &session,
+        "document.querySelectorAll('iframe').length === 1",
+        "reopen the card explicitly",
+    )
+    .await;
+    assert_ne!(
+        cdp.evaluate(&session, "document.querySelector('.card iframe').src")
+            .await,
+        old_frame_url,
+        "Reopen must mint a new mount"
     );
     assert!(
         agent_first_ui::list_sessions()

@@ -229,6 +229,35 @@ async fn revoking_an_external_credential_closes_its_typed_runtime() {
     assert!(matches!(runtime.recv().await, Ok(None)));
 }
 
+/// Nobody renews, nobody issues, nobody counts: the listener has simply gone
+/// quiet. The credential's runtime still closes when the credential lapses,
+/// because what a Provider spun up per credential must not outlive it by
+/// however long the next unrelated call takes to arrive.
+#[tokio::test]
+async fn a_lapsed_external_credential_closes_its_typed_runtime_unprompted() {
+    let host = host().await;
+    let access = host.external_access(
+        provider_routes(),
+        UiPagePolicy::new(UiPageScript::SameOrigin)
+            .allow_runtime()
+            .into_security_policy(),
+        None,
+    );
+    let (_credential, runtime) = access
+        .issue_with_runtime::<serde_json::Value, serde_json::Value, serde_json::Value>(
+            UiExpiry::Idle(Duration::from_millis(80)),
+        )
+        .expect("a runtime-backed credential is issued");
+    runtime
+        .publish_state(&serde_json::json!({"ready": true}))
+        .expect("opening state");
+
+    let closed = tokio::time::timeout(Duration::from_secs(2), runtime.recv())
+        .await
+        .expect("the runtime closes when its credential lapses");
+    assert!(matches!(closed, Ok(None)));
+}
+
 #[tokio::test]
 async fn an_external_runtime_can_bound_calls_events_and_blobs_together() {
     let host = host().await;
@@ -395,4 +424,71 @@ async fn the_reserved_prefix_is_not_the_providers_to_route_under() {
     .await;
     assert_eq!(status, 404);
     assert!(!body.contains("the provider's"), "{body}");
+}
+
+/// Revoking stops more than new requests: a response the Provider is still
+/// streaming under that credential ends too, or an open event stream would
+/// keep handing the page's data to whoever holds a credential that no longer
+/// works.
+#[tokio::test]
+async fn revoking_ends_a_response_that_is_still_streaming() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let host = host().await;
+    let (frames, receiver) =
+        tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
+    let receiver = std::sync::Arc::new(std::sync::Mutex::new(Some(receiver)));
+    let routes = Router::new().route(
+        "/events",
+        get(move || {
+            let receiver = receiver.lock().unwrap().take().expect("streamed once");
+            async move {
+                axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver))
+            }
+        }),
+    );
+    let access = host.external_access(
+        routes,
+        UiPagePolicy::new(UiPageScript::SameOrigin).into_security_policy(),
+        None,
+    );
+    let credential = access
+        .issue(UiExpiry::Idle(Duration::from_secs(60)))
+        .expect("a credential is issued");
+    let url = format!("{}events", credential.access_url_secret());
+    let (_, rest) = url.split_once("://").unwrap();
+    let (authority, path) = rest.split_once('/').unwrap();
+    let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "GET /{path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                host.authority()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    frames.send(Ok("first".into())).await.unwrap();
+    let mut received = Vec::new();
+    while !String::from_utf8_lossy(&received).contains("first") {
+        let mut chunk = [0_u8; 1024];
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert!(read > 0, "the stream ended before its first frame");
+        received.extend_from_slice(&chunk[..read]);
+    }
+
+    assert!(access.revoke(credential.secret()));
+    // The Provider still has more to say; the credential no longer does.
+    let _ignored = frames.send(Ok("after".into())).await;
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest))
+        .await
+        .expect("the response ends once its credential is revoked")
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&rest).contains("after"),
+        "{}",
+        String::from_utf8_lossy(&rest)
+    );
 }

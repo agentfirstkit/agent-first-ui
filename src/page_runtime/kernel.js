@@ -4,7 +4,7 @@
  * A frontend still cannot supply JavaScript. This source is spliced into the
  * Provider's trusted runtime — under a per-session nonce, or served as the
  * Provider's own file — which is why it may exist at all. What it removes is
- * the part every page in this kit had written for itself: deriving the session
+ * the part every live page would otherwise write for itself: deriving the session
  * root, connecting to the typed AFUI runtime, correlating and replaying calls,
  * resynchronizing retained state and ordered events after a disconnect, and
  * half a dozen small pieces of care that are only interesting when missing.
@@ -137,18 +137,28 @@ const afui = (function () {
    * first, and a person using a screen reader is told either way. */
   function inFlight(elements) {
     const controls = Array.from(elements || []);
+    let previous = null;
     return {
       begin() {
-        for (const control of controls) {
+        if (previous) return;
+        previous = controls.map(control => ({
+          control,
+          ariaDisabled: control.getAttribute('aria-disabled'),
+          disabled: control.disabled,
+        }));
+        for (const {control} of previous) {
           control.setAttribute('aria-disabled', 'true');
           if ('disabled' in control) control.disabled = true;
         }
       },
       end() {
-        for (const control of controls) {
-          control.removeAttribute('aria-disabled');
-          if ('disabled' in control) control.disabled = false;
+        if (!previous) return;
+        for (const {control, ariaDisabled, disabled} of previous) {
+          if (ariaDisabled === null) control.removeAttribute('aria-disabled');
+          else control.setAttribute('aria-disabled', ariaDisabled);
+          if ('disabled' in control) control.disabled = disabled;
         }
+        previous = null;
       },
     };
   }
@@ -163,6 +173,8 @@ const afui = (function () {
   function connect(handlers) {
     const settings = handlers || {};
     const protocol = 'afui-session-v1';
+    // afui-session-v1 bounds the complete UTF-8 envelope, not just its payload.
+    const maxMessageBytes = 1024 * 1024;
     const browserClientId = clientId();
     const pending = new Map();
     // Open-outside requests are not calls: nothing is resent after a wire drop
@@ -229,10 +241,14 @@ const afui = (function () {
     function openInOwnBrowser(target) {
       // A remote view is a person's own browser: the address bar is right
       // there, and the machine the runtime is on is not where they are.
-      const opened = window.open(target, '_blank', 'noopener,noreferrer');
-      return opened === null
-        ? Promise.reject(openFailure('ui_open_external_blocked', 'the browser blocked opening a new tab'))
-        : Promise.resolve({opened: true, via: 'browser'});
+      // With noopener the browser returns null even when the new tab opened.
+      // A fulfilled request therefore acknowledges handoff, not tab visibility.
+      try {
+        window.open(target, '_blank', 'noopener,noreferrer');
+        return Promise.resolve({opened: true, via: 'browser'});
+      } catch (_failure) {
+        return Promise.reject(openFailure('ui_open_external_failed', 'the browser could not accept the link'));
+      }
     }
 
     function stopWith(failure) {
@@ -305,8 +321,13 @@ const afui = (function () {
         // over; the person clicks again if they still want the page.
         failOpenPending(openFailure('ui_open_external_interrupted', 'the connection was lost before the link was opened'));
         for (const [requestId, waiting] of pending) {
-          sendCall(requestId, waiting);
+          // A call cancelled while the wire was down is not sent again: if the
+          // runtime never received it, replaying it would hand the Provider an
+          // action the page already gave up on, cancelled only a moment later.
+          // The cancel alone ends it on a runtime that did receive it, and is
+          // nothing to one that did not.
           if (waiting.cancelled) send('cancel', {request_id: requestId});
+          else sendCall(requestId, waiting);
         }
         setConnectionState('live');
         return;
@@ -401,15 +422,26 @@ const afui = (function () {
           failure.code = 'ui_runtime_closed';
           return Promise.reject(failure);
         }
+        const callOptions = options || {};
+        if (callOptions.signal && callOptions.signal.aborted) {
+          const failure = new Error('the UI action was cancelled');
+          failure.code = 'ui_call_cancelled';
+          return Promise.reject(failure);
+        }
         let stablePayload;
         try {
           stablePayload = actionPayload(payload);
         } catch (failure) {
           return Promise.reject(failure);
         }
-        const callOptions = options || {};
         requestSequence += 1;
         const requestId = 'r' + requestSequence;
+        const frame = JSON.stringify({kind: 'call', call: {request_id: requestId, payload: stablePayload}});
+        if (new TextEncoder().encode(frame).byteLength > maxMessageBytes) {
+          const failure = new Error('the UI action exceeds the 1 MiB runtime message limit');
+          failure.code = 'ui_runtime_message_too_large';
+          return Promise.reject(failure);
+        }
         let waiting;
         const result = new Promise((resolve, reject) => {
           waiting = {
@@ -455,7 +487,9 @@ const afui = (function () {
        * the local window the host opens the URL in the system default
        * browser; in a remote view — the person's own browser — a new tab is
        * opened right there. Only plain http/https URLs are eligible, and the
-       * host checks that again. Resolves to `{opened, via}`; rejects with a
+       * host checks that again. Resolves to `{opened, via}` when the opening
+       * request is handed off; the remote browser cannot confirm tab visibility
+       * while preserving noopener. Rejects with a
        * `code` when the URL was refused, the host could not start a browser,
        * or the connection was lost first. */
       openExternal(target) {
@@ -500,38 +534,65 @@ const afui = (function () {
 
   /* Saving an edit while a person is still making it.
    *
-   * Transport only. The debounce, the revision counter that discards a reply
-   * to a save the person has already typed past, the `base_hash` written back
-   * so the next save is against what the server actually holds, and the
-   * separate `onConflict` for a 409 — all of that is the same everywhere. What
-   * a conflict *looks like* is the Provider's: this says one happened and hands
-   * back what the server has.
+   * Transport only. The debounce, one save on the wire at a time, the
+   * `base_hash` written back so the next save is against what the server
+   * actually holds, and the separate `onConflict` for a 409 — all of that is
+   * the same everywhere. What a conflict *looks like* is the Provider's: this
+   * says one happened and hands back what the server has.
+   *
+   * One at a time because every save names the hash it was made against. A
+   * second save sent while the first is still in flight names the hash from
+   * before the first, and the server — which has just moved past it — answers
+   * a conflict that never happened. So a newer value waits, replacing any
+   * value already waiting, and goes out with the hash the reply returned.
    *
    * `save` must resolve to the new base hash, or reject. */
   function autosave(options) {
     const settings = options || {};
     const delay = settings.delayMs || 600;
     let timer = null;
-    let revision = 0;
     let baseHash = settings.baseHash || '';
+    let inFlight = null;
+    /* The newest value waiting for the save in flight, and everyone waiting
+     * for it to land. */
+    let queued = null;
 
-    async function run(value) {
-      const mine = (revision += 1);
+    function run(value) {
+      if (inFlight) {
+        const waiters = queued ? queued.waiters : [];
+        queued = {value, waiters};
+        return new Promise(resolve => waiters.push(resolve));
+      }
+      inFlight = send(value);
+      return inFlight;
+    }
+
+    async function send(value) {
       try {
         const next = await settings.save(value, baseHash);
-        /* A reply to a save the person has already typed past is not the
-         * current state, and writing it back would move the base hash
-         * backwards. */
-        if (mine !== revision) return;
         if (typeof next === 'string') baseHash = next;
-        if (settings.onSaved) settings.onSaved(baseHash);
+        /* A newer value is about to go out; this one is not the state to
+         * report. */
+        if (!queued && settings.onSaved) settings.onSaved(baseHash);
       } catch (failure) {
-        if (mine !== revision) return;
         if (failure && failure.status === 409 && settings.onConflict) {
+          /* What is waiting was typed against the copy that just lost; the
+           * Provider decides what happens to it. */
+          const dropped = queued;
+          queued = null;
+          if (dropped) dropped.waiters.forEach(resolve => resolve());
           settings.onConflict(failure);
-          return;
+        } else if (!queued && settings.onError) {
+          settings.onError(failure);
         }
-        if (settings.onError) settings.onError(failure);
+      } finally {
+        inFlight = null;
+        const waiting = queued;
+        queued = null;
+        if (waiting) {
+          const landed = () => waiting.waiters.forEach(resolve => resolve());
+          run(waiting.value).then(landed, landed);
+        }
       }
     }
 
@@ -556,8 +617,10 @@ const afui = (function () {
         }
         return run(value);
       },
+      /* Anything not yet saved: waiting on the debounce, on the wire, or
+       * queued behind the save on the wire. */
       pending() {
-        return timer !== null;
+        return timer !== null || inFlight !== null || queued !== null;
       },
     };
   }
@@ -848,7 +911,13 @@ const afui = (function () {
   /* End this session from inside its own page. Whoever created it sees the
    * same ending as a closed window. */
   async function end() {
-    await fetch(url('__afui/end'), {method: 'POST', cache: 'no-store'});
+    const response = await fetch(url('__afui/end'), {method: 'POST', cache: 'no-store'});
+    if (!response.ok) {
+      const failure = new Error('the UI session could not be ended');
+      failure.code = 'ui_session_end_failed';
+      failure.status = response.status;
+      throw failure;
+    }
   }
 
   return {

@@ -295,6 +295,14 @@ fn validate_route(value: &str) -> Result<()> {
         && !value.starts_with('/')
         && !value.contains(':')
         && !value.contains("//")
+        // A browser reads `\` as `/`, and a `.` or `..` segment climbs out of
+        // the credential's path into whatever sits beside it on this origin.
+        && !value.contains('\\')
+        && !value.split(['/', '?', '#']).any(|segment| {
+            // `%2e` is a dot to the URL parser too.
+            let segment = segment.to_ascii_lowercase().replace("%2e", ".");
+            segment == "." || segment == ".."
+        })
         && !value.contains(|c: char| c.is_ascii_whitespace() || c == '"' || c == '\'' || c == '<');
     if acceptable {
         Ok(())
@@ -389,6 +397,11 @@ mod tests {
             "",
             "app rove",
             "app\"rove",
+            "../other-session/approve",
+            "a/../../approve",
+            "%2E%2e/approve",
+            "./approve",
+            "\\elsewhere.example/approve",
         ] {
             let runtime = UiDecisionRuntime::new("data-reviewer-decision")
                 .unwrap()

@@ -3,7 +3,10 @@
 //! [`crate::UiFrontend`] refuses a frontend *file* whose name says it is a
 //! script. This refuses a script hidden inside one whose name does not — an
 //! overridden HTML template with a `<script>` block, an `onclick=` attribute,
-//! or a `javascript:` URL.
+//! or a `javascript:` URL — and the markup that runs no script but still sends
+//! the person, a request, or the page's address somewhere: a `<meta>` refresh
+//! or referrer policy, a `referrerpolicy` attribute, a form that posts by
+//! itself, a `<base>` that re-points every relative URL.
 //!
 //! It is still delivery rather than rendering: nothing here knows what a page
 //! means, only that these bytes may not leave a frontend directory. The rule
@@ -14,9 +17,8 @@
 //! Provider inherits it from rather than reimplements it.
 //!
 //! Nothing above this line needs a server, which is why it is in the featureless
-//! tier. Two copies of a security rule drift silently, and the only thing that
-//! had kept a Provider on its own copy was that taking this crate at all used
-//! to mean taking axum and tokio with it.
+//! tier. Two copies of a security rule drift silently, and a Provider whose UI
+//! is compiled out should not have to take axum and tokio to share this one.
 
 use crate::{Error, Result};
 use scraper::{Html, Node};
@@ -64,6 +66,8 @@ pub fn reject_frontend_script(label: &str, markup: &str) -> Result<()> {
 /// `data:` inside one of those is a string a person is meant to read, not a URL
 /// a browser will fetch. So this reads elements and attributes, which is where
 /// a rendered value could actually become behaviour, and leaves prose alone.
+/// A URL scheme counts only in an attribute a browser loads or navigates to:
+/// a `title` or `aria-label` is text, wherever it sits.
 pub fn reject_rendered_script(label: &str, markup: &str) -> Result<()> {
     inspect_rendered_page(label, markup).map(drop)
 }
@@ -104,13 +108,62 @@ fn escape_hatch(lower: &str) -> Option<&'static str> {
         .map(|(_, violation)| *violation)
 }
 
+/// Elements that run code, load another document, or re-point every relative
+/// URL on the page.
+const EXECUTABLE_ELEMENTS: [&str; 8] = [
+    "script", "iframe", "object", "embed", "frame", "frameset", "applet", "base",
+];
+
+/// Attributes that make a form send a request by itself. A page's forms are
+/// read by its own runtime; one that posts on its own goes to whatever route
+/// it names, past the decision a button is labelled with.
+const REQUEST_ATTRIBUTES: [&str; 4] = ["action", "formaction", "method", "formmethod"];
+
+/// Attributes whose value a browser loads or navigates to, including the SVG
+/// animation attributes that can set an `href`. Only these are read as URLs:
+/// `title="Metadata: Q3"` is text a person reads.
+const URL_ATTRIBUTES: [&str; 20] = [
+    "href",
+    "xlink:href",
+    "src",
+    "srcset",
+    "poster",
+    "data",
+    "ping",
+    "background",
+    "cite",
+    "longdesc",
+    "manifest",
+    "icon",
+    "lowsrc",
+    "dynsrc",
+    "codebase",
+    "archive",
+    "to",
+    "from",
+    "by",
+    "values",
+];
+
 fn document_violation(document: &Html) -> Option<&'static str> {
     for node in document.tree.nodes() {
         let Node::Element(element) = node.value() else {
             continue;
         };
-        if matches!(element.name(), "script" | "iframe" | "object" | "embed") {
+        if EXECUTABLE_ELEMENTS.contains(&element.name()) {
             return Some("executable element");
+        }
+        // A refresh navigates without a click, and a referrer policy would
+        // undo the `no-referrer` that keeps this page's credentialed URL here.
+        if element.name() == "meta"
+            && (element.attr("http-equiv").is_some_and(|equiv| {
+                let equiv = equiv.trim();
+                equiv.eq_ignore_ascii_case("refresh") || equiv.eq_ignore_ascii_case("set-cookie")
+            }) || element
+                .attr("name")
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case("referrer")))
+        {
+            return Some("a `<meta>` that navigates or sets page policy");
         }
         for (name, value) in element.attrs() {
             let name = name.to_ascii_lowercase();
@@ -120,7 +173,18 @@ fn document_violation(document: &Html) -> Option<&'static str> {
             {
                 return Some("inline event handler");
             }
-            if let Some(violation) = dangerous_url_scheme(value) {
+            // `method="dialog"` closes a `<dialog>` and sends nothing.
+            if REQUEST_ATTRIBUTES.contains(&name.as_str())
+                && !(name.ends_with("method") && value.trim().eq_ignore_ascii_case("dialog"))
+            {
+                return Some("a form that sends a request by itself");
+            }
+            if name == "referrerpolicy" {
+                return Some("a `referrerpolicy` override");
+            }
+            if URL_ATTRIBUTES.contains(&name.as_str())
+                && let Some(violation) = dangerous_url_scheme(value)
+            {
                 return Some(violation);
             }
         }
@@ -256,6 +320,9 @@ mod tests {
             "<a href=\"jav\tascript:alert(1)\">x</a>",
             "<a href=\"vbscript:x\">x</a>",
             "<a href=\"data:text/html,<script>\">x</a>",
+            "<frameset><frame src=\"/x\"></frameset>",
+            "<base href=\"https://elsewhere.example/\">",
+            "<svg><a><animate attributeName=\"href\" values=\"javascript:alert(1)\"/></a></svg>",
         ] {
             let error = reject_frontend_script("page", markup)
                 .unwrap_err()
@@ -293,5 +360,42 @@ mod tests {
         reject_rendered_script("page", "<pre>select 'data:image/png;base64,AA'</pre>").unwrap();
         assert!(reject_frontend_script("page", "select 'data:image/png'").is_err());
         assert!(reject_rendered_script("page", "<a href=\"data:text/html,x\">x</a>").is_err());
+        // Text in an attribute that is not a URL stays text.
+        reject_rendered_script(
+            "page",
+            "<p title=\"Metadata: Q3\" aria-label=\"javascript: a primer\">x</p>",
+        )
+        .unwrap();
+    }
+
+    /// Markup that runs no script but still sends the person, a request or
+    /// this page's address somewhere: a refresh, a referrer override, a form
+    /// that posts by itself.
+    #[test]
+    fn markup_that_navigates_posts_or_leaks_the_referrer_is_refused() {
+        for markup in [
+            "<meta http-equiv=\"refresh\" content=\"0;url=https://elsewhere.example/\">",
+            "<meta name=\"referrer\" content=\"unsafe-url\">",
+            "<a referrerpolicy=\"unsafe-url\" href=\"https://elsewhere.example/\">x</a>",
+            "<form method=\"post\" action=\"refuse\"><button>Approve</button></form>",
+            "<form><button formaction=\"refuse\">Approve</button></form>",
+        ] {
+            assert!(reject_rendered_script("page", markup).is_err(), "{markup}");
+        }
+        // A form the page's runtime reads, a dialog's own form, and the
+        // metadata a page needs — a policy `<meta>` can only narrow a policy.
+        reject_rendered_script(
+            "page",
+            "<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">\
+             <meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\">\
+             <meta http-equiv=\"Content-Security-Policy\" content=\"img-src 'self'\">\
+             <form data-provider-form><button data-provider-decision=\"approve\">Approve</button></form>\
+             <dialog><form method=\"dialog\"><button>Close</button></form></dialog>",
+        )
+        .unwrap();
+        assert!(
+            reject_rendered_script("page", "<meta http-equiv=\"Set-Cookie\" content=\"a=b\">")
+                .is_err()
+        );
     }
 }

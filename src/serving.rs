@@ -1,12 +1,12 @@
-//! The routes every Provider page in this kit serves, and the one response
-//! shape a page's own bytes travel back in.
+//! The routes every Provider page serves, and the one response shape a page's
+//! own bytes travel back in.
 //!
 //! Neither is a decision about what a page contains. A page is at `/`, its
 //! stylesheet is a route rather than an inline block so a frontend can replace
 //! presentation without touching structure, and the override's `assets/` tree
 //! is nested under a fixed name so a template can refer to it relatively.
-//! Every Provider here had written that same shape by hand, along with the
-//! `text/css` header, and the difference between four copies was noise.
+//! Nothing about that shape varies between Providers, the `text/css` header
+//! included, so a hand-written copy of it can only differ by mistake.
 //!
 //! The blob responder is the same observation about a page serving bytes of
 //! its own — a preview, a generated code, an attachment. It does not know what
@@ -15,13 +15,17 @@
 //! told about anything a session hands it, and how to read a file out of a
 //! directory without leaving it.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
+#[cfg(unix)]
+use cap_fs_ext::OpenOptionsSyncExt;
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, File, OpenOptions};
 
 use crate::frontend::UiFrontend;
 
@@ -100,9 +104,9 @@ pub fn page_asset_routes(stylesheet: impl Into<Vec<u8>>, frontend: &UiFrontend) 
 /// What a page may serve as bytes of its own, and how much of it.
 ///
 /// Deliberately narrow. There is no caching here, no `Range`, and no upload:
-/// none of those has ever been needed by a page in this kit, and each would be
-/// a second thing to get right in a response that a session hands to a browser
-/// under a bearer credential.
+/// a page's own bytes are small and generated per session, and each of those
+/// would be a second thing to get right in a response that a session hands to
+/// a browser under a bearer credential.
 ///
 /// Every refusal is a `404`, whatever the reason — too large, wrong media
 /// type, a symlink, a path that tried to leave. A page asking for something it
@@ -172,9 +176,9 @@ impl UiBlobPolicy {
     ///
     /// `relative` is refused outright if it is absolute or carries anything but
     /// plain names — no `..`, no root, no prefix — and every component along
-    /// the way is checked for being a symlink before the next one is appended.
-    /// Resolving first and comparing after is the version of this that has a
-    /// race in it; this one never follows a link at all.
+    /// the way is opened without following symlinks, relative to the previous
+    /// directory handle. A rename cannot redirect a later path lookup through
+    /// an unchecked replacement directory.
     ///
     /// The bound is applied twice: once against the file's own length, and
     /// again against what was actually read, because a file can grow between
@@ -202,24 +206,12 @@ impl UiBlobPolicy {
         if relative.as_os_str().is_empty() || relative.is_absolute() {
             return None;
         }
-        let mut path = PathBuf::from(root);
-        let mut leaf = None;
-        for component in relative.components() {
-            let Component::Normal(name) = component else {
-                return None;
-            };
-            path.push(name);
-            let metadata = std::fs::symlink_metadata(&path).ok()?;
-            if metadata.file_type().is_symlink() {
-                return None;
-            }
-            leaf = Some(metadata);
-        }
-        let leaf = leaf?;
+        let directory = Dir::open_ambient_dir(root, cap_std::ambient_authority()).ok()?;
+        let file = open_file_beneath(directory, relative)?;
+        let leaf = file.metadata().ok()?;
         if !leaf.is_file() || leaf.len() > self.max_bytes {
             return None;
         }
-        let file = std::fs::File::open(&path).ok()?;
         let mut bytes = Vec::new();
         // One byte past the bound, so a file that grew between the check above
         // and this read is caught rather than truncated into a valid-looking
@@ -231,10 +223,33 @@ impl UiBlobPolicy {
     }
 }
 
+/// Hold each ancestor open while resolving the next single path component.
+fn open_file_beneath(mut directory: Dir, relative: &Path) -> Option<File> {
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        if components.peek().is_some() {
+            directory = directory.open_dir_nofollow(name).ok()?;
+        } else {
+            let mut options = OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            // Inspect the opened handle before reading; a FIFO or device must
+            // not block the open before that type check can reject it.
+            #[cfg(unix)]
+            options.nonblock(true);
+            return directory.open_with(name, &options).ok();
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -344,5 +359,52 @@ mod tests {
         }
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_open_directory_is_not_redirected_by_replacing_its_path() {
+        use std::io::Read;
+        let root = temp_root("pinned-root");
+        let moved = root.with_extension("moved");
+        let outside = temp_root("pinned-outside");
+        fs::write(root.join("preview.png"), b"intended").unwrap();
+        fs::write(outside.join("preview.png"), b"outside-canary").unwrap();
+        let directory = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+        fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+        let mut file = open_file_beneath(directory, Path::new("preview.png")).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"intended");
+        fs::remove_file(&root).unwrap();
+        fs::remove_dir_all(moved).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_special_file_is_rejected_without_waiting_for_a_writer() {
+        let root = temp_root("fifo");
+        let path = root.join("preview.png");
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the NUL-terminated path belongs to this test's private root.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reading_root = root.clone();
+        let reader = std::thread::spawn(move || {
+            sender
+                .send(policy().read(&reading_root, Path::new("preview.png")))
+                .unwrap();
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .is_none()
+        );
+        reader.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 }

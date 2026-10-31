@@ -108,6 +108,7 @@ function sandbox(overrides = {}) {
     clearTimeout,
     setInterval,
     clearInterval,
+    TextEncoder,
     console,
     __fire: (name, event) => listeners.get(name)?.(event),
     ...overrides,
@@ -118,6 +119,22 @@ function sandbox(overrides = {}) {
 }
 
 // ── the session root ─────────────────────────────────────────────────────
+{
+  const requests = [];
+  let status = 204;
+  const {afui} = sandbox({fetch: async (url, options) => {
+    requests.push({url, options});
+    return {ok: status >= 200 && status < 300, status};
+  }});
+  await afui.end();
+  assert.equal(requests[0].url, '/abc123/__afui/end');
+  assert.equal(requests[0].options.method, 'POST');
+  for (status of [403, 404, 500]) {
+    await assert.rejects(afui.end(), failure =>
+      failure.code === 'ui_session_end_failed' && failure.status === status);
+  }
+}
+
 {
   const {afui} = sandbox();
   assert.equal(afui.sessionRoot, '/abc123/');
@@ -185,7 +202,7 @@ function sandbox(overrides = {}) {
   const progress = [];
   const events = [];
   const eventResets = [];
-  const {afui} = sandbox({
+  const {afui, context} = sandbox({
     WebSocket: FakeSocket,
     AbortController,
     setTimeout(handler) {
@@ -292,9 +309,8 @@ function sandbox(overrides = {}) {
   })), [
     {kind: 'call', requestId: 'r1'},
     {kind: 'call', requestId: 'r2'},
-    {kind: 'call', requestId: 'r3'},
     {kind: 'cancel', requestId: 'r3'},
-  ], 'every unacknowledged call keeps its AFUI identity across reconnect');
+  ], 'every unacknowledged call keeps its AFUI identity across reconnect, and a cancelled one is only cancelled');
   same(
     sockets[1].sent.find(frame => frame.kind === 'call' && frame.call.request_id === 'r2').call
       .payload,
@@ -324,6 +340,25 @@ function sandbox(overrides = {}) {
   const sentBeforeInvalidAction = sockets[1].sent.length;
   await assert.rejects(ui.call(cyclic), error => error.code === 'ui_action_encode_failed');
   assert.equal(sockets[1].sent.length, sentBeforeInvalidAction);
+  const alreadyCancelled = new AbortController();
+  alreadyCancelled.abort();
+  await assert.rejects(
+    ui.call({type: 'must_not_run'}, {signal: alreadyCancelled.signal}),
+    error => error.code === 'ui_call_cancelled',
+  );
+  assert.equal(
+    sockets[1].sent.length,
+    sentBeforeInvalidAction,
+    'an already-cancelled action must never be delivered to the Provider',
+  );
+  for (const text of ['x'.repeat(1024 * 1024 - 16), '字'.repeat(350000), '\u0001'.repeat(180000)]) {
+    await assert.rejects(ui.call({text}), error => error.code === 'ui_runtime_message_too_large');
+    assert.equal(sockets[1].sent.length, sentBeforeInvalidAction, 'an oversized frame must not reach the socket');
+  }
+  const bounded = ui.call({text: '字'.repeat(300000)});
+  const boundedId = sockets[1].sent.at(-1).call.request_id;
+  sockets[1].receive({kind: 'call_result', call_result: {request_id: boundedId, payload: 'accepted'}});
+  assert.equal(await bounded, 'accepted', 'a rejected frame must not poison later calls');
   sockets[1].receive({
     kind: 'event_reset',
     event_reset: {oldest_sequence: 0, latest_sequence: 0},
@@ -333,6 +368,14 @@ function sandbox(overrides = {}) {
   reconnects.shift()();
   sockets[2].open();
   assert.equal(sockets[2].sent[0].hello.last_event_sequence, 0);
+  sockets[2].receive({kind: 'ready', ready: {protocol: 'afui-session-v1', remote_view: true}});
+  const browserRequests = [];
+  context.window.open = (...args) => { browserRequests.push(args); return null; };
+  same(await ui.openExternal('https://example.test/'), {opened: true, via: 'browser'});
+  same(browserRequests, [['https://example.test/', '_blank', 'noopener,noreferrer']]);
+  context.window.open = () => { throw new Error('private-browser-detail'); };
+  await assert.rejects(ui.openExternal('https://example.test/'), failure =>
+    failure.code === 'ui_open_external_failed' && !failure.message.includes('private-browser-detail'));
   ui.close();
   await assert.rejects(ui.call({type: 'too_late'}), error => error.code === 'ui_runtime_closed');
 }
@@ -355,18 +398,24 @@ function sandbox(overrides = {}) {
     },
   });
 
-  /* A reply to a save the person has already typed past is not the current
-   * state, and writing its hash back would move the base backwards — which is
-   * how the *next* save turns into a spurious conflict. */
+  /* One save on the wire at a time. A second sent while the first is in
+   * flight would name the hash from before the first, and the server — which
+   * has just moved past it — would answer a conflict that never happened. A
+   * newer value waits and goes out against the hash the reply returned, and
+   * only the newest of several waiting values is sent at all. */
   const first = saver.flush('first');
   const second = saver.flush('second');
+  const third = saver.flush('third');
+  same(saves, [{value: 'first', baseHash: 'h0'}], 'nothing else goes out while one is in flight');
+  assert.equal(saver.pending(), true, 'a save on the wire, or queued behind one, is not saved yet');
   resolveFirst('h1');
-  await Promise.all([first, second]);
+  await Promise.all([first, second, third]);
+  assert.equal(saver.pending(), false);
   same(saves, [
     {value: 'first', baseHash: 'h0'},
-    {value: 'second', baseHash: 'h0'},
+    {value: 'third', baseHash: 'h1'},
   ]);
-  assert.equal(saver.baseHash, 'h2', 'the stale reply must not win');
+  assert.equal(saver.baseHash, 'h2');
 }
 
 {
@@ -467,6 +516,7 @@ function sandbox(overrides = {}) {
 
   const attributes = {};
   const link = {
+    getAttribute: name => attributes[name] ?? null,
     setAttribute: (name, value) => {
       attributes[name] = value;
     },
@@ -484,11 +534,34 @@ function sandbox(overrides = {}) {
   assert.equal(button.disabled, false);
 }
 
+// An in-flight operation must not enable controls disabled for another reason.
+{
+  const {afui} = sandbox();
+  const attributes = {'aria-disabled': 'false'};
+  const button = {
+    disabled: true,
+    getAttribute: name => attributes[name] ?? null,
+    setAttribute: (name, value) => { attributes[name] = value; },
+    removeAttribute: name => { delete attributes[name]; },
+  };
+  const flight = afui.inFlight([button]);
+  flight.end();
+  assert.equal(button.disabled, true, 'ending an idle operation changes nothing');
+  flight.begin();
+  flight.begin();
+  assert.equal(attributes['aria-disabled'], 'true');
+  flight.end();
+  assert.equal(button.disabled, true, 'the original disabled state survives');
+  assert.equal(attributes['aria-disabled'], 'false', 'an explicit ARIA value survives');
+  flight.begin();
+  flight.end();
+  assert.equal(button.disabled, true, 'a second operation captures its own original state');
+}
+
 /* ── the connection word is AFUI's, the wording is the page's ─────────────
  *
- * Every page in this kit had written its own map from these four words to a
- * look and a sentence, and two of them had written a branch for the one word
- * that is never delivered. */
+ * A page left to map these words to a look and a sentence on its own is free
+ * to write a branch for the one word that is never delivered. */
 {
   const {afui} = sandbox();
   const line = {textContent: 'x', dataset: {}};
@@ -611,7 +684,7 @@ function sandbox(overrides = {}) {
 
 /* The head a framed page does not draw twice.
  *
- * Every page in this kit had grown the same one: the program's name, what the
+ * A live page tends to draw the same one: the program's name, what the
  * session is on, and a word about how it is going — all three of which a frame
  * around it is already showing or can be told. What is checked here is that a
  * page only drops its own on being told there is another, that identity is
